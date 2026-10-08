@@ -32,9 +32,9 @@ SYMBOLS = [
 INTERVAL = "1d"
 PERIOD   = "10y"
 
-LOOKAHEAD    = 100          # بررسی ۱۰۰ کندل بعد از هر کندل مشابه
+LOOKAHEAD    = 100          # تعداد کندل بعدی برای بررسی
 K_PER_SYMBOL = 20           # از هر ارز چند نزدیک‌ترین کندل
-TOTAL_TOP    = 100          # در نهایت چند کندل مشابه تحلیل شود
+TOTAL_TOP    = 100          # نهایتاً چند کندل مشابه تحلیل شود
 
 
 # ---------- سطل‌های ۱٪ ----------
@@ -70,11 +70,11 @@ def fetch(symbol, interval, period):
 
 def candle_features(i, o, h, l, c):
     """
-    ویژگی‌های یک کندل به‌صورت نرمال‌شده:
-    - بدنه: (close - open) / open       → جهت و قدرت بدنه
-    - سایه بالا: (high - max(o,c)) / open
-    - سایه پایین: (min(o,c) - low) / open
-    - دامنه: (high - low) / open
+    ویژگی‌های یک کندل به‌صورت نرمال‌شده (همه بر مبنای open):
+    - body:       (close - open) / open
+    - upper_wick: (high - max(o,c)) / open
+    - lower_wick: (min(o,c) - low) / open
+    - range:      (high - low) / open
     """
     op, hi, lo, cl = o[i], h[i], l[i], c[i]
     if op <= 0:
@@ -87,6 +87,7 @@ def candle_features(i, o, h, l, c):
 
 
 def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
+    """بررسی آینده‌ی یک کندل به مدت lookahead کندل بعدی"""
     if entry_idx + 1 + lookahead > n:
         return None
     entry_price = float(c[entry_idx])
@@ -102,13 +103,37 @@ def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
     max_up      = (float(np.max(fut_h)) - entry_price) / entry_price * 100.0
     max_dd      = (float(np.min(fut_l)) - entry_price) / entry_price * 100.0
 
+    # کندل اوج
+    peak_idx = int(np.argmax(fut_h))
+    bars_to_peak = peak_idx + 1
+    dd_before_peak = (float(np.min(fut_l[:peak_idx + 1])) - entry_price) \
+                     / entry_price * 100.0
+
+    # اولین باری که close به سربه‌سر برمی‌گرده
+    above = fut_c >= entry_price
+    if above.any():
+        rec_idx = int(np.argmax(above))
+        bars_to_recovery = rec_idx + 1
+        dd_before_recovery = (float(np.min(fut_l[:rec_idx + 1])) - entry_price) \
+                             / entry_price * 100.0
+    else:
+        bars_to_recovery = None
+        dd_before_recovery = max_dd
+
     path = np.concatenate([[entry_price], fut_c]) / entry_price * 100.0
 
     return {
-        'entry': entry_price, 'final': final_price,
-        'ret': total_ret, 'max_up': max_up, 'max_dd': max_dd,
-        'direction': 'up' if total_ret > 0 else 'down',
-        'path': path,
+        'entry':              entry_price,
+        'final':              final_price,
+        'ret':                total_ret,
+        'max_up':             max_up,
+        'max_dd':             max_dd,
+        'dd_before_peak':     dd_before_peak,
+        'dd_before_recovery': dd_before_recovery,
+        'bars_to_peak':       bars_to_peak,
+        'bars_to_recovery':   bars_to_recovery,
+        'direction':          'up' if total_ret > 0 else 'down',
+        'path':               path,
     }
 
 
@@ -226,12 +251,10 @@ def find_similar_candles(df_target, target_idx, dfs):
         c = df['Close'].values.astype(float)
         n = len(df)
 
-        # فقط کندل‌هایی که ۱۰۰ کندل بعدی‌شون موجوده و از هدف قبل‌ترن
         max_i = n - LOOKAHEAD - 1
         if max_i <= 0:
             continue
 
-        # فیلتر: کندل باید قبل از تاریخ هدف باشه (روی همه ارزها)
         idx_naive = df.index
         if getattr(idx_naive, 'tz', None) is not None:
             idx_naive = idx_naive.tz_localize(None)
@@ -242,14 +265,12 @@ def find_similar_candles(df_target, target_idx, dfs):
         max_i = min(max_i, last_before)
 
         if sym == TARGET_SYMBOL:
-            # روی ETH خودش، کندل هدف و همسایه‌های نزدیک رو رد کن
             max_i = min(max_i, target_idx - 1)
 
         if max_i <= 0:
             continue
 
-        feats = []
-        idxs  = []
+        feats, idxs = [], []
         for i in range(0, max_i + 1):
             f = candle_features(i, o, h, l, c)
             if f is None:
@@ -261,6 +282,7 @@ def find_similar_candles(df_target, target_idx, dfs):
             continue
 
         feats = np.array(feats)
+        # فاصله‌ی اقلیدسی
         dists = np.sqrt(np.sum((feats - target_feat) ** 2, axis=1))
 
         k = min(K_PER_SYMBOL, len(idxs))
@@ -292,18 +314,20 @@ def build_chart(details, target_forward, target_date_str):
     color_map = {s: palette[i % len(palette)] for i, s in enumerate(symbols_used)}
     x = np.arange(LOOKAHEAD + 1)
 
+    # پنل ۱: تمام مسیرها
     ax = axes[0, 0]
     for r in results:
-        ax.plot(x, r['path'], color=color_map[r['symbol']], alpha=0.20, linewidth=0.8)
+        ax.plot(x, r['path'], color=color_map[r['symbol']],
+                alpha=0.20, linewidth=0.8)
     if target_forward is not None:
         ax.plot(x, target_forward, color='#000000', linewidth=3.0,
                 label=f'Target {TARGET_SYMBOL}')
     ax.axhline(100, color='#888', linestyle=':', linewidth=1)
-    ax.set_title(f"All {len(results)} forward paths (single candle match)",
-                 fontweight='bold')
+    ax.set_title(f"All {len(results)} forward paths", fontweight='bold')
     ax.set_xlabel('Bars after candle'); ax.set_ylabel('Normalized price')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
+    # پنل ۲: میانگین + باند
     ax = axes[0, 1]
     paths = np.array([r['path'] for r in results])
     ax.fill_between(x, np.percentile(paths, 10, axis=0),
@@ -311,7 +335,8 @@ def build_chart(details, target_forward, target_date_str):
                     color='#2196F3', alpha=0.15, label='10–90٪ band')
     ax.plot(x, np.percentile(paths, 50, axis=0), color='#1976D2',
             linewidth=2.0, label='Median')
-    ax.plot(x, paths.mean(axis=0), color='#0D47A1', linewidth=2.5, label='Mean')
+    ax.plot(x, paths.mean(axis=0), color='#0D47A1',
+            linewidth=2.5, label='Mean')
     if target_forward is not None:
         ax.plot(x, target_forward, color='#000000', linewidth=2.5,
                 linestyle='--', label='Target actual')
@@ -320,6 +345,7 @@ def build_chart(details, target_forward, target_date_str):
     ax.set_xlabel('Bars after candle'); ax.set_ylabel('Normalized price')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
+    # پنل ۳: صعودی vs نزولی
     ax = axes[0, 2]
     if ups:
         ax.plot(x, np.mean([r['path'] for r in ups], axis=0),
@@ -341,6 +367,7 @@ def build_chart(details, target_forward, target_date_str):
     ax.set_xlabel('Bars after candle'); ax.set_ylabel('Normalized price')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
+    # پنل ۴: توزیع max_dd
     dd_vals = details['all_max_dd']
     ax = axes[1, 0]
     ax.hist(dd_vals, bins=40, color='#ef5350', alpha=0.7, edgecolor='white')
@@ -352,6 +379,7 @@ def build_chart(details, target_forward, target_date_str):
     ax.set_xlabel('Max drawdown (٪)'); ax.set_ylabel('Count')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
+    # پنل ۵: توزیع max_up
     up_vals = details['all_max_up']
     ax = axes[1, 1]
     ax.hist(up_vals, bins=40, color='#26a69a', alpha=0.7, edgecolor='white')
@@ -363,6 +391,7 @@ def build_chart(details, target_forward, target_date_str):
     ax.set_xlabel('Max upside (٪)'); ax.set_ylabel('Count')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
+    # پنل ۶: توزیع بازدهی نهایی
     ret_vals = details['all_ret']
     ax = axes[1, 2]
     ax.hist(ret_vals, bins=40, color='#2196F3', alpha=0.7, edgecolor='white')
@@ -384,18 +413,87 @@ def build_chart(details, target_forward, target_date_str):
     return buf
 
 
-# ==================== گزارش ====================
+# ==================== تحلیل مسیر گروه صعودی ====================
+def report_up_group_path(ups):
+    """گزارش مسیر صعودی‌ها: اول چقدر ریزش، بعد چقدر رشد."""
+    if not ups:
+        return ["<b>🟢 گروه صعودی‌ها:</b>", "└ داده‌ای نیست.", ""]
+
+    n = len(ups)
+    dd_peak  = [r['dd_before_peak']     for r in ups]
+    dd_rec   = [r['dd_before_recovery'] for r in ups
+                if r['dd_before_recovery'] is not None]
+    bars_rec = [r['bars_to_recovery']   for r in ups
+                if r['bars_to_recovery'] is not None]
+    bars_pk  = [r['bars_to_peak']       for r in ups]
+
+    lines = []
+    lines.append(f"<b>🔬 تحلیل مسیر {n} صعودی (اول ریزش، بعد صعود):</b>")
+    lines.append("")
+
+    # ---- ریزش قبل از سربه‌سر شدن ----
+    if dd_rec:
+        lines.append("📉 <b>ریزش قبل از سربه‌سر شدن:</b>")
+        lines.append(f"├ میانگین: <code>{np.mean(dd_rec):+.2f}٪</code>")
+        lines.append(f"├ میانه: <code>{np.median(dd_rec):+.2f}٪</code>")
+        lines.append(f"└ بدترین: <code>{np.min(dd_rec):+.2f}٪</code>")
+
+        def pct_above(vals, threshold):
+            if not vals:
+                return 0.0
+            return sum(1 for v in vals if v >= -threshold) / len(vals) * 100.0
+
+        lines.append("")
+        lines.append("📊 <b>چند درصد قبل از سربه‌سر شدن، کمتر از ... ریزش داشتن؟</b>")
+        lines.append(f"├ کمتر از ۵٪: <code>{pct_above(dd_rec, 5):.1f}٪</code>")
+        lines.append(f"├ کمتر از ۱۰٪: <code>{pct_above(dd_rec, 10):.1f}٪</code>")
+        lines.append(f"├ کمتر از ۲۰٪: <code>{pct_above(dd_rec, 20):.1f}٪</code>")
+        lines.append(f"├ کمتر از ۳۰٪: <code>{pct_above(dd_rec, 30):.1f}٪</code>")
+        lines.append(f"└ کمتر از ۵۰٪: <code>{pct_above(dd_rec, 50):.1f}٪</code>")
+
+    # ---- ریزش قبل از سقف ----
+    lines.append("")
+    lines.append("🏔 <b>ریزش قبل از رسیدن به سقف:</b>")
+    lines.append(f"├ میانگین: <code>{np.mean(dd_peak):+.2f}٪</code>")
+    lines.append(f"├ میانه: <code>{np.median(dd_peak):+.2f}٪</code>")
+    lines.append(f"└ بدترین: <code>{np.min(dd_peak):+.2f}٪</code>")
+
+    # ---- زمان‌بندی ----
+    lines.append("")
+    lines.append("⏱ <b>زمان‌بندی (تعداد کندل):</b>")
+    if bars_rec:
+        lines.append(f"├ میانگین رسیدن به سربه‌سر: "
+                     f"<code>{np.mean(bars_rec):.0f}</code> کندل")
+        lines.append(f"├ میانه رسیدن به سربه‌سر: "
+                     f"<code>{np.median(bars_rec):.0f}</code> کندل")
+    lines.append(f"├ میانگین رسیدن به سقف: "
+                 f"<code>{np.mean(bars_pk):.0f}</code> کندل")
+    lines.append(f"└ میانه رسیدن به سقف: "
+                 f"<code>{np.median(bars_pk):.0f}</code> کندل")
+
+    # ---- توزیع ریزش اولیه ----
+    if dd_rec:
+        lines.append("")
+        lines.append("📊 <b>توزیع ریزش اولیه (قبل از سربه‌سر):</b>")
+        b = bucketize(dd_rec, DD_BUCKETS)
+        lines.extend(fmt_buckets(compress_buckets(b, max_lines=10), emoji="🟥"))
+    return lines
+
+
+# ==================== گزارش اصلی ====================
 def report_single(details, df_target, target_idx, target_forward):
     res = details['results']
     ups = details['ups']; downs = details['downs']
-    n_total = details['n_total']; n_up = details['n_up']; n_down = details['n_down']
+    n_total = details['n_total']
+    n_up = details['n_up']; n_down = details['n_down']
     win_rate = details['win_rate']
     all_ret    = details['all_ret']
     all_max_up = details['all_max_up']
     all_max_dd = details['all_max_dd']
     target_actual = details.get('target_actual')
 
-    def sub(lst, key): return [x[key] for x in lst] if lst else []
+    def sub(lst, key):
+        return [x[key] for x in lst] if lst else []
 
     avg_ret_all = float(np.mean(all_ret))
     avg_max_up  = float(np.mean(all_max_up))
@@ -423,7 +521,8 @@ def report_single(details, df_target, target_idx, target_forward):
     dd_up_buckets = bucketize(sub(ups, 'max_dd'), DD_BUCKETS) if ups else []
 
     def pct_between(vals, lo, hi):
-        if not vals: return 0.0
+        if not vals:
+            return 0.0
         return sum(1 for v in vals if lo <= v < hi) / len(vals) * 100.0
 
     pct_dd_lt_2  = pct_between(all_max_dd, -1e9, -2)
@@ -459,6 +558,7 @@ def report_single(details, df_target, target_idx, target_forward):
     lines.append(f"🌐 تعداد کندل مشابه: <code>{n_total}</code>")
     lines.append("")
 
+    # ========== آمار کلی ==========
     lines.append("<b>📈 آمار کلی:</b>")
     lines.append(f"├ 🟢 صعودی: <code>{n_up}</code> مورد ({win_rate:.1f}٪)")
     lines.append(f"├ 🔴 نزولی: <code>{n_down}</code> مورد ({100 - win_rate:.1f}٪)")
@@ -467,6 +567,7 @@ def report_single(details, df_target, target_idx, target_forward):
     lines.append(f"└ میانگین بیشترین ریزش: <code>{avg_max_dd:+.2f}٪</code>")
     lines.append("")
 
+    # ========== خلاصه‌ی ریزش ==========
     lines.append("<b>📌 خلاصه‌ی احتمال ریزش:</b>")
     lines.append(f"├ بیش از ۲٪ ریزش: <code>{pct_dd_lt_2:.1f}٪</code>")
     lines.append(f"├ بیش از ۵٪ ریزش: <code>{pct_dd_lt_5:.1f}٪</code>")
@@ -474,37 +575,47 @@ def report_single(details, df_target, target_idx, target_forward):
     lines.append(f"└ بیش از ۲۰٪ ریزش: <code>{pct_dd_lt_20:.1f}٪</code>")
     lines.append("")
 
+    # ========== توزیع ریزش ==========
     lines.append("<b>📉 توزیع حداکثر ریزش:</b>")
     lines.extend(fmt_buckets(compress_buckets(dd_buckets, max_lines=15), emoji="🟥"))
     lines.append(f"└ 📌 بدترین ریزش: <code>{min(all_max_dd):+.2f}٪</code>")
     lines.append("")
 
+    # ========== توزیع رشد ==========
     lines.append("<b>📈 توزیع حداکثر رشد:</b>")
     lines.extend(fmt_buckets(compress_buckets(up_buckets, max_lines=15), emoji="🟩"))
     lines.append(f"└ 📌 بهترین رشد: <code>{max(all_max_up):+.2f}٪</code>")
     lines.append("")
 
+    # ========== توزیع بازدهی نهایی ==========
     lines.append(f"<b>🎯 توزیع بازدهی نهایی (بعد از {LOOKAHEAD} کندل):</b>")
     lines.extend(fmt_buckets(compress_buckets(ret_buckets, max_lines=15), emoji="🔵"))
     lines.append("")
 
+    # ========== گروه صعودی + تحلیل مسیر ==========
     if ups:
-        lines.append("<b>🟢 گروه صعودی‌ها:</b>")
+        lines.append("<b>🟢 گروه صعودی‌ها (نهایتاً مثبت):</b>")
         lines.append(f"├ میانگین بازدهی: <code>{avg_ret_up:+.2f}٪</code>")
         lines.append(f"├ میانگین بیشترین رشد: <code>{avg_max_up_up:+.2f}٪</code>")
         lines.append(f"├ میانگین بیشترین ریزش: <code>{avg_dd_up:+.2f}٪</code>")
-        lines.extend(fmt_buckets(compress_buckets(dd_up_buckets, max_lines=10), emoji="🟥"))
-        lines.append(f"└ 📌 بدترین ریزش در صعودی‌ها: <code>{worst_dd_up:+.2f}٪</code>")
+        lines.append(f"└ 📌 بدترین ریزش در صعودی‌ها: "
+                     f"<code>{worst_dd_up:+.2f}٪</code>")
         lines.append("")
 
+        # ---- تحلیل مسیر صعودی‌ها ----
+        lines.extend(report_up_group_path(ups))
+        lines.append("")
+
+    # ========== گروه نزولی ==========
     if downs:
-        lines.append("<b>🔴 گروه نزولی‌ها:</b>")
+        lines.append("<b>🔴 گروه نزولی‌ها (نهایتاً منفی):</b>")
         lines.append(f"├ میانگین بازدهی: <code>{avg_ret_down:+.2f}٪</code>")
         lines.append(f"├ میانگین بیشترین ریزش: <code>{avg_dd_down:+.2f}٪</code>")
         lines.append(f"├ 📉 بدترین ریزش: <code>{worst_dd_down:+.2f}٪</code>")
         lines.append(f"└ بدترین بازدهی: <code>{worst_ret_down:+.2f}٪</code>")
         lines.append("")
 
+    # ========== مسیر واقعی هدف ==========
     if target_actual:
         lines.append("<b>🔵 مسیر واقعی همین کندل تا الان:</b>")
         lines.append(f"├ بازدهی: <code>{target_actual['ret']:+.2f}٪</code>")
@@ -512,14 +623,17 @@ def report_single(details, df_target, target_idx, target_forward):
         lines.append(f"└ بیشترین ریزش: <code>{target_actual['max_dd']:+.2f}٪</code>")
         lines.append("")
 
+    # ========== توزیع ارزها ==========
     lines.append("<b>🌐 توزیع ارزها:</b>")
     for s, cnt in sorted(sym_counts.items(), key=lambda x: -x[1]):
         lines.append(f"• <code>{s}</code>: {cnt} مورد")
     lines.append("")
 
+    # ========== نزدیک‌ترین‌ها ==========
     lines.append("<b>🔝 ۱۰ کندل نزدیک‌تر:</b>")
     for r in res[:10]:
-        d = r['date'].strftime('%Y-%m-%d') if hasattr(r['date'], 'strftime') else str(r['date'])
+        d = r['date'].strftime('%Y-%m-%d') \
+            if hasattr(r['date'], 'strftime') else str(r['date'])
         lines.append(f"• <code>{r['symbol']}</code> | {d}")
         lines.append(f"   بازدهی: <code>{r['ret']:+.1f}٪</code> | "
                      f"رشد: <code>{r['max_up']:+.1f}٪</code> | "
@@ -555,7 +669,7 @@ def main():
     target_idx = int(np.argmin(deltas))
     log(f"🎯 کندل هدف: {df_target.index[target_idx].date()}")
 
-    # مسیر واقعی هدف
+    # مسیر واقعی هدف (فقط برای مرجع)
     o_t = df_target['Open'].values.astype(float)
     h_t = df_target['High'].values.astype(float)
     l_t = df_target['Low'].values.astype(float)
@@ -591,27 +705,24 @@ def main():
     if not results:
         raise RuntimeError("نتیجه‌ای محاسبه نشد.")
 
-    # آمار
+    # آمار کلی
     ups   = [r for r in results if r['direction'] == 'up']
     downs = [r for r in results if r['direction'] == 'down']
-    n_total = len(results); n_up = len(ups); n_down = n_total - n_up
+    n_total = len(results)
+    n_up = len(ups); n_down = n_total - n_up
     win_rate = n_up / n_total * 100.0
 
-    all_ret    = [r['ret']    for r in results]
-    all_max_up = [r['max_up'] for r in results]
-    all_max_dd = [r['max_dd'] for r in results]
-
     details = {
-        'results':      results,
-        'ups':          ups,
-        'downs':        downs,
-        'n_total':      n_total,
-        'n_up':         n_up,
-        'n_down':       n_down,
-        'win_rate':     win_rate,
-        'all_ret':      all_ret,
-        'all_max_up':   all_max_up,
-        'all_max_dd':   all_max_dd,
+        'results':       results,
+        'ups':           ups,
+        'downs':         downs,
+        'n_total':       n_total,
+        'n_up':          n_up,
+        'n_down':        n_down,
+        'win_rate':      win_rate,
+        'all_ret':       [r['ret']    for r in results],
+        'all_max_up':    [r['max_up'] for r in results],
+        'all_max_dd':    [r['max_dd'] for r in results],
         'target_actual': target_actual,
     }
 
@@ -628,8 +739,7 @@ def main():
         buf = build_chart(details, target_forward, target_date_str)
         caption = (f"🕯 تک‌کندل مشابه {TARGET_SYMBOL} | "
                    f"{df_target.index[target_idx].date()}\n"
-                   f"کندل‌های مشابه: {n_total} | "
-                   f"صعودی: {win_rate:.0f}٪")
+                   f"کندل‌های مشابه: {n_total} | صعودی: {win_rate:.0f}٪")
         send_photo(buf, caption)
     except Exception as e:
         log(f"❌ chart: {e}")
