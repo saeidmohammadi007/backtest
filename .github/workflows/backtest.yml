@@ -11,29 +11,43 @@ jobs:
     timeout-minutes: 60
 
     steps:
+      # ۱) گرفتن کد از ریپو
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ۲) نصب پایتون
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
+      # ۳) نصب پیش‌نیازها
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run backtest
-        run: python backtest.py
+      # ۴) بررسی اینکه Secrets درست منتقل می‌شن
+      - name: Debug secrets
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "❌ TELEGRAM_BOT_TOKEN خالیه"
+          else
+            echo "✅ TELEGRAM_BOT_TOKEN ست شده (طول: ${#TELEGRAM_BOT_TOKEN})"
+          fi
+          if [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "❌ TELEGRAM_CHAT_ID خالیه"
+          else
+            echo "✅ TELEGRAM_CHAT_ID ست شده (طول: ${#TELEGRAM_CHAT_ID})"
+          fi
 
-      - name: Upload results as artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest-results
-          path: |
-            *.csv
-            *.png
-          retention-days: 30
+      # ۵) اجرای بک‌تست
+      - name: Run backtest
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python backtest.py
