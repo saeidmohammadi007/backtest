@@ -2,45 +2,44 @@
 import matplotlib
 matplotlib.use('Agg')
 
-import ccxt, time, warnings, signal, os, requests
+import ccxt, time, warnings, os, requests
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from datetime import datetime, timedelta, timezone
 
 warnings.filterwarnings('ignore')
 
-# ================== پوشه‌ی خروجی ==================
 OUTPUT_DIR = 'outputs'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ================== تنظیمات تلگرام ==================
+# ================== تلگرام ==================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
 TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 TELEGRAM_ENABLED   = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-def _split_text(text, max_len):
+
+def _split_text(text, max_len=3800):
     lines = text.split('\n')
     chunks, cur = [], ''
     for line in lines:
         if len(cur) + len(line) + 1 > max_len:
-            chunks.append(cur)
+            if cur: chunks.append(cur)
             cur = line
         else:
             cur = cur + '\n' + line if cur else line
-    if cur:
-        chunks.append(cur)
+    if cur: chunks.append(cur)
     return chunks
 
 
 def tg_send_message(text, parse_mode='Markdown'):
     if not TELEGRAM_ENABLED:
-        print("ℹ️ تلگرام غیرفعال (توکن یا chat_id ست نشده)")
+        print("ℹ️ تلگرام غیرفعال")
         return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        for chunk in _split_text(text, 4000):
+    url = f"{TG_API}/sendMessage"
+    for chunk in _split_text(text):
+        try:
             r = requests.post(url, data={
                 'chat_id': TELEGRAM_CHAT_ID,
                 'text': chunk,
@@ -48,74 +47,55 @@ def tg_send_message(text, parse_mode='Markdown'):
                 'disable_web_page_preview': True,
             }, timeout=20)
             if r.status_code != 200:
-                print(f"❌ تلگرام: {r.status_code} - {r.text[:200]}")
-                r2 = requests.post(url, data={
+                # fallback بدون Markdown
+                requests.post(url, data={
                     'chat_id': TELEGRAM_CHAT_ID,
                     'text': chunk,
                 }, timeout=20)
-                if r2.status_code != 200:
-                    return False
-        return True
-    except Exception as e:
-        print(f"❌ خطا در ارسال پیام: {e}")
-        return False
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"❌ تلگرام: {e}")
+    return True
 
 
-# ================== تنظیمات بک‌تست ==================
+# ================== تنظیمات ==================
 SYMBOLS = ['BTC/USDT','ETH/USDT','BNB/USDT','SOL/USDT','XRP/USDT',
            'DOGE/USDT','ADA/USDT','AVAX/USDT','LTC/USDT','UNI/USDT']
 
-TIMEFRAME = '4h'
-LOOKBACK_DAYS = 730
-PATTERN_SYMBOL = 'ETH/USDT'
-PATTERN_DATE = '2026-08-18'
-SIMILARITY_THRESHOLD = 0.08
-FORWARD_CANDLES = 60
-
-PER_SYMBOL_TIMEOUT = 45
+TIMEFRAME             = '4h'
+LOOKBACK_DAYS         = 730
+PATTERN_SYMBOL        = 'ETH/USDT'
+PATTERN_TIMEFRAME     = '1d'
+PATTERN_LOOKBACK_DAYS = 1500
+SIMILARITY_THRESHOLD  = 0.08
+FORWARD_CANDLES       = 60
+MIN_TRADES            = 30
+CAPITAL_PER_TRADE_PCT = 2.0
+EXCHANGE_NAME         = 'lbank'
+TOP_N                 = 10
+TP_LEVELS = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30]
+SL_LEVELS = [2, 3, 4, 5, 6, 8, 10, 12, 15]
 MAX_FETCH_RETRIES = 2
-EXCHANGE_NAME = 'lbank'
-
-CAPITAL_PER_TRADE_PCT = 2.0   # در هر معامله ۲٪ سرمایه
-
-
-# ================== تایم‌اوت ==================
-class TimeoutError_(Exception): pass
-
-
-def _timeout_handler(signum, frame): raise TimeoutError_()
-
-
-try:
-    signal.signal(signal.SIGALRM, _timeout_handler)
-    HAS_ALARM = True
-except Exception:
-    HAS_ALARM = False
 
 
 # ================== توابع ==================
 def connect_exchange():
-    try:
-        ex = getattr(ccxt, EXCHANGE_NAME)({'enableRateLimit': True, 'timeout': 20000})
-        ex.load_markets()
-        print(f"✅ اتصال به {EXCHANGE_NAME.upper()}")
-        return ex, EXCHANGE_NAME
-    except Exception as e:
-        raise SystemExit(f"❌ اتصال به {EXCHANGE_NAME.upper()} ناموفق: {e}")
+    ex = getattr(ccxt, EXCHANGE_NAME)({'enableRateLimit': True, 'timeout': 20000})
+    ex.load_markets()
+    print(f"✅ اتصال به {EXCHANGE_NAME.upper()}")
+    return ex
 
 
-def fetch_ohlcv(ex, sym, tf='4h', days=730):
+def fetch_ohlcv(ex, sym, tf, days):
     since = ex.parse8601((datetime.now(timezone.utc) - timedelta(days=days)).isoformat())
-    data = []
-    retries = 0
+    data, retries = [], 0
     while True:
         try:
             ohlcv = ex.fetch_ohlcv(sym, tf, since, limit=1000)
             retries = 0
         except Exception:
             retries += 1
-            if retries > MAX_FETCH_RETRIES:
-                return None
+            if retries > MAX_FETCH_RETRIES: return None
             time.sleep(1); continue
         if not ohlcv: break
         data.extend(ohlcv)
@@ -126,373 +106,246 @@ def fetch_ohlcv(ex, sym, tf='4h', days=730):
     df = pd.DataFrame(data, columns=['ts','open','high','low','close','volume'])
     df['dt'] = pd.to_datetime(df['ts'], unit='ms')
     df.set_index('dt', inplace=True)
-    df = df[['open','high','low','close','volume']].astype(float)
-    return df[~df.index.duplicated()].sort_index()
+    return df[['open','high','low','close','volume']].astype(float).sort_index()
 
 
-def candle_vector(o, h, l, c):
-    r = float(h - l)
-    if r <= 0 or not np.isfinite(r): return None
-    return np.array([(o-l)/r, 1.0, 0.0, (c-l)/r])
+def build_vectors(df):
+    o, h, l, c = df['open'].values, df['high'].values, df['low'].values, df['close'].values
+    rng = h - l
+    valid = rng > 0
+    safe = np.where(valid, rng, 1.0)
+    vecs = np.stack([(o-l)/safe, np.ones_like(o), np.zeros_like(o), (c-l)/safe], axis=1)
+    return vecs, valid
 
 
-def scan_matches(df, pvec, threshold):
-    matches = []
-    for i in range(len(df)):
-        row = df.iloc[i]
-        v = candle_vector(row['open'], row['high'], row['low'], row['close'])
-        if v is None: continue
-        d = float(np.linalg.norm(pvec - v))
-        if d <= threshold:
-            matches.append({'index': i, 'dt': df.index[i], 'dist': d})
-    return matches
-
-
-def measure_forward(df, matches, forward):
-    rows = []
-    for m in matches:
-        i = m['index']
-        if i + forward >= len(df):
-            continue
-        entry = df['open'].iloc[i + 1]
-        f = df.iloc[i + 1 : i + forward + 1]
-        rows.append({
-            'match_dt': m['dt'],
-            'entry_dt': df.index[i + 1],
-            'dist': round(m['dist'], 4),
-            'entry': entry,
-            'end_%': round((f['close'].iloc[-1] - entry) / entry * 100, 2),
-            'max_%': round((f['high'].max() - entry) / entry * 100, 2),   # MFE
-            'min_%': round((f['low'].min() - entry) / entry * 100, 2),    # MAE
-        })
-    return pd.DataFrame(rows)
-
-
-def simulate_tp_sl(df, tp_pct, sl_pct):
+def simulate(rets, tp, sl):
     capital = 100.0
-    equity_curve = [capital]
-    trade_returns = []
-
-    for _, r in df.iterrows():
-        position = capital * (CAPITAL_PER_TRADE_PCT / 100.0)
-
-        hit_tp = r['max_%'] >= tp_pct
-        hit_sl = r['min_%'] <= -sl_pct
-
-        if hit_tp and hit_sl:
-            pnl_pct = -sl_pct
-        elif hit_tp:
-            pnl_pct = tp_pct
-        elif hit_sl:
-            pnl_pct = -sl_pct
-        else:
-            pnl_pct = r['end_%']
-
-        pnl = position * (pnl_pct / 100.0)
-        capital += pnl
-        equity_curve.append(capital)
-        trade_returns.append(pnl / (capital - pnl) * 100)
-
-    results = np.array(trade_returns)
-    wins_arr = results[results > 0]
-    losses_arr = results[results < 0]
-
-    n_wins = len(wins_arr); n_loss = len(losses_arr)
-    win_rate = n_wins / len(results) * 100 if len(results) else 0
-    avg_win = wins_arr.mean() if n_wins > 0 else 0
-    avg_loss = abs(losses_arr.mean()) if n_loss > 0 else 0
-    expectancy = results.mean()
-    rr = avg_win / avg_loss if avg_loss > 0 else 0
-
-    return {
-        'tp': tp_pct, 'sl': sl_pct,
-        'hit_tp_pct': (df['max_%'] >= tp_pct).mean() * 100,
-        'hit_sl_pct': (df['min_%'] <= -sl_pct).mean() * 100,
-        'win_rate': win_rate,
-        'avg_win': avg_win, 'avg_loss': avg_loss,
-        'rr': rr, 'expectancy': expectancy,
-        'final_capital': capital,
-    }
+    tr = np.empty(len(rets))
+    pos_pct = CAPITAL_PER_TRADE_PCT / 100.0
+    for k, (end_pct, max_pct, min_pct) in enumerate(rets):
+        pos = capital * pos_pct
+        hit_tp = max_pct >= tp
+        hit_sl = min_pct <= -sl
+        if hit_tp and hit_sl: pnl_pct = -sl
+        elif hit_tp: pnl_pct = tp
+        elif hit_sl: pnl_pct = -sl
+        else: pnl_pct = end_pct
+        prev = capital
+        capital += pos * (pnl_pct / 100.0)
+        tr[k] = (capital - prev) / prev * 100.0
+    wins = tr[tr > 0]; losses = tr[tr < 0]
+    wr = len(wins) / len(tr) * 100 if len(tr) else 0
+    aw = wins.mean() if len(wins) else 0
+    al = abs(losses.mean()) if len(losses) else 0
+    rr = aw / al if al > 0 else 0
+    return {'capital': capital, 'win_rate': wr, 'rr': rr,
+            'avg_win': aw, 'avg_loss': al,
+            'expectancy': tr.mean() if len(tr) else 0}
 
 
 # ================== شروع ==================
 tg_send_message(
-    f"🚀 *شروع بک‌تست (فقط لانگ)*\n"
-    f"📅 الگو: `{PATTERN_DATE}`\n"
-    f"🪙 نمادها: {len(SYMBOLS)}\n"
-    f"⏱️ تایم‌فریم: `{TIMEFRAME}`\n"
-    f"🎯 افق بررسی: `{FORWARD_CANDLES}` کندل\n"
-    f"💰 هر معامله: `{CAPITAL_PER_TRADE_PCT}%` سرمایه"
+    f"🔎 *اسکنر الگوهای تاریخی*\n"
+    f"جستجوی بهترین ترکیب R:R + Win Rate\n"
+    f"🪙 {len(SYMBOLS)} نماد | ⏱️ `{TIMEFRAME}` | افق `{FORWARD_CANDLES}` کندل\n"
+    f"📊 حداقل معاملات: `{MIN_TRADES}`"
 )
 
-ex, ex_name = connect_exchange()
+ex = connect_exchange()
 
-target = pd.to_datetime(PATTERN_DATE).date()
-print(f"\n🔍 دریافت داده مرجع {PATTERN_SYMBOL} (روزانه) از {ex_name.upper()} ...")
-
-ref = fetch_ohlcv(ex, PATTERN_SYMBOL, '1d', days=1500)
-
-if ref is None or len(ref) == 0:
-    msg = "❌ داده مرجع دریافت نشد."
-    print(msg); tg_send_message(msg)
-    raise SystemExit
-
-oldest = ref.index[0].date()
-newest = ref.index[-1].date()
-print(f"📅 بازه‌ی داده: از {oldest} تا {newest}  ({len(ref)} کندل)")
-
-if oldest > target:
-    msg = f"❌ LBank فقط تا {oldest} عقب می‌رود."
-    print(msg); tg_send_message(msg)
-    raise SystemExit
-
-candidates = [r for d, r in ref.iterrows() if d.date() <= target]
-ref_row = candidates[-1]
-actual_date = ref_row.name.date()
-
-if actual_date != target:
-    print(f"⚠️ نزدیک‌ترین کندل به {PATTERN_DATE}: {actual_date}")
-
-row = ref_row
-pvec = candle_vector(row['open'], row['high'], row['low'], row['close'])
-print(f"\n📌 الگو ({actual_date}):")
-print(f"   O={row['open']:.4f}  H={row['high']:.4f}  L={row['low']:.4f}  C={row['close']:.4f}")
-print(f"📐 بردار: {pvec.round(3)}\n")
-
-all_trades = {}
-skipped = []
-
-print(f"📊 شروع بک‌تست {len(SYMBOLS)} نماد\n")
-
-for idx, sym in enumerate(SYMBOLS, 1):
-    print(f"[{idx:02d}/{len(SYMBOLS)}] {sym} ...", end=' ', flush=True)
-    t0 = time.time()
-    try:
-        if HAS_ALARM:
-            signal.alarm(PER_SYMBOL_TIMEOUT)
-        df = fetch_ohlcv(ex, sym, TIMEFRAME, days=LOOKBACK_DAYS)
-        if HAS_ALARM:
-            signal.alarm(0)
-    except TimeoutError_:
-        if HAS_ALARM: signal.alarm(0)
-        print("⏱️ timeout"); skipped.append(sym); continue
-    except Exception as e:
-        if HAS_ALARM: signal.alarm(0)
-        print(f"❌ {e.__class__.__name__}"); skipped.append(sym); continue
-
-    if df is None or len(df) < 60:
-        print("⏭️ داده ناکافی"); skipped.append(sym); continue
-
-    try:
-        matches = scan_matches(df, pvec, SIMILARITY_THRESHOLD)
-        trades = measure_forward(df, matches, FORWARD_CANDLES)
-        if not trades.empty:
-            trades['symbol'] = sym
-            all_trades[sym] = trades
-            print(f"✅ {len(trades)} تطابق ({time.time()-t0:.1f}s)")
-        else:
-            print(f"⚪ ۰ تطابق ({time.time()-t0:.1f}s)")
-    except Exception as e:
-        print(f"❌ {e.__class__.__name__}")
+# ---------- 1) داده‌ی نمادها ----------
+print("\n📥 دریافت داده‌ی نمادها ...")
+target_data = {}
+for i, sym in enumerate(SYMBOLS, 1):
+    print(f"  [{i:02d}/{len(SYMBOLS)}] {sym} ...", end=' ', flush=True)
+    df = fetch_ohlcv(ex, sym, TIMEFRAME, days=LOOKBACK_DAYS)
+    if df is not None and len(df) > FORWARD_CANDLES + 20:
+        target_data[sym] = df
+        print(f"✅ {len(df)}")
+    else:
+        print("⏭️")
     time.sleep(0.2)
 
+if not target_data:
+    tg_send_message("❌ داده‌ای دریافت نشد")
+    raise SystemExit("no data")
 
-# ================== گزارش ==================
-if skipped:
-    print(f"\n⏭️ رد شده: {', '.join(skipped)}")
+# ---------- 2) بردارها ----------
+print("\n⚙️ پیش‌پردازش ...")
+all_vecs_list, all_sym_list, all_idx_list = [], [], []
+sym_arrays = {}
+for sym, df in target_data.items():
+    vecs, valid = build_vectors(df)
+    idxs = np.where(valid)[0]
+    all_vecs_list.append(vecs[idxs])
+    all_sym_list.extend([sym] * len(idxs))
+    all_idx_list.extend(idxs.tolist())
+    sym_arrays[sym] = (df['open'].values, df['high'].values,
+                       df['low'].values, df['close'].values)
 
-if not all_trades:
-    msg = "❌ هیچ تطابقی پیدا نشد."
-    print(f"\n{msg}"); tg_send_message(msg)
-    raise SystemExit
+all_vecs = np.vstack(all_vecs_list)
+all_sym  = np.array(all_sym_list)
+all_idx  = np.array(all_idx_list)
+print(f"  کل بردارها: {len(all_vecs):,}")
 
-full = pd.concat(all_trades.values(), ignore_index=True)
-full = full.sort_values('entry_dt').reset_index(drop=True)
-total = len(full)
+# ---------- 3) بازده آینده ----------
+print("⏳ بازده‌های آینده ...")
+forward_map = {}
+for sym, (o, h, l, c) in sym_arrays.items():
+    n = len(o)
+    arr = np.full((n, 3), np.nan)
+    for i in range(n - FORWARD_CANDLES):
+        entry = o[i+1]
+        if entry <= 0: continue
+        fh = h[i+1:i+FORWARD_CANDLES+1].max()
+        fl = l[i+1:i+FORWARD_CANDLES+1].min()
+        fc = c[i+FORWARD_CANDLES]
+        arr[i] = [(fc-entry)/entry*100, (fh-entry)/entry*100, (fl-entry)/entry*100]
+    forward_map[sym] = arr
 
-# --- تفکیک برنده/بازنده ---
-win_trades  = full[full['end_%'] > 0].copy()
-loss_trades = full[full['end_%'] < 0].copy()
-flat_trades = full[full['end_%'] == 0]
+# ---------- 4) داده‌ی مرجع ----------
+print(f"\n📥 {PATTERN_SYMBOL} ({PATTERN_TIMEFRAME}) ...")
+ref = fetch_ohlcv(ex, PATTERN_SYMBOL, PATTERN_TIMEFRAME, days=PATTERN_LOOKBACK_DAYS)
+if ref is None or len(ref) < 30:
+    tg_send_message("❌ داده‌ی مرجع ناکافی")
+    raise SystemExit("no ref")
 
-wins_df = win_trades['end_%']
-loss_df = loss_trades['end_%']
+ref_vecs, ref_valid = build_vectors(ref)
+ref_dates = ref.index
+print(f"  {ref_dates[0].date()} → {ref_dates[-1].date()} ({len(ref)})")
 
-win_count  = len(win_trades)
-loss_count = len(loss_trades)
-win_pct    = win_count  / total * 100
-loss_pct   = loss_count / total * 100
+# ---------- 5) اسکن ----------
+print(f"\n🔎 اسکن {int(ref_valid.sum())} کندل ...\n")
+results = []
+t_start = time.time()
 
-# --- آمار MFE/MAE برای معاملات برنده (در ۶۰ کندل) ---
-if win_count > 0:
-    win_trades['drawdown_%'] = -win_trades['min_%']   # افت از ورود
-    win_trades['runup_%']    =  win_trades['max_%']   # رشد از ورود
+for pos in range(len(ref_vecs)):
+    if not ref_valid[pos]: continue
+    vec = ref_vecs[pos]
+    dt  = ref_dates[pos]
 
-    win_mfe_avg = win_trades['runup_%'].mean()
-    win_mfe_max = win_trades['runup_%'].max()
-    win_mfe_p50 = win_trades['runup_%'].median()
+    dists = np.linalg.norm(all_vecs - vec, axis=1)
+    mask = dists <= SIMILARITY_THRESHOLD
+    if mask.sum() < MIN_TRADES: continue
 
-    win_mae_avg = win_trades['drawdown_%'].mean()
-    win_mae_max = win_trades['drawdown_%'].max()
-    win_mae_p50 = win_trades['drawdown_%'].median()
-else:
-    win_mfe_avg = win_mfe_max = win_mfe_p50 = 0
-    win_mae_avg = win_mae_max = win_mae_p50 = 0
+    syms = all_sym[mask]; idxs = all_idx[mask]
+    rets = []
+    for s, i in zip(syms, idxs):
+        fr = forward_map[s][i]
+        if not np.isnan(fr[0]):
+            rets.append(fr)
+    if len(rets) < MIN_TRADES: continue
+    rets = np.array(rets)
 
-# --- آمار MFE/MAE برای معاملات بازنده ---
-if loss_count > 0:
-    loss_trades['drawdown_%'] = -loss_trades['min_%']
-    loss_trades['runup_%']    =  loss_trades['max_%']
+    best = None
+    for tp in TP_LEVELS:
+        for sl in SL_LEVELS:
+            s = simulate(rets, tp, sl)
+            if best is None or s['capital'] > best['capital']:
+                s['tp'], s['sl'] = tp, sl
+                best = s
+    if best is None: continue
 
-    loss_mfe_avg = loss_trades['runup_%'].mean()
-    loss_mfe_max = loss_trades['runup_%'].max()
-    loss_mae_avg = loss_trades['drawdown_%'].mean()
-    loss_mae_max = loss_trades['drawdown_%'].max()
-else:
-    loss_mfe_avg = loss_mfe_max = loss_mae_avg = loss_mae_max = 0
+    ends = rets[:, 0]
+    results.append({
+        'date': dt.date(), 'n_trades': len(rets),
+        'baseline_win_rate': (ends > 0).mean() * 100,
+        'baseline_exp': ends.mean(),
+        'tp': best['tp'], 'sl': best['sl'],
+        'win_rate': best['win_rate'], 'rr': best['rr'],
+        'expectancy': best['expectancy'],
+        'final_capital': best['capital'],
+        'avg_win': best['avg_win'], 'avg_loss': best['avg_loss'],
+    })
+    if len(results) % 100 == 0:
+        print(f"  ... {len(results)} | {time.time()-t_start:.0f}s")
 
-print("\n" + "="*70)
-print("📈 خلاصه‌ی کلی")
-print("="*70)
-print(f"  تعداد کل معاملات: {total}")
-print(f"  برنده:            {win_count} ({win_pct:.1f}%)")
-print(f"  بازنده:           {loss_count} ({loss_pct:.1f}%)")
-print(f"  میانگین بازده:    {full['end_%'].mean():+.2f}%")
-print(f"  میانگین MFE:      {full['max_%'].mean():+.2f}%")
-print(f"  میانگین MAE:      {full['min_%'].mean():+.2f}%")
-print("\n  --- معاملات برنده (۶۰ کندل) ---")
-print(f"  میانگین رشد (MFE):     +{win_mfe_avg:.2f}%")
-print(f"  بیشترین رشد:           +{win_mfe_max:.2f}%")
-print(f"  میانگین افت (MAE):     -{win_mae_avg:.2f}%")
-print(f"  بیشترین افت برنده‌ها:  -{win_mae_max:.2f}%")
+elapsed = time.time() - t_start
+print(f"\n✅ {len(results)} الگو در {elapsed:.0f}s")
 
+if not results:
+    tg_send_message("❌ الگویی با شرایط کافی پیدا نشد")
+    raise SystemExit("no results")
 
-# ================== SL پیشنهادی ==================
-if win_count > 0:
-    sl_80 = win_trades['drawdown_%'].quantile(0.80)
-    sl_90 = win_trades['drawdown_%'].quantile(0.90)
-    sl_95 = win_trades['drawdown_%'].quantile(0.95)
-else:
-    sl_80 = sl_90 = sl_95 = 5.0
+df_res = pd.DataFrame(results).sort_values('final_capital', ascending=False).reset_index(drop=True)
+df_res['score_balanced'] = df_res['win_rate'] * df_res['rr']
+df_res_balanced = df_res.sort_values('score_balanced', ascending=False).reset_index(drop=True)
 
-SL_FIXED = round(sl_90, 2)
-tp_levels = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30]
-sl_options = [2, 3, 4, 5, 6, 8, 10, 12, 15]
-
-tp_results = [simulate_tp_sl(full, tp, SL_FIXED) for tp in tp_levels]
-best_tp = max(tp_results, key=lambda x: x['final_capital'])
-
-matrix_vals = {}
-for tp in tp_levels:
-    for sl in sl_options:
-        matrix_vals[(tp, sl)] = simulate_tp_sl(full, tp, sl)
-
-all_combos = list(matrix_vals.values())
-best_combo = max(all_combos, key=lambda x: x['expectancy'])
-best_capital = max(all_combos, key=lambda x: x['final_capital'])
-
-
-# ================== ذخیره‌ی CSV ==================
-full.to_csv(os.path.join(OUTPUT_DIR, f'backtest_results_{PATTERN_DATE}.csv'), index=False)
-pd.DataFrame(tp_results).to_csv(os.path.join(OUTPUT_DIR, f'tp_analysis_{PATTERN_DATE}.csv'), index=False)
-pd.DataFrame([{**{'tp': tp, 'sl': sl}, **matrix_vals[(tp, sl)]}
-              for tp in tp_levels for sl in sl_options]).to_csv(
-    os.path.join(OUTPUT_DIR, f'tp_sl_matrix_{PATTERN_DATE}.csv'), index=False)
-
+# ذخیره‌ی محلی (اختیاری - برای خودت)
+out_path = os.path.join(OUTPUT_DIR, 'best_patterns.csv')
+df_res.to_csv(out_path, index=False)
+print(f"💾 {out_path} (فقط ذخیره‌ی محلی)")
 
 # ================== ارسال به تلگرام ==================
 print("\n📱 ارسال به تلگرام ...")
+top = df_res.head(TOP_N)
 
-profitable = best_combo['win_rate'] > 100/(1+best_combo['rr'])
-status_emoji = "✅" if profitable else "⚠️"
-
-# ---- پیام ۱: خلاصه‌ی کلی ----
+# ---- پیام ۱: خلاصه ----
 msg1 = (
-    f"📊 *نتیجه‌ی بک‌تست لانگ*\n"
+    f"🏆 *نتایج اسکن الگوها*\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"📅 الگو: `{actual_date}`\n"
-    f"🪙 نمادها: {len(SYMBOLS)} | رد شده: {len(skipped)}\n"
-    f"⏱️ تایم‌فریم: `{TIMEFRAME}` | افق: `{FORWARD_CANDLES}` کندل\n"
-    f"💰 هر معامله: `{CAPITAL_PER_TRADE_PCT}%` سرمایه\n"
+    f"📊 الگوهای اسکن‌شده: `{len(results)}`\n"
+    f"🪙 نمادها: `{len(target_data)}`\n"
+    f"⏱️ تایم‌فریم: `{TIMEFRAME}` | افق: `{FORWARD_CANDLES}`\n"
+    f"📌 حداقل معاملات: `{MIN_TRADES}`\n"
+    f"⏱️ زمان اسکن: `{elapsed:.0f}s`\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"*📈 خلاصه‌ی کلی:*\n"
-    f"• تعداد کل: `{total}`\n"
-    f"• میانگین بازده: `{full['end_%'].mean():+.2f}%`\n"
-    f"• میانگین MFE: `{full['max_%'].mean():+.2f}%`\n"
-    f"• میانگین MAE: `{full['min_%'].mean():+.2f}%`"
+    f"🎯 معیار: *سرمایه‌ی نهایی* (ترکیب WR و R:R)"
 )
 tg_send_message(msg1)
 
-# ---- پیام ۲: درصد برنده/بازنده ----
-msg2 = (
-    f"🎯 *درصد معاملات برنده و بازنده*\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"✅ برنده: `{win_count}` معامله → `{win_pct:.1f}%`\n"
-    f"❌ بازنده: `{loss_count}` معامله → `{loss_pct:.1f}%`\n"
-    f"➖ بدون تغییر: `{len(flat_trades)}`\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"📊 نرخ برد کل: `{win_pct:.1f}%`"
-)
-tg_send_message(msg2)
+# ---- پیام‌های ۲-۳: جزئیات top 10 ----
+for chunk_start in range(0, TOP_N, 5):
+    chunk_text = f"📋 *الگوهای #{chunk_start+1} تا #{min(chunk_start+5, TOP_N)}*\n"
+    chunk_text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    for i in range(chunk_start, min(chunk_start+5, TOP_N)):
+        r = top.iloc[i]
+        chunk_text += (
+            f"*#{i+1}*  📅 `{r['date']}`\n"
+            f"  ▪️ معاملات: `{int(r['n_trades'])}`\n"
+            f"  ▪️ TP/SL: `+{r['tp']}%` / `-{r['sl']}%`\n"
+            f"  ▪️ Win Rate: `{r['win_rate']:.1f}%`\n"
+            f"  ▪️ R:R: `{r['rr']:.2f} : 1`\n"
+            f"  ▪️ Expectancy: `{r['expectancy']:+.2f}%`\n"
+            f"  ▪️ سرمایه: `{r['final_capital']:.1f}`\n\n"
+        )
+    tg_send_message(chunk_text)
 
-# ---- پیام ۳: بیشترین افت و رشد معاملات برنده در ۶۰ کندل ----
-msg3 = (
-    f"📈 *تحلیل معاملات برنده در {FORWARD_CANDLES} کندل*\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"*🟢 بیشترین رشد (MFE):*\n"
-    f"• میانگین: `+{win_mfe_avg:.2f}%`\n"
-    f"• میانه: `+{win_mfe_p50:.2f}%`\n"
-    f"• بیشترین: `+{win_mfe_max:.2f}%`\n\n"
-    f"*🔴 بیشترین افت (MAE):*\n"
-    f"• میانگین: `-{win_mae_avg:.2f}%`\n"
-    f"• میانه: `-{win_mae_p50:.2f}%`\n"
-    f"• بیشترین: `-{win_mae_max:.2f}%`\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"💡 یعنی یک معامله‌ی برنده‌ی معمولی\n"
-    f"تا `-{win_mae_avg:.2f}%` افت می‌کند و تا `+{win_mfe_avg:.2f}%` رشد"
-)
-tg_send_message(msg3)
-
-# ---- پیام ۴: تحلیل معاملات بازنده ----
-msg4 = (
-    f"📉 *تحلیل معاملات بازنده در {FORWARD_CANDLES} کندل*\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"*🟢 بیشترین رشد ناگهانی (MFE):*\n"
-    f"• میانگین: `+{loss_mfe_avg:.2f}%`\n"
-    f"• بیشترین: `+{loss_mfe_max:.2f}%`\n\n"
-    f"*🔴 بیشترین افت (MAE):*\n"
-    f"• میانگین: `-{loss_mae_avg:.2f}%`\n"
-    f"• بیشترین: `-{loss_mae_max:.2f}%`"
-)
+# ---- پیام ۴: متعادل‌ها ----
+msg4 = "⚖️ *۵ الگوی متعادل (WR × R:R)*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+for i in range(min(5, len(df_res_balanced))):
+    r = df_res_balanced.iloc[i]
+    msg4 += (
+        f"*#{i+1}*  📅 `{r['date']}`\n"
+        f"  ▪️ WR: `{r['win_rate']:.1f}%`  |  R:R: `{r['rr']:.2f}`\n"
+        f"  ▪️ TP/SL: `+{r['tp']}%` / `-{r['sl']}%`\n"
+        f"  ▪️ امتیاز: `{r['score_balanced']:.1f}`\n\n"
+    )
 tg_send_message(msg4)
 
-# ---- پیام ۵: TP/SL پیشنهادی ----
+# ---- پیام ۵: پیشنهاد نهایی ----
+best = df_res.iloc[0]
+profitable = best['win_rate'] > 100 / (1 + best['rr']) if best['rr'] > 0 else False
+status_emoji = "✅" if profitable else "⚠️"
+
 msg5 = (
-    f"🎯 *پیشنهاد حد سود و حد ضرر*\n"
+    f"💡 *پیشنهاد نهایی*\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"• حد سود (TP): `+{best_combo['tp']:.1f}%`\n"
-    f"• حد ضرر (SL): `-{best_combo['sl']:.1f}%`\n"
-    f"• نسبت R:R: `{best_combo['rr']:.2f} : 1`\n"
-    f"• نرخ برد مورد نیاز: `{100/(1+best_combo['rr']):.1f}%`\n"
-    f"• نرخ برد واقعی: `{best_combo['win_rate']:.1f}%`\n"
-    f"• امید ریاضی: `{best_combo['expectancy']:+.2f}%`\n"
-    f"• سرمایه‌ی نهایی: `{best_combo['final_capital']:.2f}`\n"
+    f"🥇 الگو: `{best['date']}`\n"
+    f"• TP: `+{best['tp']}%`\n"
+    f"• SL: `-{best['sl']}%`\n"
+    f"• Win Rate: `{best['win_rate']:.1f}%`\n"
+    f"• R:R: `{best['rr']:.2f} : 1`\n"
+    f"• نرخ برد موردنیاز: `{100/(1+best['rr']):.1f}%`\n"
+    f"• Expectancy: `{best['expectancy']:+.2f}%`\n"
+    f"• سرمایه نهایی: `{best['final_capital']:.1f}`\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"{status_emoji} {'استراتژی سودآور است' if profitable else 'نیاز به بهینه‌سازی دارد'}"
+    f"{status_emoji} {'استراتژی سودآور' if profitable else 'نیاز به بهینه‌سازی'}\n"
+    f"⚠️ مراقب Overfitting باش"
 )
 tg_send_message(msg5)
 
-# ---- پیام ۶: SL بر اساس MAE برنده‌ها ----
-msg6 = (
-    f"📌 *SL پیشنهادی (بر اساس MAE برنده‌ها)*\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"• SL = `-{sl_80:.2f}%` → حفظ ۸۰٪ برنده‌ها\n"
-    f"• SL = `-{sl_90:.2f}%` → حفظ ۹۰٪ برنده‌ها\n"
-    f"• SL = `-{sl_95:.2f}%` → حفظ ۹۵٪ برنده‌ها\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"🏆 بهترین TP (بیشترین سرمایه): `+{best_tp['tp']:.1f}%` → `{best_tp['final_capital']:.2f}`\n"
-    f"🏆 بهترین TP/SL (بیشترین امید):  `+{best_combo['tp']:.1f}%` / `-{best_combo['sl']:.1f}%`"
-)
-tg_send_message(msg6)
+# ---- پیام پایانی ----
+tg_send_message("✅ اسکن تمام شد.")
 
-print("\n✅ همه چیز تمام شد.")
+print("\n✅ تمام شد.")
