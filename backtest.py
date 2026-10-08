@@ -22,7 +22,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 TARGET_SYMBOL = "ETH-USD"
-TARGET_DATE   = "2025-07-04"
+TARGET_DATE   = "2025-07-05"     # ← کندل آخر الگو
+
+PATTERN_LEN   = 2                # ← الگو دو کندلی
 
 SYMBOLS = [
     "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
@@ -32,11 +34,11 @@ SYMBOLS = [
 INTERVAL = "1d"
 PERIOD   = "10y"
 
-LOOKAHEAD    = 100          # تعداد کندل بعدی برای بررسی
-K_PER_SYMBOL = 20           # از هر ارز چند نزدیک‌ترین کندل
-TOTAL_TOP    = 100          # نهایتاً چند کندل مشابه تحلیل شود
+LOOKAHEAD    = 100
+K_PER_SYMBOL = 20
+TOTAL_TOP    = 100
 
-LOW_DD_THRESHOLD = 3.0      # آستانه‌ی ریزش اولیه برای گروه کم‌ریسک
+LOW_DD_THRESHOLD = 3.0
 
 
 # ---------- سطل‌های ۱٪ ----------
@@ -79,6 +81,23 @@ def candle_features(i, o, h, l, c):
     lower_wick  = (min(op, cl) - lo) / op
     total_range = (hi - lo) / op
     return np.array([body, upper_wick, lower_wick, total_range], dtype=float)
+
+
+def pattern_features(end_idx, o, h, l, c, pattern_len=PATTERN_LEN):
+    """
+    ویژگی‌های الگوی چندکندلی که به کندل end_idx ختم می‌شود.
+    خروجی: بردار 4*pattern_len بعدی.
+    """
+    start = end_idx - pattern_len + 1
+    if start < 0:
+        return None
+    feats = []
+    for j in range(start, end_idx + 1):
+        f = candle_features(j, o, h, l, c)
+        if f is None:
+            return None
+        feats.append(f)
+    return np.concatenate(feats)
 
 
 def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
@@ -216,16 +235,16 @@ def send_photo(buf, caption):
         log(f"❌ send photo: {e}")
 
 
-# ==================== جستجوی تک‌کندل‌های مشابه ====================
+# ==================== جستجوی الگوهای مشابه ====================
 def find_similar_candles(df_target, target_idx, dfs):
     o_t = df_target['Open'].values.astype(float)
     h_t = df_target['High'].values.astype(float)
     l_t = df_target['Low'].values.astype(float)
     c_t = df_target['Close'].values.astype(float)
 
-    target_feat = candle_features(target_idx, o_t, h_t, l_t, c_t)
+    target_feat = pattern_features(target_idx, o_t, h_t, l_t, c_t)
     if target_feat is None:
-        raise RuntimeError("ویژگی کندل هدف محاسبه نشد.")
+        raise RuntimeError("ویژگی الگوی هدف محاسبه نشد.")
 
     target_date = df_target.index[target_idx]
     target_date_naive = target_date
@@ -243,8 +262,9 @@ def find_similar_candles(df_target, target_idx, dfs):
         c = df['Close'].values.astype(float)
         n = len(df)
 
+        # آخرین اندیسی که هم فضای آینده دارد و هم کندل قبلش هست
         max_i = n - LOOKAHEAD - 1
-        if max_i <= 0:
+        if max_i < PATTERN_LEN - 1:
             continue
 
         idx_naive = df.index
@@ -259,12 +279,12 @@ def find_similar_candles(df_target, target_idx, dfs):
         if sym == TARGET_SYMBOL:
             max_i = min(max_i, target_idx - 1)
 
-        if max_i <= 0:
+        if max_i < PATTERN_LEN - 1:
             continue
 
         feats, idxs = [], []
-        for i in range(0, max_i + 1):
-            f = candle_features(i, o, h, l, c)
+        for i in range(PATTERN_LEN - 1, max_i + 1):
+            f = pattern_features(i, o, h, l, c)
             if f is None:
                 continue
             feats.append(f)
@@ -284,7 +304,7 @@ def find_similar_candles(df_target, target_idx, dfs):
                 'idx':    int(idxs[oi]),
                 'dist':   float(dists[oi]),
             })
-        log(f"   ✔️ {sym}: {k} کندل مشابه "
+        log(f"   ✔️ {sym}: {k} الگوی مشابه "
             f"(کمترین فاصله: {dists[order[0]]:.4f})")
 
     candidates_all.sort(key=lambda x: x['dist'])
@@ -314,7 +334,7 @@ def build_chart(details, target_forward, target_date_str):
                 label=f'Target {TARGET_SYMBOL}')
     ax.axhline(100, color='#888', linestyle=':', linewidth=1)
     ax.set_title(f"All {len(results)} forward paths", fontweight='bold')
-    ax.set_xlabel('Bars after candle'); ax.set_ylabel('Normalized price')
+    ax.set_xlabel('Bars after pattern'); ax.set_ylabel('Normalized price')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
     ax = axes[0, 1]
@@ -331,7 +351,7 @@ def build_chart(details, target_forward, target_date_str):
                 linestyle='--', label='Target actual')
     ax.axhline(100, color='#888', linestyle=':', linewidth=1)
     ax.set_title("Overall mean / median / band", fontweight='bold')
-    ax.set_xlabel('Bars after candle'); ax.set_ylabel('Normalized price')
+    ax.set_xlabel('Bars after pattern'); ax.set_ylabel('Normalized price')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
     ax = axes[0, 2]
@@ -352,7 +372,7 @@ def build_chart(details, target_forward, target_date_str):
                 linestyle='--', label='Target actual')
     ax.axhline(100, color='#888', linestyle=':', linewidth=1)
     ax.set_title("Mean path UP vs DOWN", fontweight='bold')
-    ax.set_xlabel('Bars after candle'); ax.set_ylabel('Normalized price')
+    ax.set_xlabel('Bars after pattern'); ax.set_ylabel('Normalized price')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
     dd_vals = details['all_max_dd']
@@ -387,7 +407,8 @@ def build_chart(details, target_forward, target_date_str):
     ax.set_xlabel('Final return (٪)'); ax.set_ylabel('Count')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
-    plt.suptitle(f"Top {len(results)} similar PAST candles | "
+    plt.suptitle(f"Top {len(results)} similar PAST patterns "
+                 f"({PATTERN_LEN} candles) | "
                  f"Target: {TARGET_SYMBOL} {target_date_str}",
                  fontsize=13, fontweight='bold')
     plt.tight_layout()
@@ -520,10 +541,6 @@ def report_target_reach_down(downs):
 
 # ==================== تحلیل برنده‌های کم‌ریسک ====================
 def report_low_dd_winners(ups, n_total, dd_threshold=3.0):
-    """
-    برنده‌هایی که ریزش اولیه‌شون (قبل از سربه‌سر شدن)
-    کمتر از dd_threshold درصد بوده — چقدر سود دادن؟
-    """
     lines = []
     if not ups:
         return lines
@@ -555,7 +572,7 @@ def report_low_dd_winners(ups, n_total, dd_threshold=3.0):
     lines.append(f"├ تعداد: <code>{n_low}</code> از "
                  f"<code>{n_up}</code> برنده "
                  f"({n_low / n_up * 100:.1f}٪ از برنده‌ها)")
-    lines.append(f"└ سهم از کل {n_total} کندل مشابه: "
+    lines.append(f"└ سهم از کل {n_total} الگوی مشابه: "
                  f"<code>{n_low / n_total * 100:.1f}٪</code>")
     lines.append("")
 
@@ -650,23 +667,39 @@ def report_single(details, df_target, target_idx, target_forward):
     h_t = df_target['High'].values.astype(float)
     l_t = df_target['Low'].values.astype(float)
     c_t = df_target['Close'].values.astype(float)
-    op = o_t[target_idx]; cl = c_t[target_idx]
-    hi = h_t[target_idx]; lo = l_t[target_idx]
-    body_pct  = (cl - op) / op * 100
-    range_pct = (hi - lo) / op * 100
-    color     = "🟢 صعودی" if cl >= op else "🔴 نزولی"
 
     lines = []
-    lines.append(f"🕯 <b>تحلیل تک‌کندل مشابه {TARGET_SYMBOL}</b>")
+    lines.append(f"🕯 <b>تحلیل الگوی {PATTERN_LEN}-کندلی مشابه {TARGET_SYMBOL}</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"🗓 کندل هدف: <code>{df_target.index[target_idx].date()}</code>")
-    lines.append(f"🎨 رنگ: {color}")
-    lines.append(f"💵 باز: <code>{op:.2f}</code> | بسته: <code>{cl:.2f}</code>")
-    lines.append(f"📊 بدنه: <code>{body_pct:+.2f}٪</code> | "
-                 f"دامنه: <code>{range_pct:.2f}٪</code>")
-    lines.append(f"⏭ بررسی <code>{LOOKAHEAD}</code> کندل بعدی")
-    lines.append(f"✅ فقط کندل‌های گذشته (بدون نگاه به آینده)")
-    lines.append(f"🌐 تعداد کندل مشابه: <code>{n_total}</code>")
+
+    # نمایش کندل‌های الگو
+    lines.append(f"🗓 <b>کندل‌های الگو ({PATTERN_LEN} کندل):</b>")
+    pattern_start = target_idx - PATTERN_LEN + 1
+    for k, j in enumerate(range(pattern_start, target_idx + 1), 1):
+        op = o_t[j]; cl = c_t[j]; hi = h_t[j]; lo = l_t[j]
+        if op <= 0:
+            continue
+        body_pct  = (cl - op) / op * 100
+        range_pct = (hi - lo) / op * 100
+        color = "🟢" if cl >= op else "🔴"
+        d_str = df_target.index[j].date()
+        lines.append(
+            f"├ کندل {k} ({d_str}) {color}: "
+            f"O=<code>{op:.2f}</code> H=<code>{hi:.2f}</code> "
+            f"L=<code>{lo:.2f}</code> C=<code>{cl:.2f}</code>"
+        )
+        lines.append(
+            f"│   بدنه: <code>{body_pct:+.2f}٪</code> | "
+            f"دامنه: <code>{range_pct:.2f}٪</code>"
+        )
+
+    entry_price = c_t[target_idx]
+    lines.append(f"└ 💵 قیمت ورود (Close آخرین کندل): "
+                 f"<code>{entry_price:.2f}</code>")
+    lines.append("")
+    lines.append(f"⏭ بررسی <code>{LOOKAHEAD}</code> کندل بعدی از این نقطه")
+    lines.append(f"✅ فقط الگوهای گذشته (بدون نگاه به آینده)")
+    lines.append(f"🌐 تعداد الگوی مشابه: <code>{n_total}</code>")
     lines.append("")
 
     lines.append("<b>📈 آمار کلی:</b>")
@@ -710,7 +743,6 @@ def report_single(details, df_target, target_idx, target_forward):
         lines.extend(report_up_group_path(ups))
         lines.append("")
 
-        # ---- برنده‌های کم‌ریسک (ریزش اولیه زیر ۳٪) ----
         lines.extend(report_low_dd_winners(ups, n_total,
                                            dd_threshold=LOW_DD_THRESHOLD))
         lines.append("")
@@ -730,7 +762,7 @@ def report_single(details, df_target, target_idx, target_forward):
         lines.append("")
 
     if target_actual:
-        lines.append("<b>🔵 مسیر واقعی همین کندل تا الان:</b>")
+        lines.append("<b>🔵 مسیر واقعی همین الگو تا الان:</b>")
         lines.append(f"├ بازدهی: <code>{target_actual['ret']:+.2f}٪</code>")
         lines.append(f"├ بیشترین رشد: <code>{target_actual['max_up']:+.2f}٪</code>")
         lines.append(f"└ بیشترین ریزش: <code>{target_actual['max_dd']:+.2f}٪</code>")
@@ -741,7 +773,7 @@ def report_single(details, df_target, target_idx, target_forward):
         lines.append(f"• <code>{s}</code>: {cnt} مورد")
     lines.append("")
 
-    lines.append("<b>🔝 ۱۰ کندل نزدیک‌تر:</b>")
+    lines.append(f"<b>🔝 ۱۰ الگوی نزدیک‌تر (کندل آخر الگو):</b>")
     for r in res[:10]:
         d = r['date'].strftime('%Y-%m-%d') \
             if hasattr(r['date'], 'strftime') else str(r['date'])
@@ -758,7 +790,7 @@ def report_single(details, df_target, target_idx, target_forward):
 # ==================== اجرای اصلی ====================
 def main():
     log("=" * 60)
-    log(f"🚀 مشابه‌یابی تک‌کندل {TARGET_SYMBOL}")
+    log(f"🚀 مشابه‌یابی الگوی {PATTERN_LEN}-کندلی {TARGET_SYMBOL}")
     log("=" * 60)
 
     dfs = {}
@@ -777,7 +809,17 @@ def main():
         idx_naive = idx_naive.tz_localize(None)
     deltas = np.abs((idx_naive - pd.Timestamp(TARGET_DATE)).total_seconds())
     target_idx = int(np.argmin(deltas))
-    log(f"🎯 کندل هدف: {df_target.index[target_idx].date()}")
+
+    if target_idx < PATTERN_LEN - 1:
+        raise RuntimeError(
+            f"کندل هدف ({TARGET_DATE}) باید حداقل "
+            f"{PATTERN_LEN - 1} کندل قبل از خود داشته باشد."
+        )
+
+    log(f"🎯 کندل آخر الگو: {df_target.index[target_idx].date()}")
+    if PATTERN_LEN > 1:
+        log(f"   کندل اول الگو: "
+            f"{df_target.index[target_idx - PATTERN_LEN + 1].date()}")
 
     o_t = df_target['Open'].values.astype(float)
     h_t = df_target['High'].values.astype(float)
@@ -786,11 +828,11 @@ def main():
     target_actual = analyze_forward(target_idx, o_t, h_t, l_t, c_t, n_t, LOOKAHEAD)
     target_forward = target_actual['path'] if target_actual else None
 
-    log("\n🔍 جستجوی تک‌کندل‌های مشابه در گذشته...")
+    log(f"\n🔍 جستجوی الگوهای {PATTERN_LEN}-کندلی مشابه در گذشته...")
     candidates = find_similar_candles(df_target, target_idx, dfs)
     if not candidates:
-        raise RuntimeError("هیچ کندل مشابهی یافت نشد.")
-    log(f"\n🏆 {len(candidates)} کندل مشابه برتر انتخاب شد.")
+        raise RuntimeError("هیچ الگوی مشابهی یافت نشد.")
+    log(f"\n🏆 {len(candidates)} الگوی مشابه برتر انتخاب شد.")
 
     results = []
     for c_ in candidates:
@@ -800,6 +842,7 @@ def main():
         l = df['Low'].values.astype(float)
         cc = df['Close'].values.astype(float)
         n = len(df)
+        # entry_idx = کندل آخر الگو (پس ورود از Close همان کندل)
         r = analyze_forward(c_['idx'], o, h, l, cc, n, LOOKAHEAD)
         if r is None:
             continue
@@ -841,9 +884,9 @@ def main():
     try:
         target_date_str = df_target.index[target_idx].strftime('%Y-%m-%d')
         buf = build_chart(details, target_forward, target_date_str)
-        caption = (f"🕯 تک‌کندل مشابه {TARGET_SYMBOL} | "
+        caption = (f"🕯 الگوی {PATTERN_LEN}-کندلی مشابه {TARGET_SYMBOL} | "
                    f"{df_target.index[target_idx].date()}\n"
-                   f"کندل‌های مشابه: {n_total} | صعودی: {win_rate:.0f}٪")
+                   f"الگوهای مشابه: {n_total} | صعودی: {win_rate:.0f}٪")
         send_photo(buf, caption)
     except Exception as e:
         log(f"❌ chart: {e}")
