@@ -1,351 +1,203 @@
-# ================== ایمپورت‌ها ==================
-import matplotlib
-matplotlib.use('Agg')
-
-import ccxt, time, warnings, os, requests
+import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone
+from sklearn.metrics import pairwise_distances
+import requests
+from datetime import datetime
+import io
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
-warnings.filterwarnings('ignore')
+# ======================== تنظیمات تلگرام ========================
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"      # توکن بات خود را جایگزین کنید
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"          # Chat ID خود را جایگزین کنید
 
-OUTPUT_DIR = 'outputs'
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# ======================== تنظیمات استراتژی ========================
+SYMBOL = "BTC-USD"
+INTERVAL = "1d"
+PATTERN_LEN = 5
+LOOKAHEAD = 60
+RR_RATIO = 2.0
+TOP_N = 5
 
-# ================== تلگرام ==================
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
-TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
-TELEGRAM_ENABLED   = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
-
-TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
-
-def _split_text(text, max_len=3800):
-    lines = text.split('\n')
-    chunks, cur = [], ''
-    for line in lines:
-        if len(cur) + len(line) + 1 > max_len:
-            if cur: chunks.append(cur)
-            cur = line
-        else:
-            cur = cur + '\n' + line if cur else line
-    if cur: chunks.append(cur)
-    return chunks
-
-
-def tg_send_message(text, parse_mode='Markdown'):
-    if not TELEGRAM_ENABLED:
-        print("ℹ️ تلگرام غیرفعال")
+# ======================== توابع تلگرام ========================
+def send_telegram_message(text, parse_mode="Markdown"):
+    """ارسال پیام متنی به تلگرام"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": parse_mode
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            print(f"❌ خطا در ارسال پیام: {r.text}")
+        return r.ok
+    except Exception as e:
+        print(f"❌ خطای شبکه: {e}")
         return False
-    url = f"{TG_API}/sendMessage"
-    for chunk in _split_text(text):
-        try:
-            r = requests.post(url, data={
-                'chat_id': TELEGRAM_CHAT_ID,
-                'text': chunk,
-                'parse_mode': parse_mode,
-                'disable_web_page_preview': True,
-            }, timeout=20)
-            if r.status_code != 200:
-                # fallback بدون Markdown
-                requests.post(url, data={
-                    'chat_id': TELEGRAM_CHAT_ID,
-                    'text': chunk,
-                }, timeout=20)
-            time.sleep(0.3)
-        except Exception as e:
-            print(f"❌ تلگرام: {e}")
-    return True
 
+def send_telegram_photo(photo_bytes, caption=""):
+    """ارسال تصویر به تلگرام"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    files = {"photo": ("chart.png", photo_bytes, "image/png")}
+    data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "Markdown"}
+    try:
+        r = requests.post(url, files=files, data=data, timeout=30)
+        if r.status_code != 200:
+            print(f"❌ خطا در ارسال عکس: {r.text}")
+        return r.ok
+    except Exception as e:
+        print(f"❌ خطای شبکه: {e}")
+        return False
 
-# ================== تنظیمات ==================
-SYMBOLS = ['BTC/USDT','ETH/USDT','BNB/USDT','SOL/USDT','XRP/USDT',
-           'DOGE/USDT','ADA/USDT','AVAX/USDT','LTC/USDT','UNI/USDT']
+# ======================== دریافت داده ========================
+print("📥 دریافت داده از yfinance...")
+df = yf.download(SYMBOL, interval=INTERVAL, progress=False)
+if isinstance(df.columns, pd.MultiIndex):
+    df.columns = df.columns.get_level_values(0)
+df = df[['Open', 'High', 'Low', 'Close']].dropna()
+print(f"تعداد کندل: {len(df)}")
 
-TIMEFRAME             = '4h'
-LOOKBACK_DAYS         = 730
-PATTERN_SYMBOL        = 'ETH/USDT'
-PATTERN_TIMEFRAME     = '1d'
-PATTERN_LOOKBACK_DAYS = 1500
-SIMILARITY_THRESHOLD  = 0.08
-FORWARD_CANDLES       = 60
-MIN_TRADES            = 30
-CAPITAL_PER_TRADE_PCT = 2.0
-EXCHANGE_NAME         = 'lbank'
-TOP_N                 = 10
-TP_LEVELS = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30]
-SL_LEVELS = [2, 3, 4, 5, 6, 8, 10, 12, 15]
-MAX_FETCH_RETRIES = 2
+open_p = df['Open'].values
+high_p = df['High'].values
+low_p = df['Low'].values
+close_p = df['Close'].values
+n = len(close_p)
 
+def make_feature_vector(idx_start, length):
+    o = open_p[idx_start:idx_start+length]
+    h = high_p[idx_start:idx_start+length]
+    l = low_p[idx_start:idx_start+length]
+    c = close_p[idx_start:idx_start+length]
+    vec = np.concatenate([o, h, l, c])
+    if np.std(vec) == 0:
+        return np.zeros_like(vec)
+    return (vec - np.mean(vec)) / np.std(vec)
 
-# ================== توابع ==================
-def connect_exchange():
-    ex = getattr(ccxt, EXCHANGE_NAME)({'enableRateLimit': True, 'timeout': 20000})
-    ex.load_markets()
-    print(f"✅ اتصال به {EXCHANGE_NAME.upper()}")
-    return ex
+# ======================== یافتن الگوهای مشابه ========================
+target_vec = make_feature_vector(n - PATTERN_LEN, PATTERN_LEN).reshape(1, -1)
 
+candidate_indices = range(0, n - PATTERN_LEN - LOOKAHEAD)
+candidate_vectors = []
+valid_indices = []
+for idx in candidate_indices:
+    candidate_vectors.append(make_feature_vector(idx, PATTERN_LEN))
+    valid_indices.append(idx)
 
-def fetch_ohlcv(ex, sym, tf, days):
-    since = ex.parse8601((datetime.now(timezone.utc) - timedelta(days=days)).isoformat())
-    data, retries = [], 0
-    while True:
-        try:
-            ohlcv = ex.fetch_ohlcv(sym, tf, since, limit=1000)
-            retries = 0
-        except Exception:
-            retries += 1
-            if retries > MAX_FETCH_RETRIES: return None
-            time.sleep(1); continue
-        if not ohlcv: break
-        data.extend(ohlcv)
-        since = ohlcv[-1][0] + 1
-        if len(ohlcv) < 1000: break
-        time.sleep(0.15)
-    if not data: return None
-    df = pd.DataFrame(data, columns=['ts','open','high','low','close','volume'])
-    df['dt'] = pd.to_datetime(df['ts'], unit='ms')
-    df.set_index('dt', inplace=True)
-    return df[['open','high','low','close','volume']].astype(float).sort_index()
+candidate_vectors = np.array(candidate_vectors)
+distances = pairwise_distances(target_vec, candidate_vectors, metric='euclidean')[0]
 
+sorted_idx = np.argsort(distances)
+top_indices = sorted_idx[:TOP_N]
 
-def build_vectors(df):
-    o, h, l, c = df['open'].values, df['high'].values, df['low'].values, df['close'].values
-    rng = h - l
-    valid = rng > 0
-    safe = np.where(valid, rng, 1.0)
-    vecs = np.stack([(o-l)/safe, np.ones_like(o), np.zeros_like(o), (c-l)/safe], axis=1)
-    return vecs, valid
+# ======================== شبیه‌سازی معاملات ========================
+def simulate_trade(entry_idx, lookahead=LOOKAHEAD, rr=RR_RATIO):
+    if entry_idx + 1 >= n:
+        return None
+    entry_price = open_p[entry_idx + 1]
+    stop_loss = min(low_p[entry_idx:entry_idx+PATTERN_LEN])
+    risk = entry_price - stop_loss
+    if risk <= 0:
+        return None
+    take_profit = entry_price + rr * risk
+    end_idx = min(entry_idx + 1 + lookahead, n)
+    for j in range(entry_idx + 1, end_idx):
+        if low_p[j] <= stop_loss:
+            return {'result': 'loss', 'entry': entry_price, 'exit': stop_loss,
+                    'bars': j - entry_idx - 1, 'idx': entry_idx}
+        if high_p[j] >= take_profit:
+            return {'result': 'win', 'entry': entry_price, 'exit': take_profit,
+                    'bars': j - entry_idx - 1, 'idx': entry_idx}
+    exit_price = close_p[end_idx - 1]
+    pnl = exit_price - entry_price
+    return {'result': 'win' if pnl > 0 else 'loss', 'entry': entry_price,
+            'exit': exit_price, 'bars': end_idx - 1 - entry_idx - 1, 'idx': entry_idx}
 
-
-def simulate(rets, tp, sl):
-    capital = 100.0
-    tr = np.empty(len(rets))
-    pos_pct = CAPITAL_PER_TRADE_PCT / 100.0
-    for k, (end_pct, max_pct, min_pct) in enumerate(rets):
-        pos = capital * pos_pct
-        hit_tp = max_pct >= tp
-        hit_sl = min_pct <= -sl
-        if hit_tp and hit_sl: pnl_pct = -sl
-        elif hit_tp: pnl_pct = tp
-        elif hit_sl: pnl_pct = -sl
-        else: pnl_pct = end_pct
-        prev = capital
-        capital += pos * (pnl_pct / 100.0)
-        tr[k] = (capital - prev) / prev * 100.0
-    wins = tr[tr > 0]; losses = tr[tr < 0]
-    wr = len(wins) / len(tr) * 100 if len(tr) else 0
-    aw = wins.mean() if len(wins) else 0
-    al = abs(losses.mean()) if len(losses) else 0
-    rr = aw / al if al > 0 else 0
-    return {'capital': capital, 'win_rate': wr, 'rr': rr,
-            'avg_win': aw, 'avg_loss': al,
-            'expectancy': tr.mean() if len(tr) else 0}
-
-
-# ================== شروع ==================
-tg_send_message(
-    f"🔎 *اسکنر الگوهای تاریخی*\n"
-    f"جستجوی بهترین ترکیب R:R + Win Rate\n"
-    f"🪙 {len(SYMBOLS)} نماد | ⏱️ `{TIMEFRAME}` | افق `{FORWARD_CANDLES}` کندل\n"
-    f"📊 حداقل معاملات: `{MIN_TRADES}`"
-)
-
-ex = connect_exchange()
-
-# ---------- 1) داده‌ی نمادها ----------
-print("\n📥 دریافت داده‌ی نمادها ...")
-target_data = {}
-for i, sym in enumerate(SYMBOLS, 1):
-    print(f"  [{i:02d}/{len(SYMBOLS)}] {sym} ...", end=' ', flush=True)
-    df = fetch_ohlcv(ex, sym, TIMEFRAME, days=LOOKBACK_DAYS)
-    if df is not None and len(df) > FORWARD_CANDLES + 20:
-        target_data[sym] = df
-        print(f"✅ {len(df)}")
-    else:
-        print("⏭️")
-    time.sleep(0.2)
-
-if not target_data:
-    tg_send_message("❌ داده‌ای دریافت نشد")
-    raise SystemExit("no data")
-
-# ---------- 2) بردارها ----------
-print("\n⚙️ پیش‌پردازش ...")
-all_vecs_list, all_sym_list, all_idx_list = [], [], []
-sym_arrays = {}
-for sym, df in target_data.items():
-    vecs, valid = build_vectors(df)
-    idxs = np.where(valid)[0]
-    all_vecs_list.append(vecs[idxs])
-    all_sym_list.extend([sym] * len(idxs))
-    all_idx_list.extend(idxs.tolist())
-    sym_arrays[sym] = (df['open'].values, df['high'].values,
-                       df['low'].values, df['close'].values)
-
-all_vecs = np.vstack(all_vecs_list)
-all_sym  = np.array(all_sym_list)
-all_idx  = np.array(all_idx_list)
-print(f"  کل بردارها: {len(all_vecs):,}")
-
-# ---------- 3) بازده آینده ----------
-print("⏳ بازده‌های آینده ...")
-forward_map = {}
-for sym, (o, h, l, c) in sym_arrays.items():
-    n = len(o)
-    arr = np.full((n, 3), np.nan)
-    for i in range(n - FORWARD_CANDLES):
-        entry = o[i+1]
-        if entry <= 0: continue
-        fh = h[i+1:i+FORWARD_CANDLES+1].max()
-        fl = l[i+1:i+FORWARD_CANDLES+1].min()
-        fc = c[i+FORWARD_CANDLES]
-        arr[i] = [(fc-entry)/entry*100, (fh-entry)/entry*100, (fl-entry)/entry*100]
-    forward_map[sym] = arr
-
-# ---------- 4) داده‌ی مرجع ----------
-print(f"\n📥 {PATTERN_SYMBOL} ({PATTERN_TIMEFRAME}) ...")
-ref = fetch_ohlcv(ex, PATTERN_SYMBOL, PATTERN_TIMEFRAME, days=PATTERN_LOOKBACK_DAYS)
-if ref is None or len(ref) < 30:
-    tg_send_message("❌ داده‌ی مرجع ناکافی")
-    raise SystemExit("no ref")
-
-ref_vecs, ref_valid = build_vectors(ref)
-ref_dates = ref.index
-print(f"  {ref_dates[0].date()} → {ref_dates[-1].date()} ({len(ref)})")
-
-# ---------- 5) اسکن ----------
-print(f"\n🔎 اسکن {int(ref_valid.sum())} کندل ...\n")
 results = []
-t_start = time.time()
+for i in top_indices:
+    idx = valid_indices[i]
+    trade = simulate_trade(idx)
+    if trade:
+        results.append(trade)
 
-for pos in range(len(ref_vecs)):
-    if not ref_valid[pos]: continue
-    vec = ref_vecs[pos]
-    dt  = ref_dates[pos]
+# ======================== محاسبه معیارها ========================
+wins = sum(1 for r in results if r['result'] == 'win')
+total = len(results)
+win_rate = (wins / total * 100) if total > 0 else 0
+avg_win = np.mean([r['exit'] - r['entry'] for r in results if r['result'] == 'win']) if wins > 0 else 0
+losses_list = [r['entry'] - r['exit'] for r in results if r['result'] == 'loss']
+avg_loss = np.mean(losses_list) if losses_list else 0
+profit_factor = (avg_win * wins) / (avg_loss * (total - wins)) if (avg_loss * (total - wins)) > 0 else float('inf')
 
-    dists = np.linalg.norm(all_vecs - vec, axis=1)
-    mask = dists <= SIMILARITY_THRESHOLD
-    if mask.sum() < MIN_TRADES: continue
+# ======================== ساخت پیام تلگرام ========================
+now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+rr_str = f"1:{RR_RATIO}"
 
-    syms = all_sym[mask]; idxs = all_idx[mask]
-    rets = []
-    for s, i in zip(syms, idxs):
-        fr = forward_map[s][i]
-        if not np.isnan(fr[0]):
-            rets.append(fr)
-    if len(rets) < MIN_TRADES: continue
-    rets = np.array(rets)
+message = f"""📊 *گزارش تحلیل کندل مشابه*
+🗓 زمان: `{now_str}`
+💱 نماد: `{SYMBOL}` | تایم‌فریم: `{INTERVAL}`
+🔎 طول الگو: `{PATTERN_LEN}` کندل | بررسی: `{LOOKAHEAD}` کندل بعد
+⚖️ ریسک به ریوارد: `{rr_str}`
 
-    best = None
-    for tp in TP_LEVELS:
-        for sl in SL_LEVELS:
-            s = simulate(rets, tp, sl)
-            if best is None or s['capital'] > best['capital']:
-                s['tp'], s['sl'] = tp, sl
-                best = s
-    if best is None: continue
+📈 *نتایج شبیه‌سازی:*
+• تعداد معاملات: `{total}`
+• وین ریت: `{win_rate:.1f}%` ✅
+• میانگین سود: `{avg_win:.2f}`
+• میانگین ضرر: `{avg_loss:.2f}`
+• Profit Factor: `{profit_factor:.2f}`
 
-    ends = rets[:, 0]
-    results.append({
-        'date': dt.date(), 'n_trades': len(rets),
-        'baseline_win_rate': (ends > 0).mean() * 100,
-        'baseline_exp': ends.mean(),
-        'tp': best['tp'], 'sl': best['sl'],
-        'win_rate': best['win_rate'], 'rr': best['rr'],
-        'expectancy': best['expectancy'],
-        'final_capital': best['capital'],
-        'avg_win': best['avg_win'], 'avg_loss': best['avg_loss'],
-    })
-    if len(results) % 100 == 0:
-        print(f"  ... {len(results)} | {time.time()-t_start:.0f}s")
+🔝 *{TOP_N} الگوی مشابه برتر:*
+"""
 
-elapsed = time.time() - t_start
-print(f"\n✅ {len(results)} الگو در {elapsed:.0f}s")
+for rank, i in enumerate(top_indices, 1):
+    idx = valid_indices[i]
+    trade = next((r for r in results if r['idx'] == idx), None)
+    if trade:
+        emoji = "🟢" if trade['result'] == 'win' else "🔴"
+        message += f"\n{rank}. ایندکس `{idx}` | فاصله `{distances[i]:.3f}` | {emoji} `{trade['result'].upper()}` | {trade['bars']} کندل"
 
-if not results:
-    tg_send_message("❌ الگویی با شرایط کافی پیدا نشد")
-    raise SystemExit("no results")
+message += "\n\n_⚠️ این گزارش صرفاً تحلیلی است و توصیه معاملاتی نیست._"
 
-df_res = pd.DataFrame(results).sort_values('final_capital', ascending=False).reset_index(drop=True)
-df_res['score_balanced'] = df_res['win_rate'] * df_res['rr']
-df_res_balanced = df_res.sort_values('score_balanced', ascending=False).reset_index(drop=True)
+# ======================== ارسال به تلگرام ========================
+print("\n📤 ارسال پیام به تلگرام...")
+send_telegram_message(message)
 
-# ذخیره‌ی محلی (اختیاری - برای خودت)
-out_path = os.path.join(OUTPUT_DIR, 'best_patterns.csv')
-df_res.to_csv(out_path, index=False)
-print(f"💾 {out_path} (فقط ذخیره‌ی محلی)")
+# ======================== ساخت نمودار ========================
+print("🎨 ساخت نمودار...")
+fig, ax = plt.subplots(figsize=(12, 5))
+plot_start = max(0, n - 200)
+x_axis = range(plot_start, n)
 
-# ================== ارسال به تلگرام ==================
-print("\n📱 ارسال به تلگرام ...")
-top = df_res.head(TOP_N)
+# رسم کندل‌ها
+for i in x_axis:
+    color = 'green' if close_p[i] >= open_p[i] else 'red'
+    ax.plot([i, i], [low_p[i], high_p[i]], color=color, linewidth=0.7)
+    ax.plot([i, i], [open_p[i], close_p[i]], color=color, linewidth=3)
 
-# ---- پیام ۱: خلاصه ----
-msg1 = (
-    f"🏆 *نتایج اسکن الگوها*\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"📊 الگوهای اسکن‌شده: `{len(results)}`\n"
-    f"🪙 نمادها: `{len(target_data)}`\n"
-    f"⏱️ تایم‌فریم: `{TIMEFRAME}` | افق: `{FORWARD_CANDLES}`\n"
-    f"📌 حداقل معاملات: `{MIN_TRADES}`\n"
-    f"⏱️ زمان اسکن: `{elapsed:.0f}s`\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"🎯 معیار: *سرمایه‌ی نهایی* (ترکیب WR و R:R)"
-)
-tg_send_message(msg1)
+# هایلایت الگوی فعلی
+ax.axvspan(n - PATTERN_LEN, n, alpha=0.15, color='blue', label='الگوی فعلی')
 
-# ---- پیام‌های ۲-۳: جزئیات top 10 ----
-for chunk_start in range(0, TOP_N, 5):
-    chunk_text = f"📋 *الگوهای #{chunk_start+1} تا #{min(chunk_start+5, TOP_N)}*\n"
-    chunk_text += "━━━━━━━━━━━━━━━━━━━━\n\n"
-    for i in range(chunk_start, min(chunk_start+5, TOP_N)):
-        r = top.iloc[i]
-        chunk_text += (
-            f"*#{i+1}*  📅 `{r['date']}`\n"
-            f"  ▪️ معاملات: `{int(r['n_trades'])}`\n"
-            f"  ▪️ TP/SL: `+{r['tp']}%` / `-{r['sl']}%`\n"
-            f"  ▪️ Win Rate: `{r['win_rate']:.1f}%`\n"
-            f"  ▪️ R:R: `{r['rr']:.2f} : 1`\n"
-            f"  ▪️ Expectancy: `{r['expectancy']:+.2f}%`\n"
-            f"  ▪️ سرمایه: `{r['final_capital']:.1f}`\n\n"
-        )
-    tg_send_message(chunk_text)
+# هایلایت الگوهای مشابه
+for i in top_indices:
+    idx = valid_indices[i]
+    if idx >= plot_start:
+        ax.axvspan(idx, idx + PATTERN_LEN, alpha=0.25, color='orange')
 
-# ---- پیام ۴: متعادل‌ها ----
-msg4 = "⚖️ *۵ الگوی متعادل (WR × R:R)*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-for i in range(min(5, len(df_res_balanced))):
-    r = df_res_balanced.iloc[i]
-    msg4 += (
-        f"*#{i+1}*  📅 `{r['date']}`\n"
-        f"  ▪️ WR: `{r['win_rate']:.1f}%`  |  R:R: `{r['rr']:.2f}`\n"
-        f"  ▪️ TP/SL: `+{r['tp']}%` / `-{r['sl']}%`\n"
-        f"  ▪️ امتیاز: `{r['score_balanced']:.1f}`\n\n"
-    )
-tg_send_message(msg4)
+ax.set_title(f"{SYMBOL} - الگوهای مشابه (فاصله اقلیدسی)", fontsize=12)
+ax.set_xlabel("Index")
+ax.set_ylabel("Price")
+ax.grid(alpha=0.3)
 
-# ---- پیام ۵: پیشنهاد نهایی ----
-best = df_res.iloc[0]
-profitable = best['win_rate'] > 100 / (1 + best['rr']) if best['rr'] > 0 else False
-status_emoji = "✅" if profitable else "⚠️"
+buf = io.BytesIO()
+plt.tight_layout()
+plt.savefig(buf, format='png', dpi=110)
+plt.close()
+buf.seek(0)
 
-msg5 = (
-    f"💡 *پیشنهاد نهایی*\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"🥇 الگو: `{best['date']}`\n"
-    f"• TP: `+{best['tp']}%`\n"
-    f"• SL: `-{best['sl']}%`\n"
-    f"• Win Rate: `{best['win_rate']:.1f}%`\n"
-    f"• R:R: `{best['rr']:.2f} : 1`\n"
-    f"• نرخ برد موردنیاز: `{100/(1+best['rr']):.1f}%`\n"
-    f"• Expectancy: `{best['expectancy']:+.2f}%`\n"
-    f"• سرمایه نهایی: `{best['final_capital']:.1f}`\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"{status_emoji} {'استراتژی سودآور' if profitable else 'نیاز به بهینه‌سازی'}\n"
-    f"⚠️ مراقب Overfitting باش"
-)
-tg_send_message(msg5)
+print("📤 ارسال نمودار به تلگرام...")
+send_telegram_photo(buf, caption=f"📈 {SYMBOL} - الگوهای مشابه | وین ریت: {win_rate:.1f}%")
 
-# ---- پیام پایانی ----
-tg_send_message("✅ اسکن تمام شد.")
-
-print("\n✅ تمام شد.")
+print("✅ تمام شد!")
