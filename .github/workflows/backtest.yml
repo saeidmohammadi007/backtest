@@ -3,7 +3,7 @@ name: Crypto Backtest
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 6 * * *'
+    - cron: '0 6 * * *'   # هر روز ساعت ۶ صبح UTC (≈ ۹:۳۰ صبح تهران)
 
 jobs:
   run-backtest:
@@ -17,7 +17,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'            # کش کردن نصب‌ها برای سرعت بیشتر
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
