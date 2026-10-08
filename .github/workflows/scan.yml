@@ -1,27 +1,39 @@
-name: LBank Pattern Scanner
+name: Crypto Backtest
 
 on:
-  workflow_dispatch:      # اجرای دستی از تب Actions
+  workflow_dispatch:        # اجرای دستی از تب Actions
+  schedule:
+    - cron: '0 3 * * *'     # هر روز ساعت 03:00 UTC (اختیاری)
 
 jobs:
-  scan:
+  run-backtest:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scanner
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python saeid.py
+      - name: Run backtest
+        run: python backtest.py
+
+      - name: Upload results as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: |
+            *.csv
+            *.png
+          retention-days: 30
