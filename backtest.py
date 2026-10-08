@@ -72,6 +72,11 @@ PATTERN_DATE = '2025-07-04'
 SIMILARITY_THRESHOLD = 0.08
 FORWARD_CANDLES = 60
 
+# --- فیلتر CCI ---
+USE_CCI_FILTER = True    # ← فعال/غیرفعال کردن فیلتر
+CCI_PERIOD     = 20      # دوره‌ی استاندارد CCI
+CCI_MAX        = 100     # فقط تطابق‌هایی که CCI < 100 باشند
+
 PER_SYMBOL_TIMEOUT = 45
 MAX_FETCH_RETRIES = 2
 EXCHANGE_NAME = 'lbank'
@@ -136,14 +141,32 @@ def candle_vector(o, h, l, c):
     return np.array([(o-l)/r, 1.0, 0.0, (c-l)/r])
 
 
-def scan_matches(df, pvec, threshold):
+def compute_cci(df, period=20):
+    """محاسبه‌ی CCI استاندارد (Lambert) روی Typical Price."""
+    tp = (df['high'] + df['low'] + df['close']) / 3.0
+    sma = tp.rolling(window=period, min_periods=period).mean()
+    # میانگین انحراف مطلق نسبت به SMA
+    mad = tp.rolling(window=period, min_periods=period).apply(
+        lambda x: np.mean(np.abs(x - x.mean())), raw=True
+    )
+    cci = (tp - sma) / (0.015 * mad)
+    return cci
+
+
+def scan_matches(df, pvec, threshold, cci=None, use_cci=False, cci_max=100):
     matches = []
     for i in range(len(df)):
         row = df.iloc[i]
         v = candle_vector(row['open'], row['high'], row['low'], row['close'])
-        if v is None: continue
+        if v is None:
+            continue
         d = float(np.linalg.norm(pvec - v))
         if d <= threshold:
+            # شرط CCI: فقط اگر CCI < cci_max باشد
+            if use_cci and cci is not None:
+                cci_val = cci.iloc[i]
+                if not np.isfinite(cci_val) or cci_val >= cci_max:
+                    continue
             matches.append({'index': i, 'dt': df.index[i], 'dist': d})
     return matches
 
@@ -222,6 +245,7 @@ tg_send_message(
     f"🪙 نمادها: {len(SYMBOLS)}\n"
     f"⏱️ تایم‌فریم: `{TIMEFRAME}`\n"
     f"🎯 افق بررسی: `{FORWARD_CANDLES}` کندل\n"
+    f"🔎 فیلتر CCI: `{'فعال (CCI < ' + str(CCI_MAX) + ')' if USE_CCI_FILTER else 'غیرفعال'}`\n"
     f"💰 هر معامله: `{CAPITAL_PER_TRADE_PCT}%` سرمایه"
 )
 
@@ -284,14 +308,32 @@ for idx, sym in enumerate(SYMBOLS, 1):
         print("⏭️ داده ناکافی"); skipped.append(sym); continue
 
     try:
-        matches = scan_matches(df, pvec, SIMILARITY_THRESHOLD)
+        # --- محاسبه‌ی CCI در صورت فعال بودن فیلتر ---
+        if USE_CCI_FILTER:
+            cci_series = compute_cci(df, period=CCI_PERIOD)
+        else:
+            cci_series = None
+
+        # --- شمارش خام و فیلترشده (برای گزارش) ---
+        raw_matches = scan_matches(df, pvec, SIMILARITY_THRESHOLD)
+        matches = scan_matches(
+            df, pvec, SIMILARITY_THRESHOLD,
+            cci=cci_series,
+            use_cci=USE_CCI_FILTER,
+            cci_max=CCI_MAX,
+        )
+
         trades = measure_forward(df, matches, FORWARD_CANDLES)
         if not trades.empty:
             trades['symbol'] = sym
             all_trades[sym] = trades
-            print(f"✅ {len(trades)} تطابق ({time.time()-t0:.1f}s)")
+            print(f"✅ {len(trades)} تطابق "
+                  f"(خام {len(raw_matches)} → بعد CCI {len(matches)}) "
+                  f"({time.time()-t0:.1f}s)")
         else:
-            print(f"⚪ ۰ تطابق ({time.time()-t0:.1f}s)")
+            print(f"⚪ ۰ تطابق "
+                  f"(خام {len(raw_matches)} → بعد CCI {len(matches)}) "
+                  f"({time.time()-t0:.1f}s)")
     except Exception as e:
         print(f"❌ {e.__class__.__name__}")
     time.sleep(0.2)
@@ -413,6 +455,7 @@ msg1 = (
     f"📅 الگو: `{actual_date}`\n"
     f"🪙 نمادها: {len(SYMBOLS)} | رد شده: {len(skipped)}\n"
     f"⏱️ تایم‌فریم: `{TIMEFRAME}` | افق: `{FORWARD_CANDLES}` کندل\n"
+    f"🔎 فیلتر CCI: `{'فعال (CCI < ' + str(CCI_MAX) + ')' if USE_CCI_FILTER else 'غیرفعال'}`\n"
     f"💰 هر معامله: `{CAPITAL_PER_TRADE_PCT}%` سرمایه\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
     f"*📈 خلاصه‌ی کلی:*\n"
