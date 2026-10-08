@@ -23,201 +23,260 @@ except Exception as e:
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-SYMBOL = "BTC-USD"       # نماد مورد نظر
-INTERVAL = "1d"          # 🔒 فقط روزانه
-PERIOD = "5y"            # ۵ سال داده تاریخی
-PATTERN_LEN = 5          # طول الگو
-LOOKAHEAD = 60           # بررسی ۶۰ کندل بعد
-RR_RATIO = 2.0           # ریسک به ریوارد
-TOP_N = 5                # تعداد الگوهای برتر
+SYMBOLS = [
+    "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
+    "ADA-USD", "DOGE-USD", "AVAX-USD", "DOT-USD", "LINK-USD",
+]
 
-# ======================== دریافت داده ========================
-log(f"📥 دریافت {SYMBOL} | interval={INTERVAL} | period={PERIOD}")
-try:
-    df = yf.download(SYMBOL, interval=INTERVAL, period=PERIOD,
-                     progress=False, auto_adjust=True, timeout=30)
-    if df is None or df.empty:
-        raise ValueError("داده‌ای دریافت نشد")
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df[['Open', 'High', 'Low', 'Close']].dropna()
-except Exception as e:
-    msg = f"❌ خطا در دریافت داده: {e}"
-    log(msg)
-    traceback.print_exc()
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                      json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=15)
-    sys.exit(1)
+INTERVAL      = "1d"
+PERIOD        = "5y"
+PATTERN_LEN   = 5         # طول الگو
+LOOKAHEAD     = 30        # بررسی N کندل بعد
+RR_RATIO      = 2.0       # ریسک به ریوارد
+K_NEIGHBORS   = 8         # چند همسایه نزدیک بررسی شود
+MIN_MATCHES   = 4         # حداقل تطابق معتبر
+MIN_WIN_RATE  = 55.0      # حداقل وین‌ریت
+MIN_PF        = 1.3       # حداقل Profit Factor
+GAP           = PATTERN_LEN + 10   # فاصله حداقلی بین الگوها (جلوگیری از overlap)
+TOP_CHARTS    = 5         # چند نمودار ارسال شود
 
-n = len(df)
-log(f"✅ دریافت شد: {n} کندل | از {df.index.min().date()} تا {df.index.max().date()}")
 
-MIN_REQUIRED = PATTERN_LEN + LOOKAHEAD + 50
-if n < MIN_REQUIRED:
-    msg = f"❌ داده کافی نیست. تعداد کندل: {n} (نیاز: {MIN_REQUIRED})"
-    log(msg)
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                      json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=15)
-    sys.exit(1)
-
-open_p  = df['Open'].values
-high_p  = df['High'].values
-low_p   = df['Low'].values
-close_p = df['Close'].values
-
-# ======================== ساخت بردار ویژگی ========================
-def make_feature_vector(idx_start, length):
-    o = open_p[idx_start:idx_start+length]
-    h = high_p[idx_start:idx_start+length]
-    l = low_p[idx_start:idx_start+length]
-    c = close_p[idx_start:idx_start+length]
-    vec = np.concatenate([o, h, l, c])
+# ======================== توابع ========================
+def make_feature_vector(i, length, o, h, l, c):
+    vec = np.concatenate([o[i:i+length], h[i:i+length],
+                          l[i:i+length], c[i:i+length]]).astype(float)
     std = np.std(vec)
     if std == 0:
         return np.zeros_like(vec)
     return (vec - np.mean(vec)) / std
 
-# ======================== یافتن الگوهای مشابه ========================
-log("🔍 محاسبه فاصله اقلیدسی...")
-target_vec = make_feature_vector(n - PATTERN_LEN, PATTERN_LEN).reshape(1, -1)
 
-candidate_indices = list(range(0, n - PATTERN_LEN - LOOKAHEAD))
-candidate_vectors = np.array([make_feature_vector(i, PATTERN_LEN) for i in candidate_indices])
-distances = pairwise_distances(target_vec, candidate_vectors, metric='euclidean')[0]
-
-top_indices = np.argsort(distances)[:TOP_N]
-
-# ======================== شبیه‌سازی معامله ========================
-def simulate_trade(entry_idx, lookahead=LOOKAHEAD, rr=RR_RATIO):
+def simulate_trade(entry_idx, o, h, l, c, n, lookahead, rr):
     if entry_idx + 1 >= n:
         return None
-    entry_price = float(open_p[entry_idx + 1])
-    stop_loss = float(min(low_p[entry_idx:entry_idx+PATTERN_LEN]))
-    risk = entry_price - stop_loss
+    entry_price = float(o[entry_idx + 1])
+    stop_loss   = float(np.min(l[entry_idx:entry_idx + PATTERN_LEN]))
+    risk        = entry_price - stop_loss
     if risk <= 0:
         return None
     take_profit = entry_price + rr * risk
-    end_idx = min(entry_idx + 1 + lookahead, n)
-
+    end_idx     = min(entry_idx + 1 + lookahead, n)
+    if end_idx <= entry_idx + 1:
+        return None
     for j in range(entry_idx + 1, end_idx):
-        if low_p[j] <= stop_loss:
+        if l[j] <= stop_loss:
             return {'result': 'loss', 'entry': entry_price, 'exit': stop_loss,
                     'bars': j - entry_idx - 1, 'idx': entry_idx}
-        if high_p[j] >= take_profit:
+        if h[j] >= take_profit:
             return {'result': 'win', 'entry': entry_price, 'exit': take_profit,
                     'bars': j - entry_idx - 1, 'idx': entry_idx}
-
-    exit_price = float(close_p[end_idx - 1])
+    exit_price = float(c[end_idx - 1])
     return {'result': 'win' if exit_price > entry_price else 'loss',
             'entry': entry_price, 'exit': exit_price,
-            'bars': end_idx - 1 - entry_idx - 1, 'idx': entry_idx}
+            'bars': end_idx - 2 - entry_idx, 'idx': entry_idx}
 
-results = []
-for i in top_indices:
-    idx = candidate_indices[i]
-    tr = simulate_trade(idx)
-    if tr:
-        results.append(tr)
 
-# ======================== معیارها ========================
-wins = sum(1 for r in results if r['result'] == 'win')
-total = len(results)
-win_rate = (wins / total * 100) if total > 0 else 0
-avg_win = np.mean([r['exit'] - r['entry'] for r in results if r['result'] == 'win']) if wins > 0 else 0
-losses = [r['entry'] - r['exit'] for r in results if r['result'] == 'loss']
-avg_loss = np.mean(losses) if losses else 0
-profit_factor = (avg_win * wins) / (avg_loss * (total - wins)) if (avg_loss * (total - wins)) > 0 else float('inf')
+def fetch(symbol):
+    try:
+        df = yf.download(symbol, interval=INTERVAL, period=PERIOD,
+                         progress=False, auto_adjust=True, timeout=30)
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df[['Open', 'High', 'Low', 'Close']].dropna()
+    except Exception as e:
+        log(f"❌ fetch {symbol}: {e}")
+        return None
+
+
+def analyze_symbol(symbol):
+    log(f"📥 دریافت {symbol} | {PERIOD}")
+    df = fetch(symbol)
+    if df is None:
+        return None
+    n = len(df)
+    MIN_REQ = PATTERN_LEN + LOOKAHEAD + 100
+    if n < MIN_REQ:
+        log(f"⚠️ داده کافی نیست {symbol} ({n})")
+        return None
+
+    o = df['Open'].values.astype(float)
+    h = df['High'].values.astype(float)
+    l = df['Low'].values.astype(float)
+    c = df['Close'].values.astype(float)
+
+    max_start = n - PATTERN_LEN - LOOKAHEAD - 1
+    if max_start <= GAP * 2:
+        return None
+    candidates = np.arange(0, max_start)
+    log(f"🔍 {symbol}: {len(candidates)} الگو بررسی می‌شود")
+
+    vecs = np.array([make_feature_vector(i, PATTERN_LEN, o, h, l, c)
+                     for i in candidates])
+    dists = pairwise_distances(vecs, metric='euclidean')
+
+    best = None
+    for ci in range(len(candidates)):
+        i = candidates[ci]
+        valid_mask = np.abs(candidates - i) >= GAP
+        valid_idx = np.where(valid_mask)[0]
+        if len(valid_idx) < MIN_MATCHES:
+            continue
+
+        local = dists[ci][valid_idx]
+        order = np.argsort(local)[:K_NEIGHBORS]
+        neighbors = candidates[valid_idx[order]]
+
+        results = []
+        for nb in neighbors:
+            tr = simulate_trade(int(nb), o, h, l, c, n, LOOKAHEAD, RR_RATIO)
+            if tr:
+                results.append(tr)
+        if len(results) < MIN_MATCHES:
+            continue
+
+        wins = sum(1 for r in results if r['result'] == 'win')
+        total = len(results)
+        win_rate = wins / total * 100
+        if win_rate < MIN_WIN_RATE:
+            continue
+
+        win_pnl  = [r['exit'] - r['entry'] for r in results if r['result'] == 'win']
+        loss_pnl = [r['entry'] - r['exit'] for r in results if r['result'] == 'loss']
+        gross_win  = float(np.sum(win_pnl)) if win_pnl else 0.0
+        gross_loss = float(np.sum(loss_pnl)) if loss_pnl else 0.0
+        pf = gross_win / gross_loss if gross_loss > 0 else float('inf')
+        if pf < MIN_PF:
+            continue
+
+        score = win_rate * min(pf, 5.0)
+        if best is None or score > best['score']:
+            best = {
+                'symbol': symbol,
+                'idx': int(i),
+                'date': df.index[i],
+                'matches': total,
+                'win_rate': win_rate,
+                'pf': pf,
+                'avg_win': float(np.mean(win_pnl)) if win_pnl else 0.0,
+                'avg_loss': float(np.mean(loss_pnl)) if loss_pnl else 0.0,
+                'avg_dist': float(np.mean(local[order[:len(results)]])),
+                'score': score,
+                'df': df, 'n': n,
+                'neighbors': [int(x) for x in neighbors],
+                'opens': o, 'highs': h, 'lows': l, 'closes': c,
+            }
+    return best
+
+
+def make_chart(best):
+    df = best['df']; o = best['opens']; h = best['highs']
+    l = best['lows']; c = best['closes']; n = best['n']
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    plot_start = max(0, n - 200)
+    for i in range(plot_start, n):
+        col = '#26a69a' if c[i] >= o[i] else '#ef5350'
+        ax.plot([i, i], [l[i], h[i]], color=col, linewidth=0.7)
+        ax.plot([i, i], [o[i], c[i]], color=col, linewidth=3.0)
+
+    idx = best['idx']
+    if idx >= plot_start:
+        ax.axvspan(idx, idx + PATTERN_LEN - 0.5, alpha=0.35, color='#2196F3',
+                   label=f"الگوی برتر {best['date'].strftime('%Y-%m-%d')}")
+    ax.axvspan(n - PATTERN_LEN, n - 0.5, alpha=0.20, color='#FF9800',
+               label='الگوی فعلی')
+
+    title = (f"{best['symbol']} [Daily] | {best['date'].strftime('%Y-%m-%d')} | "
+             f"Matches: {best['matches']} | WR: {best['win_rate']:.1f}% | "
+             f"PF: {best['pf']:.2f}")
+    ax.set_title(title, fontsize=11, fontweight='bold')
+    ax.set_xlabel("Index"); ax.set_ylabel("Price (USD)")
+    ax.grid(alpha=0.3); ax.legend(loc='upper left')
+
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format='png', dpi=100)
+    plt.close()
+    buf.seek(0)
+    return buf
+
+
+# ======================== اجرای اصلی ========================
+log("=" * 60)
+log(f"🚀 شروع تحلیل {len(SYMBOLS)} ارز")
+log("=" * 60)
+
+all_bests = []
+for sym in SYMBOLS:
+    try:
+        b = analyze_symbol(sym)
+        if b:
+            all_bests.append(b)
+            log(f"✅ {sym}: {b['date'].date()} | matches={b['matches']} | "
+                f"WR={b['win_rate']:.1f}% | PF={b['pf']:.2f}")
+        else:
+            log(f"⚠️ {sym}: الگوی معتبری یافت نشد")
+    except Exception as e:
+        log(f"❌ analyze {sym}: {e}")
+        traceback.print_exc()
+
+all_bests.sort(key=lambda x: x['score'], reverse=True)
 
 # ======================== پیام تلگرام ========================
 now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-message = f"""📊 <b>گزارش تحلیل کندل مشابه</b>
-🗓 زمان: <code>{now_str}</code>
-💱 نماد: <code>{SYMBOL}</code> | تایم‌فریم: <b>روزانه (1d)</b>
-📅 بازه: <code>{df.index.min().date()}</code> → <code>{df.index.max().date()}</code>
-📊 کل کندل‌ها: <code>{n}</code>
-🔎 طول الگو: <code>{PATTERN_LEN}</code> | بررسی: <code>{LOOKAHEAD}</code> کندل بعد
-⚖️ R:R = <code>1:{RR_RATIO}</code>
+message = f"""📊 <b>گزارش الگوهای تکراری در ۱۰ ارز</b>
+🗓 <code>{now_str}</code>
+🔎 طول الگو: <code>{PATTERN_LEN}</code> کندل | بررسی: <code>{LOOKAHEAD}</code> کندل بعد
+⚖️ R:R = <code>1:{RR_RATIO}</code> | حداقل تطابق: <code>{MIN_MATCHES}</code>
+📈 آستانه: WR ≥ <code>{MIN_WIN_RATE}%</code> | PF ≥ <code>{MIN_PF}</code>
 
-📈 <b>نتایج شبیه‌سازی:</b>
-• تعداد معاملات: <code>{total}</code>
-• وین ریت: <code>{win_rate:.1f}%</code>
-• میانگین سود: <code>{avg_win:.2f}</code>
-• میانگین ضرر: <code>{avg_loss:.2f}</code>
-• Profit Factor: <code>{profit_factor:.2f}</code>
-
-🔝 <b>{TOP_N} الگوی مشابه برتر:</b>
 """
 
-for rank, i in enumerate(top_indices, 1):
-    idx = candidate_indices[i]
-    tr = next((r for r in results if r['idx'] == idx), None)
-    date_str = df.index[idx].strftime('%Y-%m-%d')
-    if tr:
-        emoji = "🟢" if tr['result'] == 'win' else "🔴"
-        message += (f"\n{rank}. تاریخ <code>{date_str}</code> | "
-                    f"فاصله <code>{distances[i]:.3f}</code> | "
-                    f"{emoji} <b>{tr['result'].upper()}</b> | "
-                    f"{tr['bars']} کندل")
+if not all_bests:
+    message += "❌ هیچ الگوی معتبری با شرایط تعریف‌شده یافت نشد.\n"
+else:
+    message += f"🏆 <b>الگوهای برتر ({len(all_bests)} ارز):</b>\n"
+    for rank, b in enumerate(all_bests, 1):
+        message += (f"\n{rank}. <b>{b['symbol']}</b> | <code>{b['date'].strftime('%Y-%m-%d')}</code>\n"
+                    f"   ├ تطابق‌ها: <code>{b['matches']}</code>\n"
+                    f"   ├ وین‌ریت: <code>{b['win_rate']:.1f}%</code>\n"
+                    f"   ├ PF: <code>{b['pf']:.2f}</code>\n"
+                    f"   ├ میانگین سود/ضرر: <code>{b['avg_win']:.2f} / {b['avg_loss']:.2f}</code>\n"
+                    f"   └ امتیاز: <code>{b['score']:.1f}</code>")
 
 message += "\n\n⚠️ صرفاً تحلیلی است و توصیه معاملاتی نیست."
 
 if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
     try:
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                          json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
-                          timeout=15)
-        log(f"📤 تلگرام (پیام): {r.status_code}")
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message,
+                  "parse_mode": "HTML"},
+            timeout=20,
+        )
+        log(f"📤 telegram (message): {r.status_code}")
     except Exception as e:
-        log(f"❌ خطا در ارسال پیام: {e}")
+        log(f"❌ send msg: {e}")
 
-# ======================== نمودار ========================
-try:
-    log("🎨 ساخت نمودار...")
-    fig, ax = plt.subplots(figsize=(13, 6))
-    plot_start = max(0, n - 250)
-    x = np.arange(plot_start, n)
-
-    for i in x:
-        color = '#26a69a' if close_p[i] >= open_p[i] else '#ef5350'
-        ax.plot([i, i], [low_p[i], high_p[i]], color=color, linewidth=0.8)
-        ax.plot([i, i], [open_p[i], close_p[i]], color=color, linewidth=3.5)
-
-    # هایلایت الگوی فعلی
-    ax.axvspan(n - PATTERN_LEN, n - 0.5, alpha=0.20, color='#2196F3',
-               label=f'الگوی فعلی ({PATTERN_LEN} کندل)')
-
-    # هایلایت الگوهای مشابه
-    for i in top_indices:
-        idx = candidate_indices[i]
-        if idx >= plot_start:
-            ax.axvspan(idx, idx + PATTERN_LEN - 0.5, alpha=0.25, color='#FF9800')
-
-    ax.set_title(f"{SYMBOL} [Daily] - Similar Patterns | WinRate: {win_rate:.1f}% | R:R 1:{RR_RATIO}",
-                 fontsize=12, fontweight='bold')
-    ax.set_xlabel("Index")
-    ax.set_ylabel("Price (USD)")
-    ax.grid(alpha=0.3)
-    ax.legend(loc='upper left')
-
-    buf = io.BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format='png', dpi=110)
-    plt.close()
-    buf.seek(0)
-
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        caption = (f"📈 <b>{SYMBOL}</b> [Daily]\n"
-                   f"وین ریت: <b>{win_rate:.1f}%</b> | PF: <b>{profit_factor:.2f}</b>")
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                          files={"photo": ("chart.png", buf, "image/png")},
-                          data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption,
-                                "parse_mode": "HTML"},
-                          timeout=30)
-        log(f"📤 تلگرام (نمودار): {r.status_code}")
-except Exception as e:
-    log(f"⚠️ خطا در ساخت/ارسال نمودار: {e}")
-    traceback.print_exc()
+# ======================== ارسال نمودارها ========================
+if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and all_bests:
+    for b in all_bests[:TOP_CHARTS]:
+        try:
+            buf = make_chart(b)
+            caption = (f"📈 <b>{b['symbol']}</b> | {b['date'].strftime('%Y-%m-%d')}\n"
+                       f"تطابق: <b>{b['matches']}</b> | WR: <b>{b['win_rate']:.1f}%</b> | "
+                       f"PF: <b>{b['pf']:.2f}</b>")
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                files={"photo": ("chart.png", buf, "image/png")},
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption,
+                      "parse_mode": "HTML"},
+                timeout=30,
+            )
+            log(f"📤 chart {b['symbol']}: {r.status_code}")
+        except Exception as e:
+            log(f"⚠️ chart {b['symbol']}: {e}")
 
 log("✅ تمام شد!")
