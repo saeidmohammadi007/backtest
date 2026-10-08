@@ -22,8 +22,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 TARGET_SYMBOL = "ETH-USD"
-TARGET_DATE   = "2024-02-01"     # ← کندل آخر الگو (= 1 Feb)
-                                 #    پس کندل اول الگو = 31 Jan 2024
+TARGET_DATE   = "2025-08-01"     # ← کندل آخر الگو (= 1 Aug 2025)
+                                 #    پس کندل اول الگو = 31 Jul 2025
 
 PATTERN_LEN   = 2                # ← الگو دو کندلی
 
