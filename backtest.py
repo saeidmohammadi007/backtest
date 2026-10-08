@@ -77,8 +77,7 @@ PER_SYMBOL_TIMEOUT = 45
 MAX_FETCH_RETRIES = 2
 EXCHANGE_NAME = 'lbank'
 
-# ================== 🆕 فقط این اضافه شد ==================
-CAPITAL_PER_TRADE_PCT = 2.0   # در هر معامله ۲٪ سرمایه استفاده می‌شود
+CAPITAL_PER_TRADE_PCT = 2.0   # در هر معامله ۲٪ سرمایه
 
 
 # ================== تایم‌اوت ==================
@@ -164,31 +163,25 @@ def measure_forward(df, matches, forward):
             'dist': round(m['dist'], 4),
             'entry': entry,
             'end_%': round((f['close'].iloc[-1] - entry) / entry * 100, 2),
-            'max_%': round((f['high'].max() - entry) / entry * 100, 2),
-            'min_%': round((f['low'].min() - entry) / entry * 100, 2),
+            'max_%': round((f['high'].max() - entry) / entry * 100, 2),   # MFE
+            'min_%': round((f['low'].min() - entry) / entry * 100, 2),    # MAE
         })
     return pd.DataFrame(rows)
 
 
-# ================== 🆕 فقط این تابع عوض شد ==================
 def simulate_tp_sl(df, tp_pct, sl_pct):
-    """
-    در هر معامله فقط CAPITAL_PER_TRADE_PCT درصد سرمایه وارد می‌شود.
-    بقیه‌ی سرمایه دست‌نخورده می‌ماند.
-    """
     capital = 100.0
     equity_curve = [capital]
-    trade_returns = []   # بازده هر معامله نسبت به کل سرمایه
+    trade_returns = []
 
     for _, r in df.iterrows():
-        # حجم پوزیشن = فقط ۲٪ سرمایه‌ی فعلی
         position = capital * (CAPITAL_PER_TRADE_PCT / 100.0)
 
         hit_tp = r['max_%'] >= tp_pct
         hit_sl = r['min_%'] <= -sl_pct
 
         if hit_tp and hit_sl:
-            pnl_pct = -sl_pct          # بدبینانه
+            pnl_pct = -sl_pct
         elif hit_tp:
             pnl_pct = tp_pct
         elif hit_sl:
@@ -196,11 +189,10 @@ def simulate_tp_sl(df, tp_pct, sl_pct):
         else:
             pnl_pct = r['end_%']
 
-        # سود/ضرر دلاری روی همون ۲٪ پوزیشن
         pnl = position * (pnl_pct / 100.0)
         capital += pnl
         equity_curve.append(capital)
-        trade_returns.append(pnl / (capital - pnl) * 100)  # بازده نسبت به سرمایه‌ی قبل
+        trade_returns.append(pnl / (capital - pnl) * 100)
 
     results = np.array(trade_returns)
     wins_arr = results[results > 0]
@@ -220,16 +212,17 @@ def simulate_tp_sl(df, tp_pct, sl_pct):
         'win_rate': win_rate,
         'avg_win': avg_win, 'avg_loss': avg_loss,
         'rr': rr, 'expectancy': expectancy,
-        'final_capital': capital,   # از ۱۰۰ شروع، هر معامله ۲٪
+        'final_capital': capital,
     }
 
 
 # ================== شروع ==================
 tg_send_message(
-    f"🚀 *شروع بک‌تست*\n"
+    f"🚀 *شروع بک‌تست (فقط لانگ)*\n"
     f"📅 الگو: `{PATTERN_DATE}`\n"
     f"🪙 نمادها: {len(SYMBOLS)}\n"
     f"⏱️ تایم‌فریم: `{TIMEFRAME}`\n"
+    f"🎯 افق بررسی: `{FORWARD_CANDLES}` کندل\n"
     f"💰 هر معامله: `{CAPITAL_PER_TRADE_PCT}%` سرمایه"
 )
 
@@ -318,30 +311,70 @@ full = pd.concat(all_trades.values(), ignore_index=True)
 full = full.sort_values('entry_dt').reset_index(drop=True)
 total = len(full)
 
-wins_df = full[full['end_%'] > 0]['end_%']
-loss_df = full[full['end_%'] < 0]['end_%']
+# --- تفکیک برنده/بازنده ---
+win_trades  = full[full['end_%'] > 0].copy()
+loss_trades = full[full['end_%'] < 0].copy()
+flat_trades = full[full['end_%'] == 0]
 
-win_trades = full[full['end_%'] > 0].copy()
-win_trades['drawdown_%'] = -win_trades['min_%']
+wins_df = win_trades['end_%']
+loss_df = loss_trades['end_%']
+
+win_count  = len(win_trades)
+loss_count = len(loss_trades)
+win_pct    = win_count  / total * 100
+loss_pct   = loss_count / total * 100
+
+# --- آمار MFE/MAE برای معاملات برنده (در ۶۰ کندل) ---
+if win_count > 0:
+    win_trades['drawdown_%'] = -win_trades['min_%']   # افت از ورود
+    win_trades['runup_%']    =  win_trades['max_%']   # رشد از ورود
+
+    win_mfe_avg = win_trades['runup_%'].mean()
+    win_mfe_max = win_trades['runup_%'].max()
+    win_mfe_p50 = win_trades['runup_%'].median()
+
+    win_mae_avg = win_trades['drawdown_%'].mean()
+    win_mae_max = win_trades['drawdown_%'].max()
+    win_mae_p50 = win_trades['drawdown_%'].median()
+else:
+    win_mfe_avg = win_mfe_max = win_mfe_p50 = 0
+    win_mae_avg = win_mae_max = win_mae_p50 = 0
+
+# --- آمار MFE/MAE برای معاملات بازنده ---
+if loss_count > 0:
+    loss_trades['drawdown_%'] = -loss_trades['min_%']
+    loss_trades['runup_%']    =  loss_trades['max_%']
+
+    loss_mfe_avg = loss_trades['runup_%'].mean()
+    loss_mfe_max = loss_trades['runup_%'].max()
+    loss_mae_avg = loss_trades['drawdown_%'].mean()
+    loss_mae_max = loss_trades['drawdown_%'].max()
+else:
+    loss_mfe_avg = loss_mfe_max = loss_mae_avg = loss_mae_max = 0
 
 print("\n" + "="*70)
 print("📈 خلاصه‌ی کلی")
 print("="*70)
 print(f"  تعداد کل معاملات: {total}")
-print(f"  نرخ برد:          {len(wins_df)/total*100:.1f}%")
+print(f"  برنده:            {win_count} ({win_pct:.1f}%)")
+print(f"  بازنده:           {loss_count} ({loss_pct:.1f}%)")
 print(f"  میانگین بازده:    {full['end_%'].mean():+.2f}%")
 print(f"  میانگین MFE:      {full['max_%'].mean():+.2f}%")
 print(f"  میانگین MAE:      {full['min_%'].mean():+.2f}%")
+print("\n  --- معاملات برنده (۶۰ کندل) ---")
+print(f"  میانگین رشد (MFE):     +{win_mfe_avg:.2f}%")
+print(f"  بیشترین رشد:           +{win_mfe_max:.2f}%")
+print(f"  میانگین افت (MAE):     -{win_mae_avg:.2f}%")
+print(f"  بیشترین افت برنده‌ها:  -{win_mae_max:.2f}%")
 
 
 # ================== SL پیشنهادی ==================
-if len(win_trades) > 0:
+if win_count > 0:
     sl_80 = win_trades['drawdown_%'].quantile(0.80)
     sl_90 = win_trades['drawdown_%'].quantile(0.90)
     sl_95 = win_trades['drawdown_%'].quantile(0.95)
 else:
     sl_80 = sl_90 = sl_95 = 5.0
-
 
 SL_FIXED = round(sl_90, 2)
 tp_levels = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30]
@@ -374,25 +407,68 @@ print("\n📱 ارسال به تلگرام ...")
 profitable = best_combo['win_rate'] > 100/(1+best_combo['rr'])
 status_emoji = "✅" if profitable else "⚠️"
 
-# ---- پیام ۱ ----
+# ---- پیام ۱: خلاصه‌ی کلی ----
 msg1 = (
-    f"📊 *نتیجه‌ی بک‌تست*\n"
+    f"📊 *نتیجه‌ی بک‌تست لانگ*\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
     f"📅 الگو: `{actual_date}`\n"
     f"🪙 نمادها: {len(SYMBOLS)} | رد شده: {len(skipped)}\n"
+    f"⏱️ تایم‌فریم: `{TIMEFRAME}` | افق: `{FORWARD_CANDLES}` کندل\n"
     f"💰 هر معامله: `{CAPITAL_PER_TRADE_PCT}%` سرمایه\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
     f"*📈 خلاصه‌ی کلی:*\n"
-    f"• تعداد معاملات: `{total}`\n"
-    f"• نرخ برد: `{len(wins_df)/total*100:.1f}%`\n"
+    f"• تعداد کل: `{total}`\n"
     f"• میانگین بازده: `{full['end_%'].mean():+.2f}%`\n"
     f"• میانگین MFE: `{full['max_%'].mean():+.2f}%`\n"
     f"• میانگین MAE: `{full['min_%'].mean():+.2f}%`"
 )
 tg_send_message(msg1)
 
-# ---- پیام ۲ ----
+# ---- پیام ۲: درصد برنده/بازنده ----
 msg2 = (
+    f"🎯 *درصد معاملات برنده و بازنده*\n"
+    f"━━━━━━━━━━━━━━━━━━━━\n"
+    f"✅ برنده: `{win_count}` معامله → `{win_pct:.1f}%`\n"
+    f"❌ بازنده: `{loss_count}` معامله → `{loss_pct:.1f}%`\n"
+    f"➖ بدون تغییر: `{len(flat_trades)}`\n"
+    f"━━━━━━━━━━━━━━━━━━━━\n"
+    f"📊 نرخ برد کل: `{win_pct:.1f}%`"
+)
+tg_send_message(msg2)
+
+# ---- پیام ۳: بیشترین افت و رشد معاملات برنده در ۶۰ کندل ----
+msg3 = (
+    f"📈 *تحلیل معاملات برنده در {FORWARD_CANDLES} کندل*\n"
+    f"━━━━━━━━━━━━━━━━━━━━\n"
+    f"*🟢 بیشترین رشد (MFE):*\n"
+    f"• میانگین: `+{win_mfe_avg:.2f}%`\n"
+    f"• میانه: `+{win_mfe_p50:.2f}%`\n"
+    f"• بیشترین: `+{win_mfe_max:.2f}%`\n\n"
+    f"*🔴 بیشترین افت (MAE):*\n"
+    f"• میانگین: `-{win_mae_avg:.2f}%`\n"
+    f"• میانه: `-{win_mae_p50:.2f}%`\n"
+    f"• بیشترین: `-{win_mae_max:.2f}%`\n"
+    f"━━━━━━━━━━━━━━━━━━━━\n"
+    f"💡 یعنی یک معامله‌ی برنده‌ی معمولی\n"
+    f"تا `-{win_mae_avg:.2f}%` افت می‌کند و تا `+{win_mfe_avg:.2f}%` رشد"
+)
+tg_send_message(msg3)
+
+# ---- پیام ۴: تحلیل معاملات بازنده ----
+msg4 = (
+    f"📉 *تحلیل معاملات بازنده در {FORWARD_CANDLES} کندل*\n"
+    f"━━━━━━━━━━━━━━━━━━━━\n"
+    f"*🟢 بیشترین رشد ناگهانی (MFE):*\n"
+    f"• میانگین: `+{loss_mfe_avg:.2f}%`\n"
+    f"• بیشترین: `+{loss_mfe_max:.2f}%`\n\n"
+    f"*🔴 بیشترین افت (MAE):*\n"
+    f"• میانگین: `-{loss_mae_avg:.2f}%`\n"
+    f"• بیشترین: `-{loss_mae_max:.2f}%`"
+)
+tg_send_message(msg4)
+
+# ---- پیام ۵: TP/SL پیشنهادی ----
+msg5 = (
     f"🎯 *پیشنهاد حد سود و حد ضرر*\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
     f"• حد سود (TP): `+{best_combo['tp']:.1f}%`\n"
@@ -405,19 +481,19 @@ msg2 = (
     f"━━━━━━━━━━━━━━━━━━━━\n"
     f"{status_emoji} {'استراتژی سودآور است' if profitable else 'نیاز به بهینه‌سازی دارد'}"
 )
-tg_send_message(msg2)
+tg_send_message(msg5)
 
-# ---- پیام ۳ ----
-msg3 = (
+# ---- پیام ۶: SL بر اساس MAE برنده‌ها ----
+msg6 = (
     f"📌 *SL پیشنهادی (بر اساس MAE برنده‌ها)*\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
     f"• SL = `-{sl_80:.2f}%` → حفظ ۸۰٪ برنده‌ها\n"
     f"• SL = `-{sl_90:.2f}%` → حفظ ۹۰٪ برنده‌ها\n"
     f"• SL = `-{sl_95:.2f}%` → حفظ ۹۵٪ برنده‌ها\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"🏆 بهترین TP (سرمایه): `+{best_tp['tp']:.1f}%` → `{best_tp['final_capital']:.2f}`\n"
-    f"🏆 بهترین TP (امید):  `+{best_combo['tp']:.1f}%` | SL: `-{best_combo['sl']:.1f}%`"
+    f"🏆 بهترین TP (بیشترین سرمایه): `+{best_tp['tp']:.1f}%` → `{best_tp['final_capital']:.2f}`\n"
+    f"🏆 بهترین TP/SL (بیشترین امید):  `+{best_combo['tp']:.1f}%` / `-{best_combo['sl']:.1f}%`"
 )
-tg_send_message(msg3)
+tg_send_message(msg6)
 
 print("\n✅ همه چیز تمام شد.")
