@@ -22,7 +22,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 TARGET_SYMBOL = "ETH-USD"
-TARGET_DATE   = "2025-07-05"     # ← کندل آخر الگو
+TARGET_DATE   = "2024-02-01"     # ← کندل آخر الگو (= 1 Feb)
+                                 #    پس کندل اول الگو = 31 Jan 2024
 
 PATTERN_LEN   = 2                # ← الگو دو کندلی
 
@@ -262,7 +263,6 @@ def find_similar_candles(df_target, target_idx, dfs):
         c = df['Close'].values.astype(float)
         n = len(df)
 
-        # آخرین اندیسی که هم فضای آینده دارد و هم کندل قبلش هست
         max_i = n - LOOKAHEAD - 1
         if max_i < PATTERN_LEN - 1:
             continue
