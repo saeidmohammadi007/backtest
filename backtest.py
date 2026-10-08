@@ -21,7 +21,6 @@ TELEGRAM_ENABLED   = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 
 def _split_text(text, max_len):
-    """تقسیم متن طولانی به تکه‌های مجاز (حداکثر 4096 کاراکتر)"""
     lines = text.split('\n')
     chunks, cur = [], ''
     for line in lines:
@@ -36,7 +35,6 @@ def _split_text(text, max_len):
 
 
 def tg_send_message(text, parse_mode='Markdown'):
-    """ارسال پیام متنی به تلگرام (بدون عکس و فایل)"""
     if not TELEGRAM_ENABLED:
         print("ℹ️ تلگرام غیرفعال (توکن یا chat_id ست نشده)")
         return False
@@ -51,7 +49,6 @@ def tg_send_message(text, parse_mode='Markdown'):
             }, timeout=20)
             if r.status_code != 200:
                 print(f"❌ تلگرام: {r.status_code} - {r.text[:200]}")
-                # تلاش دوباره بدون parse_mode (اگه مشکل کاراکتر خاص بود)
                 r2 = requests.post(url, data={
                     'chat_id': TELEGRAM_CHAT_ID,
                     'text': chunk,
@@ -79,6 +76,9 @@ USE_MACD_FILTER = False
 PER_SYMBOL_TIMEOUT = 45
 MAX_FETCH_RETRIES = 2
 EXCHANGE_NAME = 'lbank'
+
+# ================== 🆕 فقط این اضافه شد ==================
+CAPITAL_PER_TRADE_PCT = 2.0   # در هر معامله ۲٪ سرمایه استفاده می‌شود
 
 
 # ================== تایم‌اوت ==================
@@ -170,12 +170,67 @@ def measure_forward(df, matches, forward):
     return pd.DataFrame(rows)
 
 
+# ================== 🆕 فقط این تابع عوض شد ==================
+def simulate_tp_sl(df, tp_pct, sl_pct):
+    """
+    در هر معامله فقط CAPITAL_PER_TRADE_PCT درصد سرمایه وارد می‌شود.
+    بقیه‌ی سرمایه دست‌نخورده می‌ماند.
+    """
+    capital = 100.0
+    equity_curve = [capital]
+    trade_returns = []   # بازده هر معامله نسبت به کل سرمایه
+
+    for _, r in df.iterrows():
+        # حجم پوزیشن = فقط ۲٪ سرمایه‌ی فعلی
+        position = capital * (CAPITAL_PER_TRADE_PCT / 100.0)
+
+        hit_tp = r['max_%'] >= tp_pct
+        hit_sl = r['min_%'] <= -sl_pct
+
+        if hit_tp and hit_sl:
+            pnl_pct = -sl_pct          # بدبینانه
+        elif hit_tp:
+            pnl_pct = tp_pct
+        elif hit_sl:
+            pnl_pct = -sl_pct
+        else:
+            pnl_pct = r['end_%']
+
+        # سود/ضرر دلاری روی همون ۲٪ پوزیشن
+        pnl = position * (pnl_pct / 100.0)
+        capital += pnl
+        equity_curve.append(capital)
+        trade_returns.append(pnl / (capital - pnl) * 100)  # بازده نسبت به سرمایه‌ی قبل
+
+    results = np.array(trade_returns)
+    wins_arr = results[results > 0]
+    losses_arr = results[results < 0]
+
+    n_wins = len(wins_arr); n_loss = len(losses_arr)
+    win_rate = n_wins / len(results) * 100 if len(results) else 0
+    avg_win = wins_arr.mean() if n_wins > 0 else 0
+    avg_loss = abs(losses_arr.mean()) if n_loss > 0 else 0
+    expectancy = results.mean()
+    rr = avg_win / avg_loss if avg_loss > 0 else 0
+
+    return {
+        'tp': tp_pct, 'sl': sl_pct,
+        'hit_tp_pct': (df['max_%'] >= tp_pct).mean() * 100,
+        'hit_sl_pct': (df['min_%'] <= -sl_pct).mean() * 100,
+        'win_rate': win_rate,
+        'avg_win': avg_win, 'avg_loss': avg_loss,
+        'rr': rr, 'expectancy': expectancy,
+        'final_capital': capital,   # از ۱۰۰ شروع، هر معامله ۲٪
+    }
+
+
 # ================== شروع ==================
 tg_send_message(
     f"🚀 *شروع بک‌تست*\n"
     f"📅 الگو: `{PATTERN_DATE}`\n"
     f"🪙 نمادها: {len(SYMBOLS)}\n"
-    f"⏱️ تایم‌فریم: `{TIMEFRAME}`"
+    f"⏱️ تایم‌فریم: `{TIMEFRAME}`\n"
+    f"💰 هر معامله: `{CAPITAL_PER_TRADE_PCT}%` سرمایه"
 )
 
 ex, ex_name = connect_exchange()
@@ -288,44 +343,6 @@ else:
     sl_80 = sl_90 = sl_95 = 5.0
 
 
-def simulate_tp_sl(df, tp_pct, sl_pct):
-    results = []
-    for _, r in df.iterrows():
-        hit_tp = r['max_%'] >= tp_pct
-        hit_sl = r['min_%'] <= -sl_pct
-        if hit_tp and hit_sl:
-            outcome = -sl_pct
-        elif hit_tp:
-            outcome = tp_pct
-        elif hit_sl:
-            outcome = -sl_pct
-        else:
-            outcome = r['end_%']
-        results.append(outcome)
-
-    results = np.array(results)
-    wins_arr = results[results > 0]
-    losses_arr = results[results < 0]
-
-    n_wins = len(wins_arr); n_loss = len(losses_arr)
-    win_rate = n_wins / len(results) * 100 if len(results) else 0
-    avg_win = wins_arr.mean() if n_wins > 0 else 0
-    avg_loss = abs(losses_arr.mean()) if n_loss > 0 else 0
-    expectancy = results.mean()
-    rr = avg_win / avg_loss if avg_loss > 0 else 0
-    cumulative = np.prod(1 + results / 100)
-
-    return {
-        'tp': tp_pct, 'sl': sl_pct,
-        'hit_tp_pct': (df['max_%'] >= tp_pct).mean() * 100,
-        'hit_sl_pct': (df['min_%'] <= -sl_pct).mean() * 100,
-        'win_rate': win_rate,
-        'avg_win': avg_win, 'avg_loss': avg_loss,
-        'rr': rr, 'expectancy': expectancy,
-        'final_capital': cumulative * 100,
-    }
-
-
 SL_FIXED = round(sl_90, 2)
 tp_levels = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30]
 sl_options = [2, 3, 4, 5, 6, 8, 10, 12, 15]
@@ -343,7 +360,7 @@ best_combo = max(all_combos, key=lambda x: x['expectancy'])
 best_capital = max(all_combos, key=lambda x: x['final_capital'])
 
 
-# ================== 📊 ذخیره‌ی CSV (برای Artifact گیت‌هاب) ==================
+# ================== ذخیره‌ی CSV ==================
 full.to_csv(os.path.join(OUTPUT_DIR, f'backtest_results_{PATTERN_DATE}.csv'), index=False)
 pd.DataFrame(tp_results).to_csv(os.path.join(OUTPUT_DIR, f'tp_analysis_{PATTERN_DATE}.csv'), index=False)
 pd.DataFrame([{**{'tp': tp, 'sl': sl}, **matrix_vals[(tp, sl)]}
@@ -351,18 +368,19 @@ pd.DataFrame([{**{'tp': tp, 'sl': sl}, **matrix_vals[(tp, sl)]}
     os.path.join(OUTPUT_DIR, f'tp_sl_matrix_{PATTERN_DATE}.csv'), index=False)
 
 
-# ================== 📱 ارسال فقط متن به تلگرام ==================
+# ================== ارسال به تلگرام ==================
 print("\n📱 ارسال به تلگرام ...")
 
 profitable = best_combo['win_rate'] > 100/(1+best_combo['rr'])
 status_emoji = "✅" if profitable else "⚠️"
 
-# ---- پیام ۱: خلاصه ----
+# ---- پیام ۱ ----
 msg1 = (
     f"📊 *نتیجه‌ی بک‌تست*\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
     f"📅 الگو: `{actual_date}`\n"
     f"🪙 نمادها: {len(SYMBOLS)} | رد شده: {len(skipped)}\n"
+    f"💰 هر معامله: `{CAPITAL_PER_TRADE_PCT}%` سرمایه\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
     f"*📈 خلاصه‌ی کلی:*\n"
     f"• تعداد معاملات: `{total}`\n"
@@ -373,7 +391,7 @@ msg1 = (
 )
 tg_send_message(msg1)
 
-# ---- پیام ۲: پیشنهاد نهایی ----
+# ---- پیام ۲ ----
 msg2 = (
     f"🎯 *پیشنهاد حد سود و حد ضرر*\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -389,7 +407,7 @@ msg2 = (
 )
 tg_send_message(msg2)
 
-# ---- پیام ۳: SL های پیشنهادی و بهترین TP ----
+# ---- پیام ۳ ----
 msg3 = (
     f"📌 *SL پیشنهادی (بر اساس MAE برنده‌ها)*\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
