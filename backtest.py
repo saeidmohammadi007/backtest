@@ -71,7 +71,6 @@ PATTERN_SYMBOL = 'ETH/USDT'
 PATTERN_DATE = '2025-07-04'
 SIMILARITY_THRESHOLD = 0.08
 FORWARD_CANDLES = 60
-USE_MACD_FILTER = True   # ← فعال شد: شرط MACD > Signal
 
 PER_SYMBOL_TIMEOUT = 45
 MAX_FETCH_RETRIES = 2
@@ -137,27 +136,14 @@ def candle_vector(o, h, l, c):
     return np.array([(o-l)/r, 1.0, 0.0, (c-l)/r])
 
 
-def compute_macd(close, fast=12, slow=26, signal_period=9):
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
-    return macd_line, signal_line
-
-
-def scan_matches(df, pvec, threshold, macd_line=None, signal_line=None, use_macd=False):
+def scan_matches(df, pvec, threshold):
     matches = []
     for i in range(len(df)):
         row = df.iloc[i]
         v = candle_vector(row['open'], row['high'], row['low'], row['close'])
-        if v is None:
-            continue
+        if v is None: continue
         d = float(np.linalg.norm(pvec - v))
         if d <= threshold:
-            # شرط MACD: خط MACD باید بالای خط سیگنال باشد
-            if use_macd and macd_line is not None and signal_line is not None:
-                if not (macd_line.iloc[i] > signal_line.iloc[i]):
-                    continue
             matches.append({'index': i, 'dt': df.index[i], 'dist': d})
     return matches
 
@@ -236,7 +222,6 @@ tg_send_message(
     f"🪙 نمادها: {len(SYMBOLS)}\n"
     f"⏱️ تایم‌فریم: `{TIMEFRAME}`\n"
     f"🎯 افق بررسی: `{FORWARD_CANDLES}` کندل\n"
-    f"🔎 فیلتر MACD: `{'فعال (MACD > Signal)' if USE_MACD_FILTER else 'غیرفعال'}`\n"
     f"💰 هر معامله: `{CAPITAL_PER_TRADE_PCT}%` سرمایه"
 )
 
@@ -299,32 +284,14 @@ for idx, sym in enumerate(SYMBOLS, 1):
         print("⏭️ داده ناکافی"); skipped.append(sym); continue
 
     try:
-        # --- محاسبه MACD در صورت فعال بودن فیلتر ---
-        if USE_MACD_FILTER:
-            macd_line, signal_line = compute_macd(df['close'])
-        else:
-            macd_line = signal_line = None
-
-        # --- شمارش خام و فیلترشده (برای گزارش) ---
-        raw_matches = scan_matches(df, pvec, SIMILARITY_THRESHOLD)
-        matches = scan_matches(
-            df, pvec, SIMILARITY_THRESHOLD,
-            macd_line=macd_line,
-            signal_line=signal_line,
-            use_macd=USE_MACD_FILTER,
-        )
-
+        matches = scan_matches(df, pvec, SIMILARITY_THRESHOLD)
         trades = measure_forward(df, matches, FORWARD_CANDLES)
         if not trades.empty:
             trades['symbol'] = sym
             all_trades[sym] = trades
-            print(f"✅ {len(trades)} تطابق "
-                  f"(خام {len(raw_matches)} → بعد MACD {len(matches)}) "
-                  f"({time.time()-t0:.1f}s)")
+            print(f"✅ {len(trades)} تطابق ({time.time()-t0:.1f}s)")
         else:
-            print(f"⚪ ۰ تطابق "
-                  f"(خام {len(raw_matches)} → بعد MACD {len(matches)}) "
-                  f"({time.time()-t0:.1f}s)")
+            print(f"⚪ ۰ تطابق ({time.time()-t0:.1f}s)")
     except Exception as e:
         print(f"❌ {e.__class__.__name__}")
     time.sleep(0.2)
@@ -446,7 +413,6 @@ msg1 = (
     f"📅 الگو: `{actual_date}`\n"
     f"🪙 نمادها: {len(SYMBOLS)} | رد شده: {len(skipped)}\n"
     f"⏱️ تایم‌فریم: `{TIMEFRAME}` | افق: `{FORWARD_CANDLES}` کندل\n"
-    f"🔎 فیلتر MACD: `{'فعال (MACD > Signal)' if USE_MACD_FILTER else 'غیرفعال'}`\n"
     f"💰 هر معامله: `{CAPITAL_PER_TRADE_PCT}%` سرمایه\n"
     f"━━━━━━━━━━━━━━━━━━━━\n"
     f"*📈 خلاصه‌ی کلی:*\n"
