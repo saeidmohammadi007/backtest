@@ -431,7 +431,6 @@ def report_up_group_path(ups):
     lines.append(f"<b>🔬 تحلیل مسیر {n} صعودی (اول ریزش، بعد صعود):</b>")
     lines.append("")
 
-    # ---- ریزش قبل از سربه‌سر شدن ----
     if dd_rec:
         lines.append("📉 <b>ریزش قبل از سربه‌سر شدن:</b>")
         lines.append(f"├ میانگین: <code>{np.mean(dd_rec):+.2f}٪</code>")
@@ -444,21 +443,20 @@ def report_up_group_path(ups):
             return sum(1 for v in vals if v >= -threshold) / len(vals) * 100.0
 
         lines.append("")
-        lines.append("📊 <b>چند درصد قبل از سربه‌سر شدن، کمتر از ... ریزش داشتن؟</b>")
+        lines.append("📊 <b>چند درصد قبل از سربه‌سر شدن، "
+                     "کمتر از ... ریزش داشتن؟</b>")
         lines.append(f"├ کمتر از ۵٪: <code>{pct_above(dd_rec, 5):.1f}٪</code>")
         lines.append(f"├ کمتر از ۱۰٪: <code>{pct_above(dd_rec, 10):.1f}٪</code>")
         lines.append(f"├ کمتر از ۲۰٪: <code>{pct_above(dd_rec, 20):.1f}٪</code>")
         lines.append(f"├ کمتر از ۳۰٪: <code>{pct_above(dd_rec, 30):.1f}٪</code>")
         lines.append(f"└ کمتر از ۵۰٪: <code>{pct_above(dd_rec, 50):.1f}٪</code>")
 
-    # ---- ریزش قبل از سقف ----
     lines.append("")
     lines.append("🏔 <b>ریزش قبل از رسیدن به سقف:</b>")
     lines.append(f"├ میانگین: <code>{np.mean(dd_peak):+.2f}٪</code>")
     lines.append(f"├ میانه: <code>{np.median(dd_peak):+.2f}٪</code>")
     lines.append(f"└ بدترین: <code>{np.min(dd_peak):+.2f}٪</code>")
 
-    # ---- زمان‌بندی ----
     lines.append("")
     lines.append("⏱ <b>زمان‌بندی (تعداد کندل):</b>")
     if bars_rec:
@@ -471,12 +469,73 @@ def report_up_group_path(ups):
     lines.append(f"└ میانه رسیدن به سقف: "
                  f"<code>{np.median(bars_pk):.0f}</code> کندل")
 
-    # ---- توزیع ریزش اولیه ----
     if dd_rec:
         lines.append("")
         lines.append("📊 <b>توزیع ریزش اولیه (قبل از سربه‌سر):</b>")
         b = bucketize(dd_rec, DD_BUCKETS)
         lines.extend(fmt_buckets(compress_buckets(b, max_lines=10), emoji="🟥"))
+    return lines
+
+
+# ==================== تحلیل اهداف سود ====================
+def report_target_reach(ups):
+    """
+    چند درصد از صعودی‌ها به اهداف سود مشخص رسیدن؟
+    هدف = بیشترین رشدی که در ۱۰۰ کندل بعدی تجربه کردن (max_up).
+    """
+    lines = []
+    if not ups:
+        return lines
+
+    n_up = len(ups)
+    max_ups = [r['max_up'] for r in ups]
+
+    targets = [5, 10, 15, 20, 30, 50, 75, 100, 150, 200]
+
+    lines.append(f"<b>🎯 از {n_up} مورد صعودی، "
+                 f"چند درصد به این اهداف رسیدن؟</b>")
+    lines.append("<i>(یعنی حداکثر رشدی که در ۱۰۰ کندل بعد تجربه کردن، "
+                 "حداقل چقدر بود)</i>")
+    lines.append("")
+    for t in targets:
+        cnt = sum(1 for v in max_ups if v >= t)
+        pct = cnt / n_up * 100.0
+        bar = "█" * int(round(pct / 5))  # هر بلاک ≈ ۵٪
+        lines.append(f"├ رسیدن به <b>+{t}٪</b>: "
+                     f"<code>{cnt:>2}</code> مورد ({pct:5.1f}٪) 🟢{bar}")
+    lines.append("")
+
+    lines.append("📊 <b>آمار بیشترین رشد در صعودی‌ها:</b>")
+    lines.append(f"├ میانگین: <code>+{np.mean(max_ups):.1f}٪</code>")
+    lines.append(f"├ میانه: <code>+{np.median(max_ups):.1f}٪</code>")
+    lines.append(f"├ بیشترین: <code>+{np.max(max_ups):.1f}٪</code>")
+    lines.append(f"└ کمترین: <code>+{np.min(max_ups):.1f}٪</code>")
+    lines.append("")
+
+    lines.append("📈 <b>توزیع بیشترین رشد در صعودی‌ها:</b>")
+    b = bucketize(max_ups, UP_BUCKETS)
+    lines.extend(fmt_buckets(compress_buckets(b, max_lines=12), emoji="🟩"))
+    return lines
+
+
+def report_target_reach_down(downs):
+    """چند درصد از نزولی‌ها ریزش‌های مشخص داشتن"""
+    lines = []
+    if not downs:
+        return lines
+
+    n = len(downs)
+    max_dds = [abs(r['max_dd']) for r in downs]
+    targets = [5, 10, 20, 30, 50, 70]
+
+    lines.append(f"<b>📉 از {n} مورد نزولی، "
+                 f"چند درصد ریزش این‌قدری داشتن؟</b>")
+    for t in targets:
+        cnt = sum(1 for v in max_dds if v >= t)
+        pct = cnt / n * 100.0
+        bar = "█" * int(round(pct / 5))
+        lines.append(f"├ ریزش بیش از <b>{t}٪</b>: "
+                     f"<code>{cnt:>2}</code> مورد ({pct:5.1f}٪) 🟥{bar}")
     return lines
 
 
@@ -518,7 +577,6 @@ def report_single(details, df_target, target_idx, target_forward):
     dd_buckets    = bucketize(all_max_dd, DD_BUCKETS)
     up_buckets    = bucketize(all_max_up, UP_BUCKETS)
     ret_buckets   = bucketize(all_ret,    RET_BUCKETS)
-    dd_up_buckets = bucketize(sub(ups, 'max_dd'), DD_BUCKETS) if ups else []
 
     def pct_between(vals, lo, hi):
         if not vals:
@@ -606,6 +664,10 @@ def report_single(details, df_target, target_idx, target_forward):
         lines.extend(report_up_group_path(ups))
         lines.append("")
 
+        # ---- اهداف سود در صعودی‌ها ----
+        lines.extend(report_target_reach(ups))
+        lines.append("")
+
     # ========== گروه نزولی ==========
     if downs:
         lines.append("<b>🔴 گروه نزولی‌ها (نهایتاً منفی):</b>")
@@ -613,6 +675,9 @@ def report_single(details, df_target, target_idx, target_forward):
         lines.append(f"├ میانگین بیشترین ریزش: <code>{avg_dd_down:+.2f}٪</code>")
         lines.append(f"├ 📉 بدترین ریزش: <code>{worst_dd_down:+.2f}٪</code>")
         lines.append(f"└ بدترین بازدهی: <code>{worst_ret_down:+.2f}٪</code>")
+        lines.append("")
+
+        lines.extend(report_target_reach_down(downs))
         lines.append("")
 
     # ========== مسیر واقعی هدف ==========
