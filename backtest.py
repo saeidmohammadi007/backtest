@@ -21,15 +21,16 @@ def log(m):
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-TARGET_SYMBOL = "BWET-USD"       # ← نماد هدف (باید داخل SYMBOLS باشد)
+TARGET_SYMBOL = "DOGE-USD"       # ← نماد هدف (باید داخل SYMBOLS باشد)
 TARGET_DATE   = "2025-07-04"     # ← کندل الگو (تک‌کندلی)
 
 PATTERN_LEN   = 1                # ← الگو تک‌کندلی
 
-# همه کریپتو → همه با پسوند -USD
+# ۱۰ کریپتوی معتبر در Yahoo Finance
 SYMBOLS = [
-    "BWET-USD", "MVLL-USD", "LUMIA-USD", "API3-USD", "FIL-USD",
-    "DOGE-USD", "ONDO-USD", "AGPU-USD", "SHIB-USD", "ADBE-USD",
+    "DOGE-USD", "SHIB-USD", "FIL-USD",
+    "API3-USD", "ONDO-USD", "LUMIA-USD",
+    "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD",
 ]
 
 INTERVAL = "1d"
@@ -85,10 +86,6 @@ def candle_features(i, o, h, l, c):
 
 
 def pattern_features(end_idx, o, h, l, c, pattern_len=PATTERN_LEN):
-    """
-    ویژگی‌های الگوی چندکندلی که به کندل end_idx ختم می‌شود.
-    خروجی: بردار 4*pattern_len بعدی.
-    """
     start = end_idx - pattern_len + 1
     if start < 0:
         return None
@@ -296,8 +293,6 @@ def find_similar_candles(df_target, target_idx, dfs):
         feats = np.array(feats)
         dists = np.sqrt(np.sum((feats - target_feat) ** 2, axis=1))
 
-        # استخر بزرگ‌تر می‌گیریم چون بخشی از کاندیدها در مرحله حذف
-        # هم‌تاریخی حذف می‌شوند.
         k = min(K_PER_SYMBOL * 5, len(idxs))
         order = np.argsort(dists)[:k]
         for oi in order:
@@ -316,7 +311,6 @@ def find_similar_candles(df_target, target_idx, dfs):
 
     candidates_all.sort(key=lambda x: x['dist'])
 
-    # ↓ حذف هم‌تاریخی‌ها: هیچ دو کندلی از یک تاریخ انتخاب نمی‌شود
     seen_dates = set()
     unique_candidates = []
     for c in candidates_all:
@@ -695,7 +689,6 @@ def report_single(details, df_target, target_idx, target_forward):
     lines.append(f"🕯 <b>تحلیل الگوی {pat_label} مشابه {TARGET_SYMBOL}</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    # نمایش کندل‌های الگو
     lines.append(f"🗓 <b>کندل‌های الگو ({PATTERN_LEN} کندل):</b>")
     pattern_start = target_idx - PATTERN_LEN + 1
     for k, j in enumerate(range(pattern_start, target_idx + 1), 1):
@@ -823,8 +816,15 @@ def main():
         if df is not None and len(df) > LOOKAHEAD + 10:
             dfs[sym] = df
 
+    missing = [s for s in SYMBOLS if s not in dfs]
+    if missing:
+        log(f"⚠️ نمادهای بدون داده (در Yahoo Finance پیدا نشدند): {missing}")
+
     if TARGET_SYMBOL not in dfs:
-        raise RuntimeError(f"داده‌ی {TARGET_SYMBOL} موجود نیست.")
+        raise RuntimeError(
+            f"داده‌ی {TARGET_SYMBOL} موجود نیست. "
+            f"نمادهای موجود: {list(dfs.keys())}"
+        )
 
     df_target = dfs[TARGET_SYMBOL]
     n_t = len(df_target)
@@ -866,7 +866,6 @@ def main():
         l = df['Low'].values.astype(float)
         cc = df['Close'].values.astype(float)
         n = len(df)
-        # entry_idx = کندل آخر الگو (پس ورود از Close همان کندل)
         r = analyze_forward(c_['idx'], o, h, l, cc, n, LOOKAHEAD)
         if r is None:
             continue
