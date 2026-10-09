@@ -295,19 +295,39 @@ def find_similar_candles(df_target, target_idx, dfs):
         feats = np.array(feats)
         dists = np.sqrt(np.sum((feats - target_feat) ** 2, axis=1))
 
-        k = min(K_PER_SYMBOL, len(idxs))
+        # استخر بزرگ‌تر می‌گیریم چون بخشی از کاندیدها در مرحله حذف
+        # هم‌تاریخی حذف می‌شوند.
+        k = min(K_PER_SYMBOL * 5, len(idxs))
         order = np.argsort(dists)[:k]
         for oi in order:
+            cand_idx = int(idxs[oi])
+            dt = df.index[cand_idx]
+            if getattr(dt, 'tz', None) is not None:
+                dt = dt.tz_localize(None)
             candidates_all.append({
-                'symbol': sym,
-                'idx':    int(idxs[oi]),
-                'dist':   float(dists[oi]),
+                'symbol':   sym,
+                'idx':      cand_idx,
+                'dist':     float(dists[oi]),
+                'date_key': dt.normalize(),
             })
         log(f"   ✔️ {sym}: {k} الگوی مشابه "
             f"(کمترین فاصله: {dists[order[0]]:.4f})")
 
     candidates_all.sort(key=lambda x: x['dist'])
-    return candidates_all[:TOTAL_TOP]
+
+    # ↓ حذف هم‌تاریخی‌ها: هیچ دو کندلی از یک تاریخ انتخاب نمی‌شود
+    seen_dates = set()
+    unique_candidates = []
+    for c in candidates_all:
+        if c['date_key'] in seen_dates:
+            continue
+        seen_dates.add(c['date_key'])
+        unique_candidates.append(c)
+        if len(unique_candidates) >= TOTAL_TOP:
+            break
+
+    log(f"🧹 بعد از حذف هم‌تاریخی‌ها: {len(unique_candidates)} الگوی یکتا")
+    return unique_candidates
 
 
 # ==================== نمودار ====================
