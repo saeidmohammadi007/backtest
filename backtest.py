@@ -26,10 +26,11 @@ TARGET_DATE   = "2025-07-04"     # ← کندل الگو (تک‌کندلی)
 
 PATTERN_LEN   = 1                # ← الگو تک‌کندلی
 
-# فقط همان ۶ کریپتوی خودت
+# کریپتوی‌ها
 SYMBOLS = [
     "LUMIA-USD", "API3-USD", "FIL-USD",
     "DOGE-USD", "ONDO-USD", "SHIB-USD",
+    "BLESS-USD", "ROSE-USD", "LINEA-USD", "JTO-USD",
 ]
 
 INTERVAL = "1d"
