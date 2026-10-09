@@ -26,11 +26,10 @@ TARGET_DATE   = "2025-07-04"     # ← کندل الگو (تک‌کندلی)
 
 PATTERN_LEN   = 1                # ← الگو تک‌کندلی
 
-# ۱۰ کریپتوی معتبر در Yahoo Finance
+# فقط همان ۶ کریپتوی خودت
 SYMBOLS = [
-    "DOGE-USD", "SHIB-USD", "FIL-USD",
-    "API3-USD", "ONDO-USD", "LUMIA-USD",
-    "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD",
+    "LUMIA-USD", "API3-USD", "FIL-USD",
+    "DOGE-USD", "ONDO-USD", "SHIB-USD",
 ]
 
 INTERVAL = "1d"
