@@ -22,10 +22,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 TARGET_SYMBOL = "ETH-USD"
-TARGET_DATE   = "2025-08-01"     # ← کندل آخر الگو (= 1 Aug 2025)
-                                 #    پس کندل اول الگو = 31 Jul 2025
+TARGET_DATE   = "2024-01-31"     # ← کندل الگو (تک‌کندلی)
 
-PATTERN_LEN   = 2                # ← الگو دو کندلی
+PATTERN_LEN   = 1                # ← الگو تک‌کندلی
 
 SYMBOLS = [
     "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
@@ -407,8 +406,9 @@ def build_chart(details, target_forward, target_date_str):
     ax.set_xlabel('Final return (٪)'); ax.set_ylabel('Count')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
+    pat_label = "single candle" if PATTERN_LEN == 1 else f"{PATTERN_LEN} candles"
     plt.suptitle(f"Top {len(results)} similar PAST patterns "
-                 f"({PATTERN_LEN} candles) | "
+                 f"({pat_label}) | "
                  f"Target: {TARGET_SYMBOL} {target_date_str}",
                  fontsize=13, fontweight='bold')
     plt.tight_layout()
@@ -668,8 +668,10 @@ def report_single(details, df_target, target_idx, target_forward):
     l_t = df_target['Low'].values.astype(float)
     c_t = df_target['Close'].values.astype(float)
 
+    pat_label = "تک‌کندلی" if PATTERN_LEN == 1 else f"{PATTERN_LEN}-کندلی"
+
     lines = []
-    lines.append(f"🕯 <b>تحلیل الگوی {PATTERN_LEN}-کندلی مشابه {TARGET_SYMBOL}</b>")
+    lines.append(f"🕯 <b>تحلیل الگوی {pat_label} مشابه {TARGET_SYMBOL}</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     # نمایش کندل‌های الگو
@@ -789,8 +791,9 @@ def report_single(details, df_target, target_idx, target_forward):
 
 # ==================== اجرای اصلی ====================
 def main():
+    pat_label = "تک‌کندلی" if PATTERN_LEN == 1 else f"{PATTERN_LEN}-کندلی"
     log("=" * 60)
-    log(f"🚀 مشابه‌یابی الگوی {PATTERN_LEN}-کندلی {TARGET_SYMBOL}")
+    log(f"🚀 مشابه‌یابی الگوی {pat_label} {TARGET_SYMBOL}")
     log("=" * 60)
 
     dfs = {}
@@ -828,7 +831,7 @@ def main():
     target_actual = analyze_forward(target_idx, o_t, h_t, l_t, c_t, n_t, LOOKAHEAD)
     target_forward = target_actual['path'] if target_actual else None
 
-    log(f"\n🔍 جستجوی الگوهای {PATTERN_LEN}-کندلی مشابه در گذشته...")
+    log(f"\n🔍 جستجوی الگوهای {pat_label} مشابه در گذشته...")
     candidates = find_similar_candles(df_target, target_idx, dfs)
     if not candidates:
         raise RuntimeError("هیچ الگوی مشابهی یافت نشد.")
@@ -884,7 +887,7 @@ def main():
     try:
         target_date_str = df_target.index[target_idx].strftime('%Y-%m-%d')
         buf = build_chart(details, target_forward, target_date_str)
-        caption = (f"🕯 الگوی {PATTERN_LEN}-کندلی مشابه {TARGET_SYMBOL} | "
+        caption = (f"🕯 الگوی {pat_label} مشابه {TARGET_SYMBOL} | "
                    f"{df_target.index[target_idx].date()}\n"
                    f"الگوهای مشابه: {n_total} | صعودی: {win_rate:.0f}٪")
         send_photo(buf, caption)
