@@ -21,14 +21,15 @@ def log(m):
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-TARGET_SYMBOL = "ETH-USD"
+TARGET_SYMBOL = "BWET-USD"       # ← نماد هدف (باید داخل SYMBOLS باشد)
 TARGET_DATE   = "2025-07-04"     # ← کندل الگو (تک‌کندلی)
 
 PATTERN_LEN   = 1                # ← الگو تک‌کندلی
 
+# همه کریپتو → همه با پسوند -USD
 SYMBOLS = [
-    "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
-    "ADA-USD", "DOGE-USD", "AVAX-USD", "DOT-USD", "LINK-USD",
+    "BWET-USD", "MVLL-USD", "LUMIA-USD", "API3-USD", "FIL-USD",
+    "DOGE-USD", "ONDO-USD", "AGPU-USD", "SHIB-USD", "ADBE-USD",
 ]
 
 INTERVAL = "1d"
