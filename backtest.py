@@ -21,22 +21,23 @@ def log(m):
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-TARGET_SYMBOL = "DOGE-USD"       # ← نماد هدف (باید داخل SYMBOLS باشد)
-TARGET_DATE   = "2025-07-04"     # ← کندل الگو (تک‌کندلی)
+TARGET_SYMBOL = "DOGE-USD"       # ← نماد هدف
+TARGET_DATE   = "2025-07-04"     # ← تاریخ کندل مرجع (روزانه)
 
-PATTERN_LEN   = 1                # ← الگو تک‌کندلی
+# ⭐ کندل مرجع روزانه، ولی جستجوی الگو روی ۴ ساعته
+TARGET_INTERVAL = "1d"           # کندل مرجع
+SEARCH_INTERVAL = "4h"           # جستجوی مشابه‌ها
+SEARCH_PERIOD_HOURLY = "730d"    # بازه‌ی داده‌ی ۱ ساعته (حداکثر Yahoo)
 
-# کریپتوی‌ها
+PATTERN_LEN = 1                  # تعداد کندل الگو (روی کندل مرجع)
+
 SYMBOLS = [
     "LUMIA-USD", "API3-USD", "FIL-USD",
     "DOGE-USD", "ONDO-USD", "SHIB-USD",
     "BLESS-USD", "ROSE-USD", "LINEA-USD", "JTO-USD",
 ]
 
-INTERVAL = "1d"
-PERIOD   = "10y"
-
-LOOKAHEAD    = 100
+LOOKAHEAD    = 100               # تعداد کندل ۴ساعته بعدی برای بررسی آینده
 K_PER_SYMBOL = 20
 TOTAL_TOP    = 100
 
@@ -60,7 +61,8 @@ RET_BUCKETS.insert(0, (-1e9, -50)); RET_BUCKETS.append((50, 1e9))
 
 # ==================== توابع ====================
 def fetch(symbol, interval, period):
-    log(f"📥 دریافت {symbol}")
+    """دریافت داده‌ی روزانه (برای کندل مرجع)."""
+    log(f"📥 دریافت {symbol} ({interval})")
     try:
         df = yf.download(symbol, interval=interval, period=period,
                          progress=False, auto_adjust=True, timeout=60)
@@ -71,6 +73,32 @@ def fetch(symbol, interval, period):
         return df[['Open', 'High', 'Low', 'Close']].dropna()
     except Exception as e:
         log(f"❌ fetch {symbol}: {e}")
+        return None
+
+
+def fetch_4h(symbol):
+    """دریافت ۱ ساعته از Yahoo و تبدیل به ۴ ساعته."""
+    log(f"📥 دریافت {symbol} (1h→4h)")
+    try:
+        df = yf.download(symbol, interval="1h", period=SEARCH_PERIOD_HOURLY,
+                         progress=False, auto_adjust=True, timeout=60)
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df[['Open', 'High', 'Low', 'Close']].dropna()
+        if df.empty:
+            return None
+        # تبدیل 1h → 4h
+        df_4h = df.resample('4h').agg({
+            'Open':  'first',
+            'High':  'max',
+            'Low':   'min',
+            'Close': 'last',
+        }).dropna()
+        return df_4h if not df_4h.empty else None
+    except Exception as e:
+        log(f"❌ fetch_4h {symbol}: {e}")
         return None
 
 
@@ -233,22 +261,13 @@ def send_photo(buf, caption):
         log(f"❌ send photo: {e}")
 
 
-# ==================== جستجوی الگوهای مشابه ====================
-def find_similar_candles(df_target, target_idx, dfs):
-    o_t = df_target['Open'].values.astype(float)
-    h_t = df_target['High'].values.astype(float)
-    l_t = df_target['Low'].values.astype(float)
-    c_t = df_target['Close'].values.astype(float)
-
-    target_feat = pattern_features(target_idx, o_t, h_t, l_t, c_t)
-    if target_feat is None:
-        raise RuntimeError("ویژگی الگوی هدف محاسبه نشد.")
-
-    target_date = df_target.index[target_idx]
-    target_date_naive = target_date
-    if getattr(target_date_naive, 'tz', None) is not None:
-        target_date_naive = target_date_naive.tz_localize(None)
-
+# ==================== جستجوی الگوهای مشابه (روی ۴ساعته) ====================
+def find_similar_candles(target_feat, target_date_naive, dfs):
+    """
+    target_feat: ویژگی‌های کندل مرجع (از تایم‌فریم روزانه)
+    target_date_naive: تاریخ کندل مرجع (naive)
+    dfs: دیکشنری دیتافریم‌های ۴ساعته
+    """
     candidates_all = []
     for sym in SYMBOLS:
         df = dfs.get(sym)
@@ -267,14 +286,12 @@ def find_similar_candles(df_target, target_idx, dfs):
         idx_naive = df.index
         if getattr(idx_naive, 'tz', None) is not None:
             idx_naive = idx_naive.tz_localize(None)
+        # فقط کندل‌های ۴ساعته‌ی «قبل از» تاریخ کندل مرجع روزانه
         mask_before = idx_naive < target_date_naive
         if not mask_before.any():
             continue
         last_before = int(np.where(mask_before)[0][-1])
         max_i = min(max_i, last_before)
-
-        if sym == TARGET_SYMBOL:
-            max_i = min(max_i, target_idx - 1)
 
         if max_i < PATTERN_LEN - 1:
             continue
@@ -306,7 +323,7 @@ def find_similar_candles(df_target, target_idx, dfs):
                 'dist':     float(dists[oi]),
                 'date_key': dt.normalize(),
             })
-        log(f"   ✔️ {sym}: {k} الگوی مشابه "
+        log(f"   ✔️ {sym}: {k} الگوی ۴ساعته مشابه "
             f"(کمترین فاصله: {dists[order[0]]:.4f})")
 
     candidates_all.sort(key=lambda x: x['dist'])
@@ -314,9 +331,11 @@ def find_similar_candles(df_target, target_idx, dfs):
     seen_dates = set()
     unique_candidates = []
     for c in candidates_all:
-        if c['date_key'] in seen_dates:
+        # کلید یکتا = (نماد، تاریخ، ساعت) تا هم‌زمانی‌های دو نماد مختلف حذف نشن
+        key = (c['symbol'], c['date_key'])
+        if key in seen_dates:
             continue
-        seen_dates.add(c['date_key'])
+        seen_dates.add(key)
         unique_candidates.append(c)
         if len(unique_candidates) >= TOTAL_TOP:
             break
@@ -347,8 +366,8 @@ def build_chart(details, target_forward, target_date_str):
         ax.plot(x, target_forward, color='#000000', linewidth=3.0,
                 label=f'Target {TARGET_SYMBOL}')
     ax.axhline(100, color='#888', linestyle=':', linewidth=1)
-    ax.set_title(f"All {len(results)} forward paths", fontweight='bold')
-    ax.set_xlabel('Bars after pattern'); ax.set_ylabel('Normalized price')
+    ax.set_title(f"All {len(results)} forward paths (4h)", fontweight='bold')
+    ax.set_xlabel('Bars after pattern (4h)'); ax.set_ylabel('Normalized price')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
     ax = axes[0, 1]
@@ -365,7 +384,7 @@ def build_chart(details, target_forward, target_date_str):
                 linestyle='--', label='Target actual')
     ax.axhline(100, color='#888', linestyle=':', linewidth=1)
     ax.set_title("Overall mean / median / band", fontweight='bold')
-    ax.set_xlabel('Bars after pattern'); ax.set_ylabel('Normalized price')
+    ax.set_xlabel('Bars after pattern (4h)'); ax.set_ylabel('Normalized price')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
     ax = axes[0, 2]
@@ -386,7 +405,7 @@ def build_chart(details, target_forward, target_date_str):
                 linestyle='--', label='Target actual')
     ax.axhline(100, color='#888', linestyle=':', linewidth=1)
     ax.set_title("Mean path UP vs DOWN", fontweight='bold')
-    ax.set_xlabel('Bars after pattern'); ax.set_ylabel('Normalized price')
+    ax.set_xlabel('Bars after pattern (4h)'); ax.set_ylabel('Normalized price')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
     dd_vals = details['all_max_dd']
@@ -421,10 +440,8 @@ def build_chart(details, target_forward, target_date_str):
     ax.set_xlabel('Final return (٪)'); ax.set_ylabel('Count')
     ax.grid(alpha=0.3); ax.legend(loc='upper left')
 
-    pat_label = "single candle" if PATTERN_LEN == 1 else f"{PATTERN_LEN} candles"
-    plt.suptitle(f"Top {len(results)} similar PAST patterns "
-                 f"({pat_label}) | "
-                 f"Target: {TARGET_SYMBOL} {target_date_str}",
+    plt.suptitle(f"Top {len(results)} similar PAST 4h patterns | "
+                 f"Target (daily): {TARGET_SYMBOL} {target_date_str}",
                  fontsize=13, fontweight='bold')
     plt.tight_layout()
     buf = io.BytesIO()
@@ -478,7 +495,7 @@ def report_up_group_path(ups):
     lines.append(f"└ بدترین: <code>{np.min(dd_peak):+.2f}٪</code>")
 
     lines.append("")
-    lines.append("⏱ <b>زمان‌بندی (تعداد کندل):</b>")
+    lines.append("⏱ <b>زمان‌بندی (تعداد کندل ۴ساعته):</b>")
     if bars_rec:
         lines.append(f"├ میانگین رسیدن به سربه‌سر: "
                      f"<code>{np.mean(bars_rec):.0f}</code> کندل")
@@ -510,8 +527,8 @@ def report_target_reach(ups):
 
     lines.append(f"<b>🎯 از {n_up} مورد صعودی، "
                  f"چند درصد به این اهداف رسیدن؟</b>")
-    lines.append("<i>(یعنی حداکثر رشدی که در ۱۰۰ کندل بعد تجربه کردن، "
-                 "حداقل چقدر بود)</i>")
+    lines.append(f"<i>(یعنی حداکثر رشدی که در {LOOKAHEAD} کندل ۴ساعته‌ی "
+                 f"بعد تجربه کردن، حداقل چقدر بود)</i>")
     lines.append("")
     for t in targets:
         cnt = sum(1 for v in max_ups if v >= t)
@@ -591,7 +608,7 @@ def report_low_dd_winners(ups, n_total, dd_threshold=3.0):
                  f"<code>{n_low / n_total * 100:.1f}٪</code>")
     lines.append("")
 
-    lines.append("📈 <b>سود نهایی (بعد از ۱۰۰ کندل):</b>")
+    lines.append(f"📈 <b>سود نهایی (بعد از {LOOKAHEAD} کندل ۴ساعته):</b>")
     lines.append(f"├ میانگین: <code>{np.mean(rets):+.2f}٪</code>")
     lines.append(f"├ میانه: <code>{np.median(rets):+.2f}٪</code>")
     lines.append(f"├ بیشترین: <code>{np.max(rets):+.2f}٪</code>")
@@ -612,7 +629,7 @@ def report_low_dd_winners(ups, n_total, dd_threshold=3.0):
     lines.append("")
 
     if bars_r:
-        lines.append("⏱ <b>زمان رسیدن به سربه‌سر:</b>")
+        lines.append("⏱ <b>زمان رسیدن به سربه‌سر (کندل ۴ساعته):</b>")
         lines.append(f"├ میانگین: <code>{np.mean(bars_r):.0f}</code> کندل")
         lines.append(f"└ میانه: <code>{np.median(bars_r):.0f}</code> کندل")
         lines.append("")
@@ -626,7 +643,7 @@ def report_low_dd_winners(ups, n_total, dd_threshold=3.0):
 
 
 # ==================== گزارش اصلی ====================
-def report_single(details, df_target, target_idx, target_forward):
+def report_single(details, df_target_daily, target_idx, target_forward):
     res = details['results']
     ups = details['ups']; downs = details['downs']
     n_total = details['n_total']
@@ -635,7 +652,6 @@ def report_single(details, df_target, target_idx, target_forward):
     all_ret    = details['all_ret']
     all_max_up = details['all_max_up']
     all_max_dd = details['all_max_dd']
-    target_actual = details.get('target_actual')
 
     def sub(lst, key):
         return [x[key] for x in lst] if lst else []
@@ -678,18 +694,22 @@ def report_single(details, df_target, target_idx, target_forward):
     for r in res:
         sym_counts[r['symbol']] = sym_counts.get(r['symbol'], 0) + 1
 
-    o_t = df_target['Open'].values.astype(float)
-    h_t = df_target['High'].values.astype(float)
-    l_t = df_target['Low'].values.astype(float)
-    c_t = df_target['Close'].values.astype(float)
+    o_t = df_target_daily['Open'].values.astype(float)
+    h_t = df_target_daily['High'].values.astype(float)
+    l_t = df_target_daily['Low'].values.astype(float)
+    c_t = df_target_daily['Close'].values.astype(float)
 
-    pat_label = "تک‌کندلی" if PATTERN_LEN == 1 else f"{PATTERN_LEN}-کندلی"
+    pat_label = "تک‌کندلی روزانه" if PATTERN_LEN == 1 else \
+                f"{PATTERN_LEN}-کندلی روزانه"
 
     lines = []
     lines.append(f"🕯 <b>تحلیل الگوی {pat_label} مشابه {TARGET_SYMBOL}</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🎯 <b>کندل مرجع: روزانه</b> | "
+                 "🔍 <b>جستجوی مشابه: ۴ ساعته</b>")
+    lines.append("")
 
-    lines.append(f"🗓 <b>کندل‌های الگو ({PATTERN_LEN} کندل):</b>")
+    lines.append(f"🗓 <b>کندل‌های الگو (روزانه):</b>")
     pattern_start = target_idx - PATTERN_LEN + 1
     for k, j in enumerate(range(pattern_start, target_idx + 1), 1):
         op = o_t[j]; cl = c_t[j]; hi = h_t[j]; lo = l_t[j]
@@ -698,7 +718,7 @@ def report_single(details, df_target, target_idx, target_forward):
         body_pct  = (cl - op) / op * 100
         range_pct = (hi - lo) / op * 100
         color = "🟢" if cl >= op else "🔴"
-        d_str = df_target.index[j].date()
+        d_str = df_target_daily.index[j].date()
         lines.append(
             f"├ کندل {k} ({d_str}) {color}: "
             f"O=<code>{op:.2f}</code> H=<code>{hi:.2f}</code> "
@@ -710,12 +730,15 @@ def report_single(details, df_target, target_idx, target_forward):
         )
 
     entry_price = c_t[target_idx]
-    lines.append(f"└ 💵 قیمت ورود (Close آخرین کندل): "
+    lines.append(f"└ 💵 قیمت مرجع (Close کندل روزانه): "
                  f"<code>{entry_price:.2f}</code>")
     lines.append("")
-    lines.append(f"⏭ بررسی <code>{LOOKAHEAD}</code> کندل بعدی از این نقطه")
+    lines.append(f"⏭ بررسی <code>{LOOKAHEAD}</code> کندل ۴ساعته‌ی "
+                 f"بعد از هر الگوی ۴ساعته‌ی مشابه")
+    lines.append(f"   (≈ <code>{LOOKAHEAD * 4}</code> ساعت ≈ "
+                 f"<code>{LOOKAHEAD * 4 / 24:.1f}</code> روز)")
     lines.append(f"✅ فقط الگوهای گذشته (بدون نگاه به آینده)")
-    lines.append(f"🌐 تعداد الگوی مشابه: <code>{n_total}</code>")
+    lines.append(f"🌐 تعداد الگوی ۴ساعته‌ی مشابه: <code>{n_total}</code>")
     lines.append("")
 
     lines.append("<b>📈 آمار کلی:</b>")
@@ -743,7 +766,7 @@ def report_single(details, df_target, target_idx, target_forward):
     lines.append(f"└ 📌 بهترین رشد: <code>{max(all_max_up):+.2f}٪</code>")
     lines.append("")
 
-    lines.append(f"<b>🎯 توزیع بازدهی نهایی (بعد از {LOOKAHEAD} کندل):</b>")
+    lines.append(f"<b>🎯 توزیع بازدهی نهایی (بعد از {LOOKAHEAD} کندل ۴ساعته):</b>")
     lines.extend(fmt_buckets(compress_buckets(ret_buckets, max_lines=15), emoji="🔵"))
     lines.append("")
 
@@ -777,87 +800,86 @@ def report_single(details, df_target, target_idx, target_forward):
         lines.extend(report_target_reach_down(downs))
         lines.append("")
 
-    if target_actual:
-        lines.append("<b>🔵 مسیر واقعی همین الگو تا الان:</b>")
-        lines.append(f"├ بازدهی: <code>{target_actual['ret']:+.2f}٪</code>")
-        lines.append(f"├ بیشترین رشد: <code>{target_actual['max_up']:+.2f}٪</code>")
-        lines.append(f"└ بیشترین ریزش: <code>{target_actual['max_dd']:+.2f}٪</code>")
-        lines.append("")
-
-    lines.append("<b>🌐 توزیع ارزها:</b>")
+    lines.append("<b>🌐 توزیع ارزها (الگوهای ۴ساعته مشابه):</b>")
     for s, cnt in sorted(sym_counts.items(), key=lambda x: -x[1]):
         lines.append(f"• <code>{s}</code>: {cnt} مورد")
     lines.append("")
 
-    lines.append(f"<b>🔝 ۱۰ الگوی نزدیک‌تر (کندل آخر الگو):</b>")
+    lines.append(f"<b>🔝 ۱۰ الگوی ۴ساعته‌ی نزدیک‌تر:</b>")
     for r in res[:10]:
-        d = r['date'].strftime('%Y-%m-%d') \
+        d = r['date'].strftime('%Y-%m-%d %H:%M') \
             if hasattr(r['date'], 'strftime') else str(r['date'])
         lines.append(f"• <code>{r['symbol']}</code> | {d}")
         lines.append(f"   بازدهی: <code>{r['ret']:+.1f}٪</code> | "
                      f"رشد: <code>{r['max_up']:+.1f}٪</code> | "
                      f"ریزش: <code>{r['max_dd']:+.1f}٪</code>")
     lines.append("")
-    lines.append("⚠️ صرفاً تحلیلی است؛ توصیه‌ی معاملاتی نیست.")
+    lines.append("⚠️ صرفاً تحلیلی است؛ توصیه‌ی معاملاتی نیست. "
+                 "داده‌ی ۱ساعته Yahoo فقط ~۲ سال اخیر را پوشش می‌دهد.")
 
     return "\n".join(lines)
 
 
 # ==================== اجرای اصلی ====================
 def main():
-    pat_label = "تک‌کندلی" if PATTERN_LEN == 1 else f"{PATTERN_LEN}-کندلی"
+    pat_label = "تک‌کندلی روزانه"
     log("=" * 60)
     log(f"🚀 مشابه‌یابی الگوی {pat_label} {TARGET_SYMBOL}")
+    log(f"   کندل مرجع: روزانه  |  جستجو: ۴ ساعته")
     log("=" * 60)
 
+    # ---------- ۱) دریافت داده‌ی روزانه‌ی نماد هدف ----------
+    df_target_daily = fetch(TARGET_SYMBOL, TARGET_INTERVAL, "10y")
+    if df_target_daily is None or len(df_target_daily) < PATTERN_LEN:
+        raise RuntimeError(f"داده‌ی روزانه‌ی {TARGET_SYMBOL} موجود نیست.")
+
+    idx_naive = df_target_daily.index
+    if getattr(idx_naive, 'tz', None) is not None:
+        idx_naive = idx_naive.tz_localize(None)
+    deltas = np.abs((idx_naive - pd.Timestamp(TARGET_DATE)).total_seconds())
+    target_idx = int(np.argmin(deltas))
+    if target_idx < PATTERN_LEN - 1:
+        raise RuntimeError(f"کندل مرجع ({TARGET_DATE}) باید "
+                           f"حداقل {PATTERN_LEN - 1} کندل قبل از خود داشته باشد.")
+
+    log(f"🎯 کندل مرجع (روزانه): "
+        f"{df_target_daily.index[target_idx].date()}")
+
+    o_t = df_target_daily['Open'].values.astype(float)
+    h_t = df_target_daily['High'].values.astype(float)
+    l_t = df_target_daily['Low'].values.astype(float)
+    c_t = df_target_daily['Close'].values.astype(float)
+
+    target_feat = pattern_features(target_idx, o_t, h_t, l_t, c_t)
+    if target_feat is None:
+        raise RuntimeError("ویژگی کندل مرجع محاسبه نشد.")
+
+    target_date_naive = df_target_daily.index[target_idx]
+    if getattr(target_date_naive, 'tz', None) is not None:
+        target_date_naive = target_date_naive.tz_localize(None)
+
+    # ---------- ۲) دریافت داده‌ی ۴ساعته‌ی همه‌ی نمادها ----------
     dfs = {}
     for sym in SYMBOLS:
-        df = fetch(sym, INTERVAL, PERIOD)
+        df = fetch_4h(sym)
         if df is not None and len(df) > LOOKAHEAD + 10:
             dfs[sym] = df
 
     missing = [s for s in SYMBOLS if s not in dfs]
     if missing:
-        log(f"⚠️ نمادهای بدون داده (در Yahoo Finance پیدا نشدند): {missing}")
+        log(f"⚠️ نمادهای بدون داده‌ی ۴ساعته: {missing}")
 
-    if TARGET_SYMBOL not in dfs:
-        raise RuntimeError(
-            f"داده‌ی {TARGET_SYMBOL} موجود نیست. "
-            f"نمادهای موجود: {list(dfs.keys())}"
-        )
+    if not dfs:
+        raise RuntimeError("هیچ نمادی داده‌ی ۴ساعته ندارد.")
 
-    df_target = dfs[TARGET_SYMBOL]
-    n_t = len(df_target)
-    idx_naive = df_target.index
-    if getattr(idx_naive, 'tz', None) is not None:
-        idx_naive = idx_naive.tz_localize(None)
-    deltas = np.abs((idx_naive - pd.Timestamp(TARGET_DATE)).total_seconds())
-    target_idx = int(np.argmin(deltas))
-
-    if target_idx < PATTERN_LEN - 1:
-        raise RuntimeError(
-            f"کندل هدف ({TARGET_DATE}) باید حداقل "
-            f"{PATTERN_LEN - 1} کندل قبل از خود داشته باشد."
-        )
-
-    log(f"🎯 کندل آخر الگو: {df_target.index[target_idx].date()}")
-    if PATTERN_LEN > 1:
-        log(f"   کندل اول الگو: "
-            f"{df_target.index[target_idx - PATTERN_LEN + 1].date()}")
-
-    o_t = df_target['Open'].values.astype(float)
-    h_t = df_target['High'].values.astype(float)
-    l_t = df_target['Low'].values.astype(float)
-    c_t = df_target['Close'].values.astype(float)
-    target_actual = analyze_forward(target_idx, o_t, h_t, l_t, c_t, n_t, LOOKAHEAD)
-    target_forward = target_actual['path'] if target_actual else None
-
-    log(f"\n🔍 جستجوی الگوهای {pat_label} مشابه در گذشته...")
-    candidates = find_similar_candles(df_target, target_idx, dfs)
+    # ---------- ۳) جستجوی الگوهای ۴ساعته‌ی مشابه ----------
+    log(f"\n🔍 جستجوی الگوهای ۴ساعته‌ی مشابه در گذشته...")
+    candidates = find_similar_candles(target_feat, target_date_naive, dfs)
     if not candidates:
         raise RuntimeError("هیچ الگوی مشابهی یافت نشد.")
-    log(f"\n🏆 {len(candidates)} الگوی مشابه برتر انتخاب شد.")
+    log(f"\n🏆 {len(candidates)} الگوی ۴ساعته‌ی مشابه برتر انتخاب شد.")
 
+    # ---------- ۴) تحلیل فوروارد روی ۴ساعته ----------
     results = []
     for c_ in candidates:
         sym = c_['symbol']; df = dfs[sym]
@@ -884,6 +906,9 @@ def main():
     n_up = len(ups); n_down = n_total - n_up
     win_rate = n_up / n_total * 100.0
 
+    # target_forward روی ۴ساعته محاسبه نمی‌شه چون کندل مرجع روزانه است
+    target_forward = None
+
     details = {
         'results':       results,
         'ups':           ups,
@@ -895,21 +920,22 @@ def main():
         'all_ret':       [r['ret']    for r in results],
         'all_max_up':    [r['max_up'] for r in results],
         'all_max_dd':    [r['max_dd'] for r in results],
-        'target_actual': target_actual,
+        'target_actual': None,
     }
 
-    report = report_single(details, df_target, target_idx, target_forward)
+    report = report_single(details, df_target_daily, target_idx, target_forward)
     plain = (report.replace("<b>", "").replace("</b>", "")
                    .replace("<code>", "").replace("</code>", ""))
     log("\n" + plain)
     send_message(report)
 
     try:
-        target_date_str = df_target.index[target_idx].strftime('%Y-%m-%d')
+        target_date_str = df_target_daily.index[target_idx].strftime('%Y-%m-%d')
         buf = build_chart(details, target_forward, target_date_str)
-        caption = (f"🕯 الگوی {pat_label} مشابه {TARGET_SYMBOL} | "
-                   f"{df_target.index[target_idx].date()}\n"
-                   f"الگوهای مشابه: {n_total} | صعودی: {win_rate:.0f}٪")
+        caption = (f"🕯 کندل مرجع (روزانه): {TARGET_SYMBOL} "
+                   f"{target_date_str}\n"
+                   f"🔍 الگوهای مشابه: ۴ ساعته\n"
+                   f"تعداد: {n_total} | صعودی: {win_rate:.0f}٪")
         send_photo(buf, caption)
     except Exception as e:
         log(f"❌ chart: {e}")
