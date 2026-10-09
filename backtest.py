@@ -24,7 +24,6 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TARGET_SYMBOL = "DOGE-USD"       # ← نماد هدف
 TARGET_DATE   = "2025-07-04"     # ← تاریخ کندل مرجع (روزانه)
 
-# ⭐ کندل مرجع روزانه، ولی جستجوی الگو روی ۴ ساعته
 TARGET_INTERVAL = "1d"           # کندل مرجع
 SEARCH_INTERVAL = "4h"           # جستجوی مشابه‌ها
 SEARCH_PERIOD_HOURLY = "730d"    # بازه‌ی داده‌ی ۱ ساعته (حداکثر Yahoo)
@@ -263,11 +262,6 @@ def send_photo(buf, caption):
 
 # ==================== جستجوی الگوهای مشابه (روی ۴ساعته) ====================
 def find_similar_candles(target_feat, target_date_naive, dfs):
-    """
-    target_feat: ویژگی‌های کندل مرجع (از تایم‌فریم روزانه)
-    target_date_naive: تاریخ کندل مرجع (naive)
-    dfs: دیکشنری دیتافریم‌های ۴ساعته
-    """
     candidates_all = []
     for sym in SYMBOLS:
         df = dfs.get(sym)
@@ -286,7 +280,6 @@ def find_similar_candles(target_feat, target_date_naive, dfs):
         idx_naive = df.index
         if getattr(idx_naive, 'tz', None) is not None:
             idx_naive = idx_naive.tz_localize(None)
-        # فقط کندل‌های ۴ساعته‌ی «قبل از» تاریخ کندل مرجع روزانه
         mask_before = idx_naive < target_date_naive
         if not mask_before.any():
             continue
@@ -331,7 +324,6 @@ def find_similar_candles(target_feat, target_date_naive, dfs):
     seen_dates = set()
     unique_candidates = []
     for c in candidates_all:
-        # کلید یکتا = (نماد، تاریخ، ساعت) تا هم‌زمانی‌های دو نماد مختلف حذف نشن
         key = (c['symbol'], c['date_key'])
         if key in seen_dates:
             continue
@@ -451,372 +443,28 @@ def build_chart(details, target_forward, target_date_str):
     return buf
 
 
-# ==================== تحلیل مسیر گروه صعودی ====================
-def report_up_group_path(ups):
-    if not ups:
-        return ["<b>🟢 گروه صعودی‌ها:</b>", "└ داده‌ای نیست.", ""]
+# ==================== گزارش خیلی خلاصه ====================
+def report_minimal(ups, n_total):
+    """فقط دو عدد: زیر ۲٪ ریزش + ۲۰٪ رشد، و زیر ۳٪ ریزش + ۲۰٪ رشد."""
+    def joint(th, target=20.0):
+        low = [r for r in ups
+               if r['dd_before_recovery'] is not None
+               and r['dd_before_recovery'] >= -th]
+        cnt = sum(1 for r in low if r['max_up'] >= target)
+        pct_total = cnt / n_total * 100.0 if n_total else 0.0
+        return cnt, len(low), pct_total
 
-    n = len(ups)
-    dd_peak  = [r['dd_before_peak']     for r in ups]
-    dd_rec   = [r['dd_before_recovery'] for r in ups
-                if r['dd_before_recovery'] is not None]
-    bars_rec = [r['bars_to_recovery']   for r in ups
-                if r['bars_to_recovery'] is not None]
-    bars_pk  = [r['bars_to_peak']       for r in ups]
-
-    lines = []
-    lines.append(f"<b>🔬 تحلیل مسیر {n} صعودی (اول ریزش، بعد صعود):</b>")
-    lines.append("")
-
-    if dd_rec:
-        lines.append("📉 <b>ریزش قبل از سربه‌سر شدن:</b>")
-        lines.append(f"├ میانگین: <code>{np.mean(dd_rec):+.2f}٪</code>")
-        lines.append(f"├ میانه: <code>{np.median(dd_rec):+.2f}٪</code>")
-        lines.append(f"└ بدترین: <code>{np.min(dd_rec):+.2f}٪</code>")
-
-        def pct_above(vals, threshold):
-            if not vals:
-                return 0.0
-            return sum(1 for v in vals if v >= -threshold) / len(vals) * 100.0
-
-        lines.append("")
-        lines.append("📊 <b>چند درصد قبل از سربه‌سر شدن، "
-                     "کمتر از ... ریزش داشتن؟</b>")
-        lines.append(f"├ کمتر از ۵٪: <code>{pct_above(dd_rec, 5):.1f}٪</code>")
-        lines.append(f"├ کمتر از ۱۰٪: <code>{pct_above(dd_rec, 10):.1f}٪</code>")
-        lines.append(f"├ کمتر از ۲۰٪: <code>{pct_above(dd_rec, 20):.1f}٪</code>")
-        lines.append(f"├ کمتر از ۳۰٪: <code>{pct_above(dd_rec, 30):.1f}٪</code>")
-        lines.append(f"└ کمتر از ۵۰٪: <code>{pct_above(dd_rec, 50):.1f}٪</code>")
-
-    lines.append("")
-    lines.append("🏔 <b>ریزش قبل از رسیدن به سقف:</b>")
-    lines.append(f"├ میانگین: <code>{np.mean(dd_peak):+.2f}٪</code>")
-    lines.append(f"├ میانه: <code>{np.median(dd_peak):+.2f}٪</code>")
-    lines.append(f"└ بدترین: <code>{np.min(dd_peak):+.2f}٪</code>")
-
-    lines.append("")
-    lines.append("⏱ <b>زمان‌بندی (تعداد کندل ۴ساعته):</b>")
-    if bars_rec:
-        lines.append(f"├ میانگین رسیدن به سربه‌سر: "
-                     f"<code>{np.mean(bars_rec):.0f}</code> کندل")
-        lines.append(f"├ میانه رسیدن به سربه‌سر: "
-                     f"<code>{np.median(bars_rec):.0f}</code> کندل")
-    lines.append(f"├ میانگین رسیدن به سقف: "
-                 f"<code>{np.mean(bars_pk):.0f}</code> کندل")
-    lines.append(f"└ میانه رسیدن به سقف: "
-                 f"<code>{np.median(bars_pk):.0f}</code> کندل")
-
-    if dd_rec:
-        lines.append("")
-        lines.append("📊 <b>توزیع ریزش اولیه (قبل از سربه‌سر):</b>")
-        b = bucketize(dd_rec, DD_BUCKETS)
-        lines.extend(fmt_buckets(compress_buckets(b, max_lines=10), emoji="🟥"))
-    return lines
-
-
-# ==================== تحلیل اهداف سود ====================
-def report_target_reach(ups):
-    lines = []
-    if not ups:
-        return lines
-
-    n_up = len(ups)
-    max_ups = [r['max_up'] for r in ups]
-
-    targets = [5, 10, 15, 20, 30, 50, 75, 100, 150, 200]
-
-    lines.append(f"<b>🎯 از {n_up} مورد صعودی، "
-                 f"چند درصد به این اهداف رسیدن؟</b>")
-    lines.append(f"<i>(یعنی حداکثر رشدی که در {LOOKAHEAD} کندل ۴ساعته‌ی "
-                 f"بعد تجربه کردن، حداقل چقدر بود)</i>")
-    lines.append("")
-    for t in targets:
-        cnt = sum(1 for v in max_ups if v >= t)
-        pct = cnt / n_up * 100.0
-        bar = "█" * int(round(pct / 5))
-        lines.append(f"├ رسیدن به <b>+{t}٪</b>: "
-                     f"<code>{cnt:>2}</code> مورد ({pct:5.1f}٪) 🟢{bar}")
-    lines.append("")
-
-    lines.append("📊 <b>آمار بیشترین رشد در صعودی‌ها:</b>")
-    lines.append(f"├ میانگین: <code>+{np.mean(max_ups):.1f}٪</code>")
-    lines.append(f"├ میانه: <code>+{np.median(max_ups):.1f}٪</code>")
-    lines.append(f"├ بیشترین: <code>+{np.max(max_ups):.1f}٪</code>")
-    lines.append(f"└ کمترین: <code>+{np.min(max_ups):.1f}٪</code>")
-    lines.append("")
-
-    lines.append("📈 <b>توزیع بیشترین رشد در صعودی‌ها:</b>")
-    b = bucketize(max_ups, UP_BUCKETS)
-    lines.extend(fmt_buckets(compress_buckets(b, max_lines=12), emoji="🟩"))
-    return lines
-
-
-def report_target_reach_down(downs):
-    lines = []
-    if not downs:
-        return lines
-
-    n = len(downs)
-    max_dds = [abs(r['max_dd']) for r in downs]
-    targets = [5, 10, 20, 30, 50, 70]
-
-    lines.append(f"<b>📉 از {n} مورد نزولی، "
-                 f"چند درصد ریزش این‌قدری داشتن؟</b>")
-    for t in targets:
-        cnt = sum(1 for v in max_dds if v >= t)
-        pct = cnt / n * 100.0
-        bar = "█" * int(round(pct / 5))
-        lines.append(f"├ ریزش بیش از <b>{t}٪</b>: "
-                     f"<code>{cnt:>2}</code> مورد ({pct:5.1f}٪) 🟥{bar}")
-    return lines
-
-
-# ==================== تحلیل برنده‌های کم‌ریسک ====================
-def report_low_dd_winners(ups, n_total, dd_threshold=3.0):
-    lines = []
-    if not ups:
-        return lines
-
-    low_dd = [r for r in ups
-              if r['dd_before_recovery'] is not None
-              and r['dd_before_recovery'] >= -dd_threshold]
-
-    lines.append(f"<b>💎 برنده‌هایی با ریزش اولیه کمتر از "
-                 f"{dd_threshold:.0f}٪ (کم‌ریسک‌ها):</b>")
-
-    if not low_dd:
-        lines.append("└ موردی یافت نشد.")
-        return lines
-
-    n_low = len(low_dd)
-    n_up  = len(ups)
-
-    rets   = [r['ret']    for r in low_dd]
-    maxups = [r['max_up'] for r in low_dd]
-    maxdds = [r['max_dd'] for r in low_dd]
-    dds_r  = [r['dd_before_recovery'] for r in low_dd]
-    bars_r = [r['bars_to_recovery'] for r in low_dd
-              if r['bars_to_recovery'] is not None]
-
-    def hit(t):
-        return sum(1 for v in maxups if v >= t) / n_low * 100.0
-
-    lines.append(f"├ تعداد: <code>{n_low}</code> از "
-                 f"<code>{n_up}</code> برنده "
-                 f"({n_low / n_up * 100:.1f}٪ از برنده‌ها)")
-    lines.append(f"└ سهم از کل {n_total} الگوی مشابه: "
-                 f"<code>{n_low / n_total * 100:.1f}٪</code>")
-    lines.append("")
-
-    lines.append(f"📈 <b>سود نهایی (بعد از {LOOKAHEAD} کندل ۴ساعته):</b>")
-    lines.append(f"├ میانگین: <code>{np.mean(rets):+.2f}٪</code>")
-    lines.append(f"├ میانه: <code>{np.median(rets):+.2f}٪</code>")
-    lines.append(f"├ بیشترین: <code>{np.max(rets):+.2f}٪</code>")
-    lines.append(f"└ کمترین: <code>{np.min(rets):+.2f}٪</code>")
-    lines.append("")
-
-    lines.append("🚀 <b>بیشترین رشد (سقف مسیر):</b>")
-    lines.append(f"├ میانگین: <code>{np.mean(maxups):+.2f}٪</code>")
-    lines.append(f"├ میانه: <code>{np.median(maxups):+.2f}٪</code>")
-    lines.append(f"├ بیشترین: <code>{np.max(maxups):+.2f}٪</code>")
-    lines.append(f"└ کمترین: <code>{np.min(maxups):+.2f}٪</code>")
-    lines.append("")
-
-    lines.append("📉 <b>ریزش تجربه‌شده در کل مسیر:</b>")
-    lines.append(f"├ میانگین بیشترین ریزش: <code>{np.mean(maxdds):+.2f}٪</code>")
-    lines.append(f"├ میانگین ریزش اولیه: <code>{np.mean(dds_r):+.2f}٪</code>")
-    lines.append(f"└ بدترین ریزش: <code>{np.min(maxdds):+.2f}٪</code>")
-    lines.append("")
-
-    if bars_r:
-        lines.append("⏱ <b>زمان رسیدن به سربه‌سر (کندل ۴ساعته):</b>")
-        lines.append(f"├ میانگین: <code>{np.mean(bars_r):.0f}</code> کندل")
-        lines.append(f"└ میانه: <code>{np.median(bars_r):.0f}</code> کندل")
-        lines.append("")
-
-    lines.append(f"🎯 <b>چند درصد این زیرگروه به اهداف سود رسیدن:</b>")
-    for t in [5, 10, 20, 30, 50, 75, 100, 150, 200]:
-        p = hit(t)
-        bar = "█" * int(round(p / 5))
-        lines.append(f"├ +{t}٪: <code>{p:5.1f}٪</code> 🟢{bar}")
-    return lines
-
-
-# ==================== گزارش اصلی ====================
-def report_single(details, df_target_daily, target_idx, target_forward):
-    res = details['results']
-    ups = details['ups']; downs = details['downs']
-    n_total = details['n_total']
-    n_up = details['n_up']; n_down = details['n_down']
-    win_rate = details['win_rate']
-    all_ret    = details['all_ret']
-    all_max_up = details['all_max_up']
-    all_max_dd = details['all_max_dd']
-
-    def sub(lst, key):
-        return [x[key] for x in lst] if lst else []
-
-    avg_ret_all = float(np.mean(all_ret))
-    avg_max_up  = float(np.mean(all_max_up))
-    avg_max_dd  = float(np.mean(all_max_dd))
-
-    if ups:
-        avg_ret_up    = float(np.mean(sub(ups, 'ret')))
-        avg_max_up_up = float(np.mean(sub(ups, 'max_up')))
-        avg_dd_up     = float(np.mean(sub(ups, 'max_dd')))
-        worst_dd_up   = float(np.min(sub(ups, 'max_dd')))
-    else:
-        avg_ret_up = avg_max_up_up = avg_dd_up = worst_dd_up = 0.0
-
-    if downs:
-        avg_ret_down  = float(np.mean(sub(downs, 'ret')))
-        avg_dd_down   = float(np.mean(sub(downs, 'max_dd')))
-        worst_dd_down = float(np.min(sub(downs, 'max_dd')))
-        worst_ret_down= float(np.min(sub(downs, 'ret')))
-    else:
-        avg_ret_down = avg_dd_down = worst_dd_down = worst_ret_down = 0.0
-
-    dd_buckets    = bucketize(all_max_dd, DD_BUCKETS)
-    up_buckets    = bucketize(all_max_up, UP_BUCKETS)
-    ret_buckets   = bucketize(all_ret,    RET_BUCKETS)
-
-    def pct_between(vals, lo, hi):
-        if not vals:
-            return 0.0
-        return sum(1 for v in vals if lo <= v < hi) / len(vals) * 100.0
-
-    pct_dd_lt_2  = pct_between(all_max_dd, -1e9, -2)
-    pct_dd_lt_5  = pct_between(all_max_dd, -1e9, -5)
-    pct_dd_lt_10 = pct_between(all_max_dd, -1e9, -10)
-    pct_dd_lt_20 = pct_between(all_max_dd, -1e9, -20)
-
-    sym_counts = {}
-    for r in res:
-        sym_counts[r['symbol']] = sym_counts.get(r['symbol'], 0) + 1
-
-    o_t = df_target_daily['Open'].values.astype(float)
-    h_t = df_target_daily['High'].values.astype(float)
-    l_t = df_target_daily['Low'].values.astype(float)
-    c_t = df_target_daily['Close'].values.astype(float)
-
-    pat_label = "تک‌کندلی روزانه" if PATTERN_LEN == 1 else \
-                f"{PATTERN_LEN}-کندلی روزانه"
+    c2, n2, p2 = joint(2.0)
+    c3, n3, p3 = joint(3.0)
 
     lines = []
-    lines.append(f"🕯 <b>تحلیل الگوی {pat_label} مشابه {TARGET_SYMBOL}</b>")
+    lines.append(f"🕯 <b>الگوی {TARGET_SYMBOL} | {TARGET_DATE}</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("🎯 <b>کندل مرجع: روزانه</b> | "
-                 "🔍 <b>جستجوی مشابه: ۴ ساعته</b>")
-    lines.append("")
-
-    lines.append(f"🗓 <b>کندل‌های الگو (روزانه):</b>")
-    pattern_start = target_idx - PATTERN_LEN + 1
-    for k, j in enumerate(range(pattern_start, target_idx + 1), 1):
-        op = o_t[j]; cl = c_t[j]; hi = h_t[j]; lo = l_t[j]
-        if op <= 0:
-            continue
-        body_pct  = (cl - op) / op * 100
-        range_pct = (hi - lo) / op * 100
-        color = "🟢" if cl >= op else "🔴"
-        d_str = df_target_daily.index[j].date()
-        lines.append(
-            f"├ کندل {k} ({d_str}) {color}: "
-            f"O=<code>{op:.2f}</code> H=<code>{hi:.2f}</code> "
-            f"L=<code>{lo:.2f}</code> C=<code>{cl:.2f}</code>"
-        )
-        lines.append(
-            f"│   بدنه: <code>{body_pct:+.2f}٪</code> | "
-            f"دامنه: <code>{range_pct:.2f}٪</code>"
-        )
-
-    entry_price = c_t[target_idx]
-    lines.append(f"└ 💵 قیمت مرجع (Close کندل روزانه): "
-                 f"<code>{entry_price:.2f}</code>")
-    lines.append("")
-    lines.append(f"⏭ بررسی <code>{LOOKAHEAD}</code> کندل ۴ساعته‌ی "
-                 f"بعد از هر الگوی ۴ساعته‌ی مشابه")
-    lines.append(f"   (≈ <code>{LOOKAHEAD * 4}</code> ساعت ≈ "
-                 f"<code>{LOOKAHEAD * 4 / 24:.1f}</code> روز)")
-    lines.append(f"✅ فقط الگوهای گذشته (بدون نگاه به آینده)")
-    lines.append(f"🌐 تعداد الگوی ۴ساعته‌ی مشابه: <code>{n_total}</code>")
-    lines.append("")
-
-    lines.append("<b>📈 آمار کلی:</b>")
-    lines.append(f"├ 🟢 صعودی: <code>{n_up}</code> مورد ({win_rate:.1f}٪)")
-    lines.append(f"├ 🔴 نزولی: <code>{n_down}</code> مورد ({100 - win_rate:.1f}٪)")
-    lines.append(f"├ میانگین بازدهی: <code>{avg_ret_all:+.2f}٪</code>")
-    lines.append(f"├ میانگین بیشترین رشد: <code>{avg_max_up:+.2f}٪</code>")
-    lines.append(f"└ میانگین بیشترین ریزش: <code>{avg_max_dd:+.2f}٪</code>")
-    lines.append("")
-
-    lines.append("<b>📌 خلاصه‌ی احتمال ریزش:</b>")
-    lines.append(f"├ بیش از ۲٪ ریزش: <code>{pct_dd_lt_2:.1f}٪</code>")
-    lines.append(f"├ بیش از ۵٪ ریزش: <code>{pct_dd_lt_5:.1f}٪</code>")
-    lines.append(f"├ بیش از ۱۰٪ ریزش: <code>{pct_dd_lt_10:.1f}٪</code>")
-    lines.append(f"└ بیش از ۲۰٪ ریزش: <code>{pct_dd_lt_20:.1f}٪</code>")
-    lines.append("")
-
-    lines.append("<b>📉 توزیع حداکثر ریزش:</b>")
-    lines.extend(fmt_buckets(compress_buckets(dd_buckets, max_lines=15), emoji="🟥"))
-    lines.append(f"└ 📌 بدترین ریزش: <code>{min(all_max_dd):+.2f}٪</code>")
-    lines.append("")
-
-    lines.append("<b>📈 توزیع حداکثر رشد:</b>")
-    lines.extend(fmt_buckets(compress_buckets(up_buckets, max_lines=15), emoji="🟩"))
-    lines.append(f"└ 📌 بهترین رشد: <code>{max(all_max_up):+.2f}٪</code>")
-    lines.append("")
-
-    lines.append(f"<b>🎯 توزیع بازدهی نهایی (بعد از {LOOKAHEAD} کندل ۴ساعته):</b>")
-    lines.extend(fmt_buckets(compress_buckets(ret_buckets, max_lines=15), emoji="🔵"))
-    lines.append("")
-
-    if ups:
-        lines.append("<b>🟢 گروه صعودی‌ها (نهایتاً مثبت):</b>")
-        lines.append(f"├ میانگین بازدهی: <code>{avg_ret_up:+.2f}٪</code>")
-        lines.append(f"├ میانگین بیشترین رشد: <code>{avg_max_up_up:+.2f}٪</code>")
-        lines.append(f"├ میانگین بیشترین ریزش: <code>{avg_dd_up:+.2f}٪</code>")
-        lines.append(f"└ 📌 بدترین ریزش در صعودی‌ها: "
-                     f"<code>{worst_dd_up:+.2f}٪</code>")
-        lines.append("")
-
-        lines.extend(report_up_group_path(ups))
-        lines.append("")
-
-        lines.extend(report_low_dd_winners(ups, n_total,
-                                           dd_threshold=LOW_DD_THRESHOLD))
-        lines.append("")
-
-        lines.extend(report_target_reach(ups))
-        lines.append("")
-
-    if downs:
-        lines.append("<b>🔴 گروه نزولی‌ها (نهایتاً منفی):</b>")
-        lines.append(f"├ میانگین بازدهی: <code>{avg_ret_down:+.2f}٪</code>")
-        lines.append(f"├ میانگین بیشترین ریزش: <code>{avg_dd_down:+.2f}٪</code>")
-        lines.append(f"├ 📉 بدترین ریزش: <code>{worst_dd_down:+.2f}٪</code>")
-        lines.append(f"└ بدترین بازدهی: <code>{worst_ret_down:+.2f}٪</code>")
-        lines.append("")
-
-        lines.extend(report_target_reach_down(downs))
-        lines.append("")
-
-    lines.append("<b>🌐 توزیع ارزها (الگوهای ۴ساعته مشابه):</b>")
-    for s, cnt in sorted(sym_counts.items(), key=lambda x: -x[1]):
-        lines.append(f"• <code>{s}</code>: {cnt} مورد")
-    lines.append("")
-
-    lines.append(f"<b>🔝 ۱۰ الگوی ۴ساعته‌ی نزدیک‌تر:</b>")
-    for r in res[:10]:
-        d = r['date'].strftime('%Y-%m-%d %H:%M') \
-            if hasattr(r['date'], 'strftime') else str(r['date'])
-        lines.append(f"• <code>{r['symbol']}</code> | {d}")
-        lines.append(f"   بازدهی: <code>{r['ret']:+.1f}٪</code> | "
-                     f"رشد: <code>{r['max_up']:+.1f}٪</code> | "
-                     f"ریزش: <code>{r['max_dd']:+.1f}٪</code>")
-    lines.append("")
-    lines.append("⚠️ صرفاً تحلیلی است؛ توصیه‌ی معاملاتی نیست. "
-                 "داده‌ی ۱ساعته Yahoo فقط ~۲ سال اخیر را پوشش می‌دهد.")
-
+    lines.append("📊 <b>نتیجه:</b>")
+    lines.append(f"├ ریزش زیر ۲٪ + رشد ۲۰٪: "
+                 f"<code>{p2:.1f}٪</code>  ({c2} از {n_total})")
+    lines.append(f"└ ریزش زیر ۳٪ + رشد ۲۰٪: "
+                 f"<code>{p3:.1f}٪</code>  ({c3} از {n_total})")
     return "\n".join(lines)
 
 
@@ -906,7 +554,6 @@ def main():
     n_up = len(ups); n_down = n_total - n_up
     win_rate = n_up / n_total * 100.0
 
-    # target_forward روی ۴ساعته محاسبه نمی‌شه چون کندل مرجع روزانه است
     target_forward = None
 
     details = {
@@ -923,12 +570,14 @@ def main():
         'target_actual': None,
     }
 
-    report = report_single(details, df_target_daily, target_idx, target_forward)
+    # ---------- ۵) گزارش خیلی خلاصه ----------
+    report = report_minimal(ups, n_total)
     plain = (report.replace("<b>", "").replace("</b>", "")
                    .replace("<code>", "").replace("</code>", ""))
     log("\n" + plain)
     send_message(report)
 
+    # ---------- ۶) نمودار ----------
     try:
         target_date_str = df_target_daily.index[target_idx].strftime('%Y-%m-%d')
         buf = build_chart(details, target_forward, target_date_str)
