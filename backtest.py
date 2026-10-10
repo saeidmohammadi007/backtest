@@ -52,8 +52,8 @@ K_PER_SYMBOL           = 20
 TOTAL_TOP              = 100
 EXCLUDE_TEMPORAL_HOURS = 168   # 7 روز
 
-TARGETS       = [20.0, 50.0]
-DD_THRESHOLDS = [2.0, 3.0]
+TARGETS       = [2.0, 20.0, 50.0]        # ← 2.0 اضافه شد
+DD_THRESHOLDS = [1.0, 2.0, 3.0]          # ← 1.0 اضافه شد
 
 # حداکثر انحراف مجاز کندل مرجع 4h (ساعت)
 MAX_DATE_DRIFT_HOURS = 4
@@ -378,6 +378,32 @@ def build_report(results, target_info, baseline):
             lines.append(f"│ <b>{r['symbol']}</b> @ {r['date']}")
     else:
         lines.append("│ (هیچ)")
+
+    # 🎯 هایلایت اختصاصی: رشد ۲٪ با ریزش حداکثر ۱٪
+    hit_2_dd1  = [r for r in results if r.get("hit_2.0_dd1.0", False)]
+    pct_2_dd1  = len(hit_2_dd1) / n * 100.0
+    base_2_dd1 = baseline.get((2.0, 1.0), 0.0)
+    edge_2_dd1 = pct_2_dd1 - base_2_dd1
+    exp_val    = pct_2_dd1 * 2.0 - (100.0 - pct_2_dd1) * 1.0
+
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🎯 <b>رشد +۲٪ با ریزش زیر ۱٪</b>")
+    lines.append(
+        f"├ احتمال: <code>{pct_2_dd1:.1f}٪</code> "
+        f"(پایه <code>{base_2_dd1:.1f}٪</code> | "
+        f"edge <code>{edge_2_dd1:+.1f}٪</code>)"
+    )
+    lines.append(f"├ تعداد موارد: <code>{len(hit_2_dd1)}</code> از <code>{n}</code>")
+    lines.append(f"├ نسبت ریسک/ریوارد: <code>1:2</code>")
+    lines.append(f"└ امید ریاضی: <code>{exp_val:+.1f}٪</code>")
+    if hit_2_dd1:
+        lines.append("")
+        lines.append("   <b>موارد موفق:</b>")
+        for r in hit_2_dd1[:15]:
+            lines.append(f"   │ <b>{r['symbol']}</b> @ {r['date']}")
+        if len(hit_2_dd1) > 15:
+            lines.append(f"   │ ... و {len(hit_2_dd1) - 15} مورد دیگر")
 
     return "\n".join(lines).rstrip()
 
