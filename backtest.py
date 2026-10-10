@@ -19,17 +19,18 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TARGET_SYMBOL = "ETH-USD"
 
 # اگر این تاریخ در وسط هفته باشد، نزدیک‌ترین دوشنبه‌ی هفته‌ی مربوطه انتخاب می‌شود.
-# مثال: 2025-04-24 (پنجشنبه) → کندل هفتگی 2025-04-21 (دوشنبه)
-TARGET_DATE = "2025-04-21"
+# 2017-09-11 یک دوشنبه است → کندل هفتگی هفته‌ی 11 سپتامبر 2017
+TARGET_DATE = "2017-09-11"
 
 SEARCH_PERIOD = "max"
 STRICT_BEFORE_TARGET = False
 PATTERN_LEN = 1
 
+# فقط ارزهایی که قبل از 2017-09-11 داده‌ی هفتگی داشتند
 SYMBOLS = [
-    "LUMIA-USD", "API3-USD", "FIL-USD",
-    "DOGE-USD", "ONDO-USD", "SHIB-USD",
-    "BLESS-USD", "ROSE-USD", "LINEA-USD", "JTO-USD",
+    "BTC-USD", "ETH-USD", "LTC-USD", "XRP-USD",
+    "XMR-USD", "ZEC-USD", "DASH-USD", "ETC-USD",
+    "XLM-USD", "REP-USD",
 ]
 
 LOOKAHEAD        = 26            # تعداد کندل هفتگی بعدی (~۶ ماه)
