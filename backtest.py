@@ -16,38 +16,37 @@ def log(m):
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-TARGET_SYMBOL = "ETH-USD"
-
-# اگر این تاریخ در وسط هفته باشد، نزدیک‌ترین دوشنبه‌ی هفته‌ی مربوطه انتخاب می‌شود.
-# 2017-09-11 یک دوشنبه است → کندل هفتگی هفته‌ی 11 سپتامبر 2017
-TARGET_DATE = "2017-09-11"
+TARGET_SYMBOL = "BTC-USD"
+TARGET_DATE   = "2017-09-11"
 
 SEARCH_PERIOD = "max"
 STRICT_BEFORE_TARGET = False
 PATTERN_LEN = 1
 
-# فقط ارزهایی که قبل از 2017-09-11 داده‌ی هفتگی داشتند
+# برای BTC از همین لیست استفاده می‌کنیم (همه قبل از 2017-09-11 داده دارند)
 SYMBOLS = [
     "BTC-USD", "ETH-USD", "LTC-USD", "XRP-USD",
     "XMR-USD", "ZEC-USD", "DASH-USD", "ETC-USD",
     "XLM-USD", "REP-USD",
 ]
 
-LOOKAHEAD        = 26            # تعداد کندل هفتگی بعدی (~۶ ماه)
+LOOKAHEAD        = 26
 K_PER_SYMBOL     = 20
 TOTAL_TOP        = 100
-EXCLUDE_TEMPORAL = 4             # هفته‌ی هم‌نماد مجاور
+EXCLUDE_TEMPORAL = 4
 
 TARGETS       = [20.0, 50.0]
 DD_THRESHOLDS = [2.0, 3.0]
 
-# شروع هفته (برای هم‌راستایی با TradingView کریپتو)
 WEEK_START = "MON"
+
+# حداکثر انحراف مجاز تاریخ کندل مرجع از TARGET_DATE (روز)
+MAX_DATE_DRIFT_DAYS = 7
 
 
 # ==================== توابع ====================
 def fetch_weekly(symbol):
-    """دریافت روزانه و رزمپل به هفتگی با برچسب دوشنبه (TradingView-aligned)."""
+    """دریافت روزانه از yfinance و رزمپل به هفتگی با برچسب دوشنبه."""
     log(f"📥 دریافت هفتگی {symbol}")
     try:
         df = yf.download(symbol, interval="1d", period=SEARCH_PERIOD,
@@ -56,22 +55,22 @@ def fetch_weekly(symbol):
             return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        df = df[['Open', 'High', 'Low', 'Close']].dropna()
+        df = df[["Open", "High", "Low", "Close"]].dropna()
         if df.empty:
             return None
 
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
         if df.index.tz is not None:
-            df.index = df.index.tz_convert('UTC').tz_localize(None)
+            df.index = df.index.tz_convert("UTC").tz_localize(None)
         df.index = df.index.normalize()
 
-        rule = 'W-MON' if WEEK_START == "MON" else 'W-SUN'
-        df_wk = df.resample(rule, label='left', closed='left').agg({
-            'Open':  'first',
-            'High':  'max',
-            'Low':   'min',
-            'Close': 'last',
+        rule = "W-MON" if WEEK_START == "MON" else "W-SUN"
+        df_wk = df.resample(rule, label="left", closed="left").agg({
+            "Open":  "first",
+            "High":  "max",
+            "Low":   "min",
+            "Close": "last",
         }).dropna()
 
         return df_wk if not df_wk.empty else None
@@ -121,20 +120,20 @@ def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
     final_price = float(fut_c[-1])
     total_ret = (final_price - entry_price) / entry_price * 100.0
 
-    out = {'ret': total_ret}
+    out = {"ret": total_ret}
     for T in TARGETS:
         target_price = entry_price * (1 + T / 100.0)
         hits = np.where(fut_h >= target_price)[0]
         if len(hits) == 0:
-            out[f'hit_{T}'] = False
+            out[f"hit_{T}"] = False
             for D in DD_THRESHOLDS:
-                out[f'hit_{T}_dd{D}'] = False
+                out[f"hit_{T}_dd{D}"] = False
         else:
-            out[f'hit_{T}'] = True
+            out[f"hit_{T}"] = True
             k = int(hits[0])
             dd = (float(np.min(fut_l[:k + 1])) - entry_price) / entry_price * 100.0
             for D in DD_THRESHOLDS:
-                out[f'hit_{T}_dd{D}'] = dd >= -D
+                out[f"hit_{T}_dd{D}"] = dd >= -D
     return out
 
 
@@ -146,10 +145,10 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
         df = dfs.get(sym)
         if df is None:
             continue
-        o = df['Open'].values.astype(float)
-        h = df['High'].values.astype(float)
-        l = df['Low'].values.astype(float)
-        c = df['Close'].values.astype(float)
+        o = df["Open"].values.astype(float)
+        h = df["High"].values.astype(float)
+        l = df["Low"].values.astype(float)
+        c = df["Close"].values.astype(float)
         n = len(df)
 
         max_i = n - LOOKAHEAD - 1
@@ -197,25 +196,24 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
         for oi in order:
             cand_idx = int(idxs[oi])
             candidates_all.append({
-                'symbol':   sym,
-                'idx':      cand_idx,
-                'dist':     float(dists[oi]),
-                'date':     df.index[cand_idx],
+                "symbol": sym,
+                "idx":    cand_idx,
+                "dist":   float(dists[oi]),
+                "date":   df.index[cand_idx],
             })
 
     if skipped_by_date:
         log(f"⏭️  رد شده: {skipped_by_date}")
 
-    candidates_all.sort(key=lambda x: x['dist'])
+    candidates_all.sort(key=lambda x: x["dist"])
 
     unique_candidates = []
     for c_ in candidates_all:
         too_close = False
         for u in unique_candidates:
-            if u['symbol'] != c_['symbol']:
+            if u["symbol"] != c_["symbol"]:
                 continue
-            # فاصله‌ی کمتر از EXCLUDE_TEMPORAL هفته = حذف
-            if abs((u['date'] - c_['date']).days) < EXCLUDE_TEMPORAL * 7:
+            if abs((u["date"] - c_["date"]).days) < EXCLUDE_TEMPORAL * 7:
                 too_close = True
                 break
         if too_close:
@@ -264,7 +262,7 @@ def build_report(results, target_info, baseline):
     if n == 0:
         return "بدون داده"
 
-    wins = sum(1 for r in results if r['ret'] > 0)
+    wins = sum(1 for r in results if r["ret"] > 0)
     win_pct = wins / n * 100.0
 
     lines = []
@@ -291,7 +289,7 @@ def build_report(results, target_info, baseline):
     for D in DD_THRESHOLDS:
         lines.append(f"📉 <b>ریزش زیر {D:.0f}٪</b>")
         for T in TARGETS:
-            cnt = sum(1 for r in results if r[f'hit_{T}_dd{D}'])
+            cnt = sum(1 for r in results if r[f"hit_{T}_dd{D}"])
             pct = cnt / n * 100.0
             base = baseline[(T, D)]
             lines.append(
@@ -302,7 +300,7 @@ def build_report(results, target_info, baseline):
 
     lines.append("📋 <b>۱۰ کندل هفتگی مشابه برتر (برای تأیید در TradingView):</b>")
     for r in results[:10]:
-        f0 = r['feat'][0]
+        f0 = r["feat"][0]
         lines.append(
             f"├ <b>{r['symbol']}</b> @ <code>{r['date']}</code> | "
             f"d=<code>{r['dist']:.4f}</code> | "
@@ -318,24 +316,35 @@ def main():
     log(f"🚀 مشابه‌یابی: هدف=هفتگی {TARGET_SYMBOL} | جستجو=هفتگی")
     log("=" * 60)
 
-    # ۱) کندل مرجع هفتگی (از همان ETH)
+    # ۱) کندل مرجع هفتگی (از همان BTC)
     df_target = fetch_weekly(TARGET_SYMBOL)
     if df_target is None or len(df_target) < PATTERN_LEN:
         raise RuntimeError(f"داده‌ی هفتگی {TARGET_SYMBOL} موجود نیست.")
 
-    # نزدیک‌ترین کندل هفتگی به تاریخ داده‌شده
+    log(f"   محدوده‌ی داده: {df_target.index[0].date()} → "
+        f"{df_target.index[-1].date()}")
+
     deltas = np.abs((df_target.index - pd.Timestamp(TARGET_DATE)).total_seconds())
     target_idx = int(np.argmin(deltas))
-    if target_idx < PATTERN_LEN - 1:
-        raise RuntimeError(f"کندل مرجع ({TARGET_DATE}) معتبر نیست.")
-
     actual_date = df_target.index[target_idx]
-    log(f"🎯 کندل مرجع هفتگی: {actual_date.date()} ({actual_date.day_name()})")
+    drift_days = abs((actual_date - pd.Timestamp(TARGET_DATE)).days)
 
-    o_t = df_target['Open'].values.astype(float)
-    h_t = df_target['High'].values.astype(float)
-    l_t = df_target['Low'].values.astype(float)
-    c_t = df_target['Close'].values.astype(float)
+    if drift_days > MAX_DATE_DRIFT_DAYS:
+        raise RuntimeError(
+            f"⛔ کندل مرجع یافت‌شده ({actual_date.date()}) "
+            f"{drift_days} روز از تاریخ هدف ({TARGET_DATE}) فاصله دارد.\n"
+            f"   یعنی yfinance داده‌ی هفتگی {TARGET_SYMBOL} را فقط از "
+            f"{df_target.index[0].date()} به بعد دارد.\n"
+            f"   TARGET_DATE را داخل این محدوده تنظیم کنید."
+        )
+
+    log(f"🎯 کندل مرجع هفتگی: {actual_date.date()} ({actual_date.day_name()}) | "
+        f"انحراف از هدف: {drift_days} روز")
+
+    o_t = df_target["Open"].values.astype(float)
+    h_t = df_target["High"].values.astype(float)
+    l_t = df_target["Low"].values.astype(float)
+    c_t = df_target["Close"].values.astype(float)
 
     target_feat = pattern_features(target_idx, o_t, h_t, l_t, c_t)
     if target_feat is None:
@@ -373,10 +382,10 @@ def main():
     log("\n📊 محاسبه‌ی نرخ پایه (هفتگی)...")
     all_outcomes = []
     for sym, df in dfs.items():
-        o = df['Open'].values.astype(float)
-        h = df['High'].values.astype(float)
-        l = df['Low'].values.astype(float)
-        c = df['Close'].values.astype(float)
+        o = df["Open"].values.astype(float)
+        h = df["High"].values.astype(float)
+        l = df["Low"].values.astype(float)
+        c = df["Close"].values.astype(float)
         n = len(df)
         for i in range(n):
             out = analyze_forward(i, o, h, l, c, n, LOOKAHEAD)
@@ -385,11 +394,11 @@ def main():
 
     n_base = len(all_outcomes)
     baseline = {
-        'win': sum(1 for o in all_outcomes if o['ret'] > 0) / n_base * 100.0
+        "win": sum(1 for o in all_outcomes if o["ret"] > 0) / n_base * 100.0
     }
     for T in TARGETS:
         for D in DD_THRESHOLDS:
-            cnt = sum(1 for o in all_outcomes if o[f'hit_{T}_dd{D}'])
+            cnt = sum(1 for o in all_outcomes if o[f"hit_{T}_dd{D}"])
             baseline[(T, D)] = cnt / n_base * 100.0
 
     log(f"   نمونه‌های پایه: {n_base}")
@@ -407,37 +416,37 @@ def main():
     # ۵) تحلیل فوروارد
     results = []
     for c_ in candidates:
-        sym = c_['symbol']
+        sym = c_["symbol"]
         df = dfs[sym]
-        o = df['Open'].values.astype(float)
-        h = df['High'].values.astype(float)
-        l = df['Low'].values.astype(float)
-        cc = df['Close'].values.astype(float)
+        o = df["Open"].values.astype(float)
+        h = df["High"].values.astype(float)
+        l = df["Low"].values.astype(float)
+        cc = df["Close"].values.astype(float)
         n = len(df)
-        r = analyze_forward(c_['idx'], o, h, l, cc, n, LOOKAHEAD)
+        r = analyze_forward(c_["idx"], o, h, l, cc, n, LOOKAHEAD)
         if r is None:
             continue
-        r['symbol'] = sym
-        r['date']   = c_['date'].strftime('%Y-%m-%d (%a)')
-        r['dist']   = c_['dist']
-        r['feat']   = pattern_features(c_['idx'], o, h, l, cc)
+        r["symbol"] = sym
+        r["date"]   = c_["date"].strftime("%Y-%m-%d (%a)")
+        r["dist"]   = c_["dist"]
+        r["feat"]   = pattern_features(c_["idx"], o, h, l, cc)
         results.append(r)
 
     if not results:
         raise RuntimeError("نتیجه‌ای محاسبه نشد.")
 
-    results.sort(key=lambda x: x['dist'])
+    results.sort(key=lambda x: x["dist"])
 
     target_info = {
-        'date': actual_date.strftime('%Y-%m-%d (%a)'),
-        'o':    o_t[target_idx],
-        'h':    h_t[target_idx],
-        'l':    l_t[target_idx],
-        'c':    c_t[target_idx],
-        'body': target_feat[0],
-        'up':   target_feat[1],
-        'dn':   target_feat[2],
-        'rng':  target_feat[3],
+        "date": actual_date.strftime("%Y-%m-%d (%a)"),
+        "o":    o_t[target_idx],
+        "h":    h_t[target_idx],
+        "l":    l_t[target_idx],
+        "c":    c_t[target_idx],
+        "body": target_feat[0],
+        "up":   target_feat[1],
+        "dn":   target_feat[2],
+        "rng":  target_feat[3],
     }
 
     # ۶) گزارش
