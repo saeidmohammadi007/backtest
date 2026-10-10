@@ -16,10 +16,11 @@ def log(m):
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-TARGET_SYMBOL = "DOGE-USD"
+# 🕯 نماد مرجع (4h)
+TARGET_SYMBOL = "API3-USD"
 
-# 🕯 تاریخ کندل مرجع روی تایم‌فریم روزانه (فرمت YYYY-MM-DD)
-TARGET_DATE   = "2025-01-15"
+# 🕯 کندل مرجع روی تایم‌فریم 4h (فرمت YYYY-MM-DD HH:MM — UTC)
+TARGET_DATE   = "2025-02-03 04:00"
 
 # ─── داده‌ی کاندیدها (4h) ───
 SEARCH_PERIOD = "730d"      # حداکثر بازه‌ی مجاز برای دیتای 1h
@@ -28,6 +29,7 @@ RESAMPLE_RULE = "4h"        # تبدیل به 4h
 PATTERN_LEN   = 1
 
 SYMBOLS = [
+    "API3-USD",
     "BTC-USD", "ETH-USD", "LTC-USD", "XRP-USD",
     "XMR-USD", "ZEC-USD", "DASH-USD", "ETC-USD",
     "XLM-USD", "REP-USD",
@@ -38,7 +40,7 @@ MIN_CANDIDATE_DATE = "2024-10-01"
 MAX_CANDIDATE_DATE = "2026-12-31"
 
 ALLOW_CANDIDATES_AFTER_TARGET = True
-EXCLUDE_EXACT_TARGET_CANDLE   = True   # تمام کندل‌های 4h هم‌روز با کندل روزانه‌ی مرجع (در همان نماد) حذف می‌شوند
+EXCLUDE_EXACT_TARGET_CANDLE   = True   # کندل 4h دقیقاً برابر کندل مرجع در همان نماد حذف می‌شود
 EXCLUDE_SAME_MONTH_AS_TARGET  = False
 
 # ─── حالت ورود ───
@@ -53,41 +55,15 @@ EXCLUDE_TEMPORAL_HOURS = 168   # 7 روز
 TARGETS       = [20.0, 50.0]
 DD_THRESHOLDS = [2.0, 3.0]
 
-# حداکثر انحراف مجاز کندل روزانه‌ی مرجع (روز)
-MAX_DATE_DRIFT_DAYS = 1
+# حداکثر انحراف مجاز کندل مرجع 4h (ساعت)
+MAX_DATE_DRIFT_HOURS = 4
 
 ONE_CANDIDATE_PER_WEEK = True
 
 
 # ==================== دریافت داده ====================
-def fetch_daily(symbol):
-    """دریافت روزانه‌ی خام — فقط برای استخراج کندل مرجع."""
-    log(f"📥 دریافت روزانه {symbol}")
-    try:
-        df = yf.download(symbol, interval="1d", period="max",
-                         progress=False, auto_adjust=True, timeout=60)
-        if df is None or df.empty:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df[["Open", "High", "Low", "Close"]].dropna()
-        if df.empty:
-            return None
-
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index)
-        if df.index.tz is not None:
-            df.index = df.index.tz_convert("UTC").tz_localize(None)
-        df.index = df.index.normalize()
-        return df if not df.empty else None
-    except Exception as e:
-        log(f"❌ fetch_daily {symbol}: {e}")
-        traceback.print_exc()
-        return None
-
-
 def fetch_4h(symbol):
-    """دریافت 1h از yfinance و رزمپل به 4h — برای کاندیدها."""
+    """دریافت 1h از yfinance و رزمپل به 4h."""
     log(f"📥 دریافت 4h {symbol}")
     try:
         df = yf.download(symbol, interval=INTERVAL_SRC, period=SEARCH_PERIOD,
@@ -191,9 +167,9 @@ def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
 
 
 # ==================== جستجوی مشابه‌ها (4h) ====================
-def find_similar(target_feat, target_day, dfs):
+def find_similar(target_feat, target_dt_actual, dfs):
     """
-    target_day: تاریخ روزانه‌ی کندل مرجع (Timestamp نرمال‌شده).
+    target_dt_actual: تایم‌استمپ دقیق کندل 4h مرجع.
     کاندیدها کندل‌های 4h در بازه‌ی [MIN_CANDIDATE_DATE, MAX_CANDIDATE_DATE) هستند.
     """
     candidates_all = []
@@ -216,17 +192,17 @@ def find_similar(target_feat, target_day, dfs):
         mask = mask & (df.index < cap_global)
 
         if not ALLOW_CANDIDATES_AFTER_TARGET:
-            mask = mask & (df.index < target_day)
+            mask = mask & (df.index < target_dt_actual)
 
-        # 🕯 حذف روزِ کندل مرجع در همان نماد هدف
+        # 🕯 حذف دقیقاً همان کندل 4h مرجع در همان نماد هدف
         if EXCLUDE_EXACT_TARGET_CANDLE and sym == TARGET_SYMBOL:
-            same_day = (df.index.normalize() == target_day)
-            mask = mask & (~same_day)
+            same_candle = (df.index == target_dt_actual)
+            mask = mask & (~same_candle)
 
         if EXCLUDE_SAME_MONTH_AS_TARGET:
             same_month = (
-                (df.index.year  == target_day.year) &
-                (df.index.month == target_day.month)
+                (df.index.year  == target_dt_actual.year) &
+                (df.index.month == target_dt_actual.month)
             )
             mask = mask & (~same_month)
 
@@ -340,9 +316,9 @@ def build_report(results, target_info, baseline):
     win_pct = wins / n * 100.0
 
     lines = []
-    lines.append(f"🕯 <b>مرجع روزانه {TARGET_SYMBOL} → کاندید ۴ساعته</b>")
+    lines.append(f"🕯 <b>مرجع 4h {TARGET_SYMBOL} → کاندید 4h</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📅 کندل مرجع (روزانه): <code>{target_info['date']}</code>")
+    lines.append(f"📅 کندل مرجع (4h): <code>{target_info['date']}</code>")
     lines.append(f"   O=<code>{target_info['o']:.4f}</code> "
                  f"H=<code>{target_info['h']:.4f}</code> "
                  f"L=<code>{target_info['l']:.4f}</code> "
@@ -351,7 +327,7 @@ def build_report(results, target_info, baseline):
                  f"سایه‌بالا <code>{target_info['up']*100:.2f}٪</code> | "
                  f"سایه‌پایین <code>{target_info['dn']*100:.2f}٪</code> | "
                  f"دامنه <code>{target_info['rng']*100:.2f}٪</code>")
-    lines.append(f"🔎 الگوهای مشابه (۴ساعته): <code>{n}</code> | "
+    lines.append(f"🔎 الگوهای مشابه (4h): <code>{n}</code> | "
                  f"Lookahead: <code>{LOOKAHEAD}×4h</code> | "
                  f"ورود: <code>{ENTRY_MODE}</code>")
     lines.append(f"🗓 بازه‌ی کاندیدها: "
@@ -375,7 +351,7 @@ def build_report(results, target_info, baseline):
             )
         lines.append("")
 
-    lines.append("📋 <b>۱۰ کندل ۴ساعته‌ی مشابه برتر:</b>")
+    lines.append("📋 <b>۱۰ کندل 4h مشابه برتر:</b>")
     for r in results[:10]:
         f0 = r["feat"][0]
         lines.append(
@@ -409,16 +385,16 @@ def build_report(results, target_info, baseline):
 # ==================== اجرای اصلی ====================
 def main():
     log("=" * 60)
-    log(f"🚀 مرجع=روزانه {TARGET_SYMBOL} | کاندید=4h | ورود={ENTRY_MODE}")
+    log(f"🚀 مرجع=4h {TARGET_SYMBOL}@{TARGET_DATE} | کاندید=4h | ورود={ENTRY_MODE}")
     log(f"   بازه‌ی دریافت 4h: {SEARCH_PERIOD} | اینتروال خام: {INTERVAL_SRC}")
     log(f"   کف تاریخی کاندیدها: {MIN_CANDIDATE_DATE}")
     log(f"   سقف تاریخی کاندیدها: {MAX_CANDIDATE_DATE}")
     log(f"   کاندیدهای بعد از هدف: {ALLOW_CANDIDATES_AFTER_TARGET}")
     log("=" * 60)
 
-    target_day = pd.Timestamp(TARGET_DATE).normalize()
+    target_dt = pd.Timestamp(TARGET_DATE)
 
-    if target_day >= pd.Timestamp(MAX_CANDIDATE_DATE):
+    if target_dt >= pd.Timestamp(MAX_CANDIDATE_DATE):
         raise RuntimeError(
             f"⛔ TARGET_DATE ({TARGET_DATE}) باید قبل از "
             f"MAX_CANDIDATE_DATE ({MAX_CANDIDATE_DATE}) باشد."
@@ -428,45 +404,7 @@ def main():
             "⛔ MIN_CANDIDATE_DATE باید قبل از MAX_CANDIDATE_DATE باشد."
         )
 
-    # ۱) کندل مرجع از داده‌ی روزانه
-    df_daily = fetch_daily(TARGET_SYMBOL)
-    if df_daily is None or len(df_daily) < 1:
-        raise RuntimeError(f"داده‌ی روزانه‌ی {TARGET_SYMBOL} موجود نیست.")
-
-    log(f"   محدوده‌ی داده‌ی روزانه: {df_daily.index[0].date()} → "
-        f"{df_daily.index[-1].date()}")
-
-    deltas = np.abs((df_daily.index - target_day).total_seconds())
-    target_idx_d = int(np.argmin(deltas))
-    actual_day = df_daily.index[target_idx_d]
-    drift_days = abs((actual_day - target_day).days)
-
-    if drift_days > MAX_DATE_DRIFT_DAYS:
-        raise RuntimeError(
-            f"⛔ کندل روزانه‌ی مرجع ({actual_day.date()}) "
-            f"{drift_days} روز از TARGET_DATE فاصله دارد."
-        )
-
-    log(f"🎯 کندل مرجع روزانه: {actual_day.date()} "
-        f"({actual_day.day_name()}) | انحراف: {drift_days} روز")
-
-    o_d = df_daily["Open"].values.astype(float)
-    h_d = df_daily["High"].values.astype(float)
-    l_d = df_daily["Low"].values.astype(float)
-    c_d = df_daily["Close"].values.astype(float)
-
-    target_feat = pattern_features(target_idx_d, o_d, h_d, l_d, c_d)
-    if target_feat is None:
-        raise RuntimeError("ویژگی کندل روزانه‌ی مرجع محاسبه نشد.")
-
-    log(f"   O={o_d[target_idx_d]:.4f} H={h_d[target_idx_d]:.4f} "
-        f"L={l_d[target_idx_d]:.4f} C={c_d[target_idx_d]:.4f}")
-    log(f"   بدنه={target_feat[0]*100:+.2f}٪ | "
-        f"سایه‌بالا={target_feat[1]*100:.2f}٪ | "
-        f"سایه‌پایین={target_feat[2]*100:.2f}٪ | "
-        f"دامنه={target_feat[3]*100:.2f}٪")
-
-    # ۲) داده‌ی 4h نمادها
+    # ۱) دریافت داده‌ی 4h همه‌ی نمادها (شامل نماد مرجع)
     dfs = {}
     for sym in SYMBOLS:
         df = fetch_4h(sym)
@@ -480,6 +418,44 @@ def main():
         log(f"⚠️ بدون داده: {missing}")
     if not dfs:
         raise RuntimeError("هیچ نمادی داده‌ی 4h ندارد.")
+
+    if TARGET_SYMBOL not in dfs:
+        raise RuntimeError(f"⛔ داده‌ی 4h برای {TARGET_SYMBOL} موجود نیست.")
+
+    # ۲) یافتن کندل مرجع 4h در داده‌ی همان نماد
+    df_target = dfs[TARGET_SYMBOL]
+    log(f"   محدوده‌ی داده‌ی 4h {TARGET_SYMBOL}: "
+        f"{df_target.index[0]} → {df_target.index[-1]}")
+
+    deltas = np.abs((df_target.index - target_dt).total_seconds())
+    target_idx_4h = int(np.argmin(deltas))
+    actual_dt = df_target.index[target_idx_4h]
+    drift_hours = abs((actual_dt - target_dt).total_seconds()) / 3600.0
+
+    if drift_hours > MAX_DATE_DRIFT_HOURS:
+        raise RuntimeError(
+            f"⛔ نزدیک‌ترین کندل 4h ({actual_dt}) "
+            f"{drift_hours:.1f} ساعت از TARGET_DATE ({target_dt}) فاصله دارد."
+        )
+
+    log(f"🎯 کندل مرجع 4h: {actual_dt} "
+        f"({actual_dt.day_name()}) | انحراف: {drift_hours:.1f} ساعت")
+
+    o_t = df_target["Open"].values.astype(float)
+    h_t = df_target["High"].values.astype(float)
+    l_t = df_target["Low"].values.astype(float)
+    c_t = df_target["Close"].values.astype(float)
+
+    target_feat = pattern_features(target_idx_4h, o_t, h_t, l_t, c_t)
+    if target_feat is None:
+        raise RuntimeError("ویژگی کندل 4h مرجع محاسبه نشد.")
+
+    log(f"   O={o_t[target_idx_4h]:.4f} H={h_t[target_idx_4h]:.4f} "
+        f"L={l_t[target_idx_4h]:.4f} C={c_t[target_idx_4h]:.4f}")
+    log(f"   بدنه={target_feat[0]*100:+.2f}٪ | "
+        f"سایه‌بالا={target_feat[1]*100:.2f}٪ | "
+        f"سایه‌پایین={target_feat[2]*100:.2f}٪ | "
+        f"دامنه={target_feat[3]*100:.2f}٪")
 
     # ۳) نرخ پایه (4h)
     log("\n📊 محاسبه‌ی نرخ پایه (4h)...")
@@ -513,8 +489,8 @@ def main():
             log(f"   +{T:.0f}٪ / DD≤{D:.0f}٪: {baseline[(T, D)]:.2f}٪")
 
     # ۴) جستجوی الگوهای 4h مشابه
-    log("\n🔍 جستجوی الگوهای 4h مشابه با کندل روزانه‌ی مرجع...")
-    candidates = find_similar(target_feat, actual_day, dfs)
+    log("\n🔍 جستجوی الگوهای 4h مشابه با کندل 4h مرجع...")
+    candidates = find_similar(target_feat, actual_dt, dfs)
     if not candidates:
         raise RuntimeError("هیچ الگوی مشابهی یافت نشد.")
 
@@ -543,11 +519,11 @@ def main():
     results.sort(key=lambda x: x["dist"])
 
     target_info = {
-        "date": actual_day.strftime("%Y-%m-%d (%a)"),
-        "o":    o_d[target_idx_d],
-        "h":    h_d[target_idx_d],
-        "l":    l_d[target_idx_d],
-        "c":    c_d[target_idx_d],
+        "date": actual_dt.strftime("%Y-%m-%d %H:%M (%a)"),
+        "o":    o_t[target_idx_4h],
+        "h":    h_t[target_idx_4h],
+        "l":    l_t[target_idx_4h],
+        "c":    c_t[target_idx_4h],
         "body": target_feat[0],
         "up":   target_feat[1],
         "dn":   target_feat[2],
