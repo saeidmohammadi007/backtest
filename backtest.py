@@ -22,6 +22,11 @@ TARGET_DATE   = "2023-10-20"    # تاریخ کندل مرجع (روزانه)
 TARGET_INTERVAL = "1d"          # کندل مرجع
 SEARCH_PERIOD_HOURLY = "730d"   # بازه‌ی داده‌ی ۱ ساعته (حداکثر Yahoo)
 
+# اگر True باشد فقط کندل‌های قبل از تاریخ مرجع بررسی می‌شوند.
+# اگر False باشد، وقتی داده‌ی قبل از تاریخ مرجع کافی نبود،
+# از همه‌ی داده‌های موجود استفاده می‌شود.
+STRICT_BEFORE_TARGET = False
+
 PATTERN_LEN = 1                 # تعداد کندل الگو (روی کندل مرجع)
 
 SYMBOLS = [
@@ -118,7 +123,6 @@ def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
 
     out = {'ret': total_ret}
 
-    # برای هر هدف: آیا رسید؟ و اگر رسید، ریزش قبل از رسیدن چقدر بود؟
     for T in TARGETS:
         target_price = entry_price * (1 + T / 100.0)
         hits = np.where(fut_h >= target_price)[0]
@@ -137,6 +141,8 @@ def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
 
 def find_similar_candles(target_feat, target_date_naive, dfs):
     candidates_all = []
+    skipped_by_date = []
+
     for sym in SYMBOLS:
         df = dfs.get(sym)
         if df is None:
@@ -154,11 +160,28 @@ def find_similar_candles(target_feat, target_date_naive, dfs):
         idx_naive = df.index
         if getattr(idx_naive, 'tz', None) is not None:
             idx_naive = idx_naive.tz_localize(None)
+
         mask_before = idx_naive < target_date_naive
-        if not mask_before.any():
-            continue
-        last_before = int(np.where(mask_before)[0][-1])
-        max_i = min(max_i, last_before)
+
+        if mask_before.any():
+            last_before = int(np.where(mask_before)[0][-1])
+            max_i_strict = min(max_i, last_before)
+            if max_i_strict >= PATTERN_LEN - 1:
+                max_i = max_i_strict
+            elif STRICT_BEFORE_TARGET:
+                # داده‌ی کافی قبل از تاریخ مرجع نیست
+                skipped_by_date.append(sym)
+                continue
+            else:
+                # از کل داده استفاده می‌کنیم
+                log(f"⚠️ {sym}: کندل کافی قبل از {target_date_naive.date()} "
+                    f"نیست → از کل داده استفاده می‌شود.")
+        else:
+            if STRICT_BEFORE_TARGET:
+                skipped_by_date.append(sym)
+                continue
+            log(f"⚠️ {sym}: هیچ کندلی قبل از {target_date_naive.date()} "
+                f"وجود ندارد → از کل داده استفاده می‌شود.")
 
         if max_i < PATTERN_LEN - 1:
             continue
@@ -190,6 +213,10 @@ def find_similar_candles(target_feat, target_date_naive, dfs):
                 'dist':     float(dists[oi]),
                 'date_key': dt.normalize(),
             })
+
+    if skipped_by_date:
+        log(f"⏭️  نمادهای رد شده به‌دلیل نبود داده‌ی قبل از تاریخ مرجع: "
+            f"{skipped_by_date}")
 
     candidates_all.sort(key=lambda x: x['dist'])
 
@@ -308,6 +335,8 @@ def main():
         df = fetch_4h(sym)
         if df is not None and len(df) > LOOKAHEAD + 10:
             dfs[sym] = df
+            log(f"   ↳ {sym}: {len(df)} کندل ۴ساعته "
+                f"({df.index[0].date()} → {df.index[-1].date()})")
 
     missing = [s for s in SYMBOLS if s not in dfs]
     if missing:
@@ -319,7 +348,11 @@ def main():
     log("\n🔍 جستجوی الگوهای ۴ساعته‌ی مشابه...")
     candidates = find_similar_candles(target_feat, target_date_naive, dfs)
     if not candidates:
-        raise RuntimeError("هیچ الگوی مشابهی یافت نشد.")
+        raise RuntimeError(
+            "هیچ الگوی مشابهی یافت نشد. "
+            "احتمالاً داده‌ی ۴ساعته‌ی کافی وجود ندارد. "
+            "تاریخ مرجع را به بازه‌ی ۷۳۰ روز اخیر تغییر بده."
+        )
     log(f"🏆 {len(candidates)} الگوی مشابه برتر.")
 
     # ۴) تحلیل فوروارد
