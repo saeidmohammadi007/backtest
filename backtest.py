@@ -43,8 +43,11 @@ WEEK_START = "MON"
 # حداکثر انحراف مجاز تاریخ کندل مرجع از TARGET_DATE (روز)
 MAX_DATE_DRIFT_DAYS = 7
 
-# حذف کندل‌هایی که در همان ماه تقویمیِ کندل مرجع هستند
+# ① حذف کندل‌هایی که در همان ماه تقویمیِ کندل مرجع هستند
 EXCLUDE_SAME_MONTH_AS_TARGET = True
+
+# ② از بین کاندیدها، فقط یک کندل در هر ماه تقویمی نگه داشته شود
+ONE_CANDIDATE_PER_MONTH = True
 
 
 # ==================== توابع ====================
@@ -161,7 +164,7 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
         # فقط کندل‌های قبل از تاریخ هدف
         mask_before = df.index < target_date_naive
 
-        # ─── حذف کندل‌های هم‌ماه با کندل مرجع ───
+        # ─── ① حذف کندل‌های هم‌ماه با کندل مرجع ───
         if EXCLUDE_SAME_MONTH_AS_TARGET:
             same_month = (
                 (df.index.year  == target_date_naive.year) &
@@ -222,7 +225,17 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
     candidates_all.sort(key=lambda x: x["dist"])
 
     unique_candidates = []
+    seen_months = set()   # ② (year, month) برای جلوگیری از تکرار ماه
+
     for c_ in candidates_all:
+        # ─── ② فقط یک کاندید در هر ماه تقویمی ───
+        if ONE_CANDIDATE_PER_MONTH:
+            ym = (c_["date"].year, c_["date"].month)
+            if ym in seen_months:
+                continue
+        # ────────────────────────────────────────
+
+        # حذف هم‌نمادهای نزدیک زمانی
         too_close = False
         for u in unique_candidates:
             if u["symbol"] != c_["symbol"]:
@@ -232,11 +245,16 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
                 break
         if too_close:
             continue
+
         unique_candidates.append(c_)
+        if ONE_CANDIDATE_PER_MONTH:
+            seen_months.add((c_["date"].year, c_["date"].month))
+
         if len(unique_candidates) >= TOTAL_TOP:
             break
 
-    log(f"🧹 بعد از حذف هم‌نمادهای نزدیک: {len(unique_candidates)} الگو")
+    log(f"🧹 بعد از حذف هم‌نمادهای نزدیک و هم‌ماه‌ها: "
+        f"{len(unique_candidates)} الگو")
     return unique_candidates
 
 
