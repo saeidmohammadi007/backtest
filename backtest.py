@@ -16,7 +16,7 @@ def log(m):
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-TARGET_SYMBOL = "DOGE-USD"      # نماد هدف
+TARGET_SYMBOL = "ETH-USD"      # نماد هدف
 TARGET_DATE   = "2023-10-20"    # تاریخ کندل مرجع (روزانه)
 
 TARGET_INTERVAL = "1d"          # کندل مرجع
