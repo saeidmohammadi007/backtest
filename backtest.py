@@ -17,7 +17,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 TARGET_SYMBOL = "DOGE-USD"      # نماد هدف
-TARGET_DATE   = "2025-07-04"    # تاریخ کندل مرجع (روزانه)
+TARGET_DATE   = "2023-10-20"    # تاریخ کندل مرجع (روزانه)
 
 TARGET_INTERVAL = "1d"          # کندل مرجع
 SEARCH_PERIOD_HOURLY = "730d"   # بازه‌ی داده‌ی ۱ ساعته (حداکثر Yahoo)
