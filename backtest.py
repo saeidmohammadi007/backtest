@@ -20,11 +20,9 @@ TARGET_SYMBOL = "ETH-USD"      # نماد هدف
 TARGET_DATE   = "2025-04-24"    # تاریخ کندل مرجع (روزانه)
 
 TARGET_INTERVAL = "1d"          # کندل مرجع
-SEARCH_PERIOD_HOURLY = "730d"   # بازه‌ی داده‌ی ۱ ساعته (حداکثر Yahoo)
+SEARCH_PERIOD_WEEKLY = "max"    # بازه‌ی داده‌ی هفتگی (max = کل تاریخچه)
 
 # اگر True باشد فقط کندل‌های قبل از تاریخ مرجع بررسی می‌شوند.
-# اگر False باشد، وقتی داده‌ی قبل از تاریخ مرجع کافی نبود،
-# از همه‌ی داده‌های موجود استفاده می‌شود.
 STRICT_BEFORE_TARGET = False
 
 PATTERN_LEN = 1                 # تعداد کندل الگو (روی کندل مرجع)
@@ -35,7 +33,7 @@ SYMBOLS = [
     "BLESS-USD", "ROSE-USD", "LINEA-USD", "JTO-USD",
 ]
 
-LOOKAHEAD    = 100              # تعداد کندل ۴ساعته‌ی بعدی
+LOOKAHEAD    = 30               # تعداد کندل هفتگی بعدی (~۷ ماه)
 K_PER_SYMBOL = 20
 TOTAL_TOP    = 100
 
@@ -59,27 +57,19 @@ def fetch(symbol, interval, period):
         return None
 
 
-def fetch_4h(symbol):
-    log(f"📥 دریافت {symbol} (1h→4h)")
+def fetch_weekly(symbol):
+    log(f"📥 دریافت {symbol} (1wk)")
     try:
-        df = yf.download(symbol, interval="1h", period=SEARCH_PERIOD_HOURLY,
+        df = yf.download(symbol, interval="1wk", period=SEARCH_PERIOD_WEEKLY,
                          progress=False, auto_adjust=True, timeout=60)
         if df is None or df.empty:
             return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df[['Open', 'High', 'Low', 'Close']].dropna()
-        if df.empty:
-            return None
-        df_4h = df.resample('4h').agg({
-            'Open':  'first',
-            'High':  'max',
-            'Low':   'min',
-            'Close': 'last',
-        }).dropna()
-        return df_4h if not df_4h.empty else None
+        return df if not df.empty else None
     except Exception as e:
-        log(f"❌ fetch_4h {symbol}: {e}")
+        log(f"❌ fetch_weekly {symbol}: {e}")
         return None
 
 
@@ -169,11 +159,9 @@ def find_similar_candles(target_feat, target_date_naive, dfs):
             if max_i_strict >= PATTERN_LEN - 1:
                 max_i = max_i_strict
             elif STRICT_BEFORE_TARGET:
-                # داده‌ی کافی قبل از تاریخ مرجع نیست
                 skipped_by_date.append(sym)
                 continue
             else:
-                # از کل داده استفاده می‌کنیم
                 log(f"⚠️ {sym}: کندل کافی قبل از {target_date_naive.date()} "
                     f"نیست → از کل داده استفاده می‌شود.")
         else:
@@ -329,29 +317,28 @@ def main():
     if getattr(target_date_naive, 'tz', None) is not None:
         target_date_naive = target_date_naive.tz_localize(None)
 
-    # ۲) داده‌ی ۴ساعته‌ی همه‌ی نمادها
+    # ۲) داده‌ی هفتگی همه‌ی نمادها (مستقیم از yfinance)
     dfs = {}
     for sym in SYMBOLS:
-        df = fetch_4h(sym)
+        df = fetch_weekly(sym)
         if df is not None and len(df) > LOOKAHEAD + 10:
             dfs[sym] = df
-            log(f"   ↳ {sym}: {len(df)} کندل ۴ساعته "
+            log(f"   ↳ {sym}: {len(df)} کندل هفتگی "
                 f"({df.index[0].date()} → {df.index[-1].date()})")
 
     missing = [s for s in SYMBOLS if s not in dfs]
     if missing:
-        log(f"⚠️ بدون داده‌ی ۴ساعته: {missing}")
+        log(f"⚠️ بدون داده‌ی هفتگی: {missing}")
     if not dfs:
-        raise RuntimeError("هیچ نمادی داده‌ی ۴ساعته ندارد.")
+        raise RuntimeError("هیچ نمادی داده‌ی هفتگی ندارد.")
 
     # ۳) جستجوی الگوهای مشابه
-    log("\n🔍 جستجوی الگوهای ۴ساعته‌ی مشابه...")
+    log("\n🔍 جستجوی الگوهای هفتگی مشابه...")
     candidates = find_similar_candles(target_feat, target_date_naive, dfs)
     if not candidates:
         raise RuntimeError(
             "هیچ الگوی مشابهی یافت نشد. "
-            "احتمالاً داده‌ی ۴ساعته‌ی کافی وجود ندارد. "
-            "تاریخ مرجع را به بازه‌ی ۷۳۰ روز اخیر تغییر بده."
+            "احتمالاً داده‌ی هفتگی کافی وجود ندارد."
         )
     log(f"🏆 {len(candidates)} الگوی مشابه برتر.")
 
