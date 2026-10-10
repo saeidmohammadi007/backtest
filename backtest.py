@@ -20,7 +20,6 @@ TARGET_SYMBOL = "DOGE-USD"
 TARGET_DATE   = "2019-01-21"
 
 SEARCH_PERIOD = "max"
-STRICT_BEFORE_TARGET = False
 PATTERN_LEN = 1
 
 SYMBOLS = [
@@ -29,15 +28,25 @@ SYMBOLS = [
     "XLM-USD", "REP-USD",
 ]
 
-# ⚠️ تغییر ۱: کف تاریخی برای کاندیدها
-# yfinance قبل از ۲۰۱۹ سایه‌های کریپتو را ناقص ثبت می‌کند
+# ─── بازه‌ی کاندیدها ───
+# کف تاریخی (yfinance قبل از این تاریخ سایه‌های کریپتو را ناقص می‌دهد)
 MIN_CANDIDATE_DATE = "2019-01-01"
 
-# ⚠️ تغییر ۲: نحوه‌ی ورود
-#   "next_open" → ورود روی Open کندل هفته‌ی بعد (واقع‌گرایانه) ✅
-#   "ref_close" → ورود روی Close کندل الگو (خوش‌بینانه — کد قبلی)
+# کاندیدهای بعد از تاریخ هدف هم مجاز باشند
+ALLOW_CANDIDATES_AFTER_TARGET = True
+
+# فقط دقیقاً خودِ کندل مرجع حذف شود
+EXCLUDE_EXACT_TARGET_CANDLE = True
+
+# کل ماه هدف حذف نشود
+EXCLUDE_SAME_MONTH_AS_TARGET = False
+
+# ─── حالت ورود ───
+#   "next_open" → ورود روی Open کندل هفته‌ی بعد (واقع‌گرایانه)
+#   "ref_close" → ورود روی Close کندل الگو (خوش‌بینانه)
 ENTRY_MODE = "next_open"
 
+# ─── پارامترهای جستجو ───
 LOOKAHEAD        = 26
 K_PER_SYMBOL     = 20
 TOTAL_TOP        = 100
@@ -46,17 +55,17 @@ EXCLUDE_TEMPORAL = 4
 TARGETS       = [20.0, 50.0]
 DD_THRESHOLDS = [2.0, 3.0]
 
-WEEK_START = "MON"
+WEEK_START = "MON"   # "MON" یا "SUN"
 
 MAX_DATE_DRIFT_DAYS = 7
 
-EXCLUDE_SAME_MONTH_AS_TARGET = True
+# از بین کاندیدها فقط یک کندل در هر ماه تقویمی
 ONE_CANDIDATE_PER_MONTH = True
 
 
 # ==================== توابع ====================
 def fetch_weekly(symbol):
-    """دریافت روزانه از yfinance و رزمپل به هفتگی با برچسب دوشنبه."""
+    """دریافت روزانه از yfinance و رزمپل به هفتگی."""
     log(f"📥 دریافت هفتگی {symbol}")
     try:
         df = yf.download(symbol, interval="1d", period=SEARCH_PERIOD,
@@ -115,7 +124,7 @@ def pattern_features(end_idx, o, h, l, c, pattern_len=PATTERN_LEN):
 
 
 def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
-    # ⚠️ تغییر ۳: حالت ورود
+    """ورود طبق ENTRY_MODE، سپس سنجش بازده و drawdown."""
     if ENTRY_MODE == "next_open":
         if entry_idx + 1 >= n:
             return None
@@ -159,63 +168,65 @@ def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
 
 
 def find_similar_weekly(target_feat, target_date_naive, dfs):
+    """
+    جستجوی الگوهای مشابه با استفاده از mask بولی.
+    کاندیدها می‌توانند قبل یا بعد از تاریخ هدف باشند
+    (به‌جز خودِ کندل مرجع در صورت EXCLUDE_EXACT_TARGET_CANDLE).
+    """
     candidates_all = []
-    skipped_by_date = []
-
-    min_date = pd.Timestamp(MIN_CANDIDATE_DATE)  # ⚠️ تغییر ۴
+    sym_floor_global = pd.Timestamp(MIN_CANDIDATE_DATE)
 
     for sym in SYMBOLS:
         df = dfs.get(sym)
         if df is None:
             continue
+
         o = df["Open"].values.astype(float)
         h = df["High"].values.astype(float)
         l = df["Low"].values.astype(float)
         c = df["Close"].values.astype(float)
         n = len(df)
 
-        max_i = n - LOOKAHEAD - 1
-        if max_i < PATTERN_LEN - 1:
-            continue
+        idx_arr = np.arange(n)
 
-        mask_before = df.index < target_date_naive
-        mask_after_min = df.index >= min_date          # ⚠️ تغییر ۵
-        mask_before = mask_before & mask_after_min
+        # ─── کف تاریخی ───
+        mask = df.index >= sym_floor_global
 
+        # ─── آیا فقط قبل از تاریخ هدف؟ ───
+        if not ALLOW_CANDIDATES_AFTER_TARGET:
+            mask = mask & (df.index < target_date_naive)
+
+        # ─── حذف دقیقاً خودِ کندل مرجع ───
+        if EXCLUDE_EXACT_TARGET_CANDLE:
+            mask = mask & (df.index != target_date_naive)
+
+        # ─── حذف هم‌ماه (اختیاری) ───
         if EXCLUDE_SAME_MONTH_AS_TARGET:
             same_month = (
                 (df.index.year  == target_date_naive.year) &
                 (df.index.month == target_date_naive.month)
             )
-            mask_before = mask_before & (~same_month)
+            mask = mask & (~same_month)
 
-        if mask_before.any():
-            last_before = int(np.where(mask_before)[0][-1])
-            max_i_strict = min(max_i, last_before)
-            if max_i_strict >= PATTERN_LEN - 1:
-                max_i = max_i_strict
-            elif STRICT_BEFORE_TARGET:
-                skipped_by_date.append(sym)
-                continue
-            else:
-                log(f"⚠️ {sym}: کندل کافی در بازه‌ی مجاز نیست → کل داده استفاده می‌شود.")
-        else:
-            if STRICT_BEFORE_TARGET:
-                skipped_by_date.append(sym)
-                continue
+        # ─── باید حداقل PATTERN_LEN کندل قبل داشته باشد ───
+        mask = mask & (idx_arr >= PATTERN_LEN - 1)
+
+        # ─── باید LOOKAHEAD+1 کندل بعد داشته باشد (برای next_open) ───
+        mask = mask & (idx_arr <= n - LOOKAHEAD - 2)
+
+        valid_idxs = np.where(mask)[0]
+        if len(valid_idxs) == 0:
             log(f"⚠️ {sym}: هیچ کندل معتبری در بازه‌ی مجاز ندارد → رد شد.")
             continue
 
-        if max_i < PATTERN_LEN - 1:
-            continue
-
+        # ساخت فیچرها فقط برای ایندکس‌های معتبر
         feats, idxs = [], []
-        for i in range(PATTERN_LEN - 1, max_i + 1):
-            f = pattern_features(i, o, h, l, c)
+        for i in valid_idxs:
+            f = pattern_features(int(i), o, h, l, c)
             if f is None:
                 continue
             feats.append(f)
-            idxs.append(i)
+            idxs.append(int(i))
 
         if not feats:
             continue
@@ -233,9 +244,6 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
                 "dist":   float(dists[oi]),
                 "date":   df.index[cand_idx],
             })
-
-    if skipped_by_date:
-        log(f"⏭️  رد شده: {skipped_by_date}")
 
     candidates_all.sort(key=lambda x: x["dist"])
 
@@ -321,7 +329,7 @@ def build_report(results, target_info, baseline):
                  f"سایه‌بالا <code>{target_info['up']*100:.2f}٪</code> | "
                  f"سایه‌پایین <code>{target_info['dn']*100:.2f}٪</code> | "
                  f"دامنه <code>{target_info['rng']*100:.2f}٪</code>")
-    lines.append(f"🔎 الگوهای هفتگی مشابه: <code>{n}</code> | "
+    lines.append(f"🔎 الگوهای مشابه: <code>{n}</code> | "
                  f"Lookahead: <code>{LOOKAHEAD}w</code> | "
                  f"ورود: <code>{ENTRY_MODE}</code>")
     lines.append(f"🗓 کف تاریخی: <code>{MIN_CANDIDATE_DATE}</code>")
@@ -380,8 +388,10 @@ def main():
     log("=" * 60)
     log(f"🚀 مشابه‌یابی: هدف=هفتگی {TARGET_SYMBOL} | ورود={ENTRY_MODE}")
     log(f"   کف تاریخی کاندیدها: {MIN_CANDIDATE_DATE}")
+    log(f"   کاندیدهای بعد از هدف: {ALLOW_CANDIDATES_AFTER_TARGET}")
     log("=" * 60)
 
+    # ۱) کندل مرجع هفتگی
     df_target = fetch_weekly(TARGET_SYMBOL)
     if df_target is None or len(df_target) < PATTERN_LEN:
         raise RuntimeError(f"داده‌ی هفتگی {TARGET_SYMBOL} موجود نیست.")
@@ -400,7 +410,8 @@ def main():
             f"{drift_days} روز از TARGET_DATE فاصله دارد."
         )
 
-    log(f"🎯 کندل مرجع هفتگی: {actual_date.date()} ({actual_date.day_name()})")
+    log(f"🎯 کندل مرجع هفتگی: {actual_date.date()} ({actual_date.day_name()}) | "
+        f"انحراف: {drift_days} روز")
 
     o_t = df_target["Open"].values.astype(float)
     h_t = df_target["High"].values.astype(float)
@@ -413,9 +424,14 @@ def main():
 
     log(f"   O={o_t[target_idx]:.4f} H={h_t[target_idx]:.4f} "
         f"L={l_t[target_idx]:.4f} C={c_t[target_idx]:.4f}")
+    log(f"   بدنه={target_feat[0]*100:+.2f}٪ | "
+        f"سایه‌بالا={target_feat[1]*100:.2f}٪ | "
+        f"سایه‌پایین={target_feat[2]*100:.2f}٪ | "
+        f"دامنه={target_feat[3]*100:.2f}٪")
 
     target_date_naive = actual_date
 
+    # ۲) داده‌ی هفتگی نمادها
     dfs = {}
     for sym in SYMBOLS:
         df = fetch_weekly(sym)
@@ -430,6 +446,7 @@ def main():
     if not dfs:
         raise RuntimeError("هیچ نمادی داده‌ی هفتگی ندارد.")
 
+    # ۳) نرخ پایه
     log("\n📊 محاسبه‌ی نرخ پایه (هفتگی)...")
     all_outcomes = []
     for sym, df in dfs.items():
@@ -444,6 +461,8 @@ def main():
                 all_outcomes.append(out)
 
     n_base = len(all_outcomes)
+    if n_base == 0:
+        raise RuntimeError("نمونه‌ی پایه صفر است.")
     baseline = {
         "win": sum(1 for o in all_outcomes if o["ret"] > 0) / n_base * 100.0
     }
@@ -458,11 +477,13 @@ def main():
         for D in DD_THRESHOLDS:
             log(f"   +{T:.0f}٪ / DD≤{D:.0f}٪: {baseline[(T, D)]:.2f}٪")
 
+    # ۴) جستجوی الگوهای مشابه
     log("\n🔍 جستجوی الگوهای هفتگی مشابه...")
     candidates = find_similar_weekly(target_feat, target_date_naive, dfs)
     if not candidates:
         raise RuntimeError("هیچ الگوی مشابهی یافت نشد.")
 
+    # ۵) تحلیل فوروارد
     results = []
     for c_ in candidates:
         sym = c_["symbol"]
@@ -498,6 +519,7 @@ def main():
         "rng":  target_feat[3],
     }
 
+    # ۶) گزارش
     report = build_report(results, target_info, baseline)
     plain = (report.replace("<b>", "").replace("</b>", "")
                    .replace("<code>", "").replace("</code>", ""))
