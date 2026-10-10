@@ -339,7 +339,7 @@ def build_report(results, target_info, baseline):
             f"بدنه <code>{f0*100:+.2f}٪</code>"
         )
 
-    # ============ تاریخ کندل‌های موفق ============
+    # ============ تاریخ + نام نماد کندل‌های موفق ============
     hit_50_dd2 = [r for r in results if r.get("hit_50.0_dd2.0", False)]
     hit_50_dd3 = [r for r in results if r.get("hit_50.0_dd3.0", False)]
 
@@ -347,7 +347,7 @@ def build_report(results, target_info, baseline):
     lines.append(f"✅ <b>+۵۰٪ / DD≤۲٪</b> — {len(hit_50_dd2)} مورد:")
     if hit_50_dd2:
         for r in hit_50_dd2:
-            lines.append(f"│ {r['date']}")
+            lines.append(f"│ <b>{r['symbol']}</b> @ {r['date']}")
     else:
         lines.append("│ (هیچ)")
 
@@ -355,7 +355,7 @@ def build_report(results, target_info, baseline):
     lines.append(f"✅ <b>+۵۰٪ / DD≤۳٪</b> — {len(hit_50_dd3)} مورد:")
     if hit_50_dd3:
         for r in hit_50_dd3:
-            lines.append(f"│ {r['date']}")
+            lines.append(f"│ <b>{r['symbol']}</b> @ {r['date']}")
     else:
         lines.append("│ (هیچ)")
 
