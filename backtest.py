@@ -43,6 +43,9 @@ WEEK_START = "MON"
 # حداکثر انحراف مجاز تاریخ کندل مرجع از TARGET_DATE (روز)
 MAX_DATE_DRIFT_DAYS = 7
 
+# حذف کندل‌هایی که در همان ماه تقویمیِ کندل مرجع هستند
+EXCLUDE_SAME_MONTH_AS_TARGET = True
+
 
 # ==================== توابع ====================
 def fetch_weekly(symbol):
@@ -155,7 +158,18 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
         if max_i < PATTERN_LEN - 1:
             continue
 
+        # فقط کندل‌های قبل از تاریخ هدف
         mask_before = df.index < target_date_naive
+
+        # ─── حذف کندل‌های هم‌ماه با کندل مرجع ───
+        if EXCLUDE_SAME_MONTH_AS_TARGET:
+            same_month = (
+                (df.index.year  == target_date_naive.year) &
+                (df.index.month == target_date_naive.month)
+            )
+            mask_before = mask_before & (~same_month)
+        # ─────────────────────────────────────────
+
         if mask_before.any():
             last_before = int(np.where(mask_before)[0][-1])
             max_i_strict = min(max_i, last_before)
@@ -306,6 +320,26 @@ def build_report(results, target_info, baseline):
             f"d=<code>{r['dist']:.4f}</code> | "
             f"بدنه <code>{f0*100:+.2f}٪</code>"
         )
+
+    # ============ تاریخ کندل‌های موفق ============
+    hit_50_dd2 = [r for r in results if r.get("hit_50.0_dd2.0", False)]
+    hit_50_dd3 = [r for r in results if r.get("hit_50.0_dd3.0", False)]
+
+    lines.append("")
+    lines.append(f"✅ <b>+۵۰٪ / DD≤۲٪</b> — {len(hit_50_dd2)} مورد:")
+    if hit_50_dd2:
+        for r in hit_50_dd2:
+            lines.append(f"│ {r['date']}")
+    else:
+        lines.append("│ (هیچ)")
+
+    lines.append("")
+    lines.append(f"✅ <b>+۵۰٪ / DD≤۳٪</b> — {len(hit_50_dd3)} مورد:")
+    if hit_50_dd3:
+        for r in hit_50_dd3:
+            lines.append(f"│ {r['date']}")
+    else:
+        lines.append("│ (هیچ)")
 
     return "\n".join(lines).rstrip()
 
