@@ -1,11 +1,18 @@
 import os
 import sys
+import time
 import traceback
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+
+try:
+    import ccxt
+    HAS_CCXT = True
+except ImportError:
+    HAS_CCXT = False
 
 
 def log(m):
@@ -23,12 +30,36 @@ SEARCH_PERIOD = "max"
 STRICT_BEFORE_TARGET = False
 PATTERN_LEN = 1
 
-# برای BTC از همین لیست استفاده می‌کنیم (همه قبل از 2017-09-11 داده دارند)
+# منبع داده: "ccxt" (پیشنهادی) یا "yfinance"
+DATA_SOURCE = "ccxt"
+
+# صرافی‌های ترجیحی برای هر نماد (به ترتیب اولویت)
+# این صرافی‌ها معمولاً داده‌ی تاریخی دقیق‌تری دارند و با TradingView همخوانی دارند.
+SYMBOL_SOURCES = {
+    "BTC-USD":  [("bitstamp", "BTC/USD"), ("kraken", "BTC/USD"), ("coinbase", "BTC/USD")],
+    "ETH-USD":  [("bitstamp", "ETH/USD"), ("kraken", "ETH/USD"), ("coinbase", "ETH/USD")],
+    "LTC-USD":  [("bitstamp", "LTC/USD"), ("kraken", "LTC/USD"), ("coinbase", "LTC/USD")],
+    "XRP-USD":  [("bitstamp", "XRP/USD"), ("kraken", "XRP/USD"), ("bitfinex", "XRP/USD")],
+    "XMR-USD":  [("kraken", "XMR/USD"), ("bitfinex", "XMR/USD")],
+    "ZEC-USD":  [("kraken", "ZEC/USD"), ("bitfinex", "ZEC/USD")],
+    "DASH-USD": [("kraken", "DASH/USD"), ("bitfinex", "DASH/USD")],
+    "ETC-USD":  [("kraken", "ETC/USD"), ("bitfinex", "ETC/USD")],
+    "XLM-USD":  [("kraken", "XLM/USD"), ("bitfinex", "XLM/USD")],
+    "DOGE-USD": [("kraken", "DOGE/USD"), ("bitfinex", "DOGE/USD"), ("binance", "DOGE/USDT")],
+    "REP-USD":  [("kraken", "REP/USD")],
+    "ADA-USD":  [("kraken", "ADA/USD"), ("binance", "ADA/USDT")],
+    "SOL-USD":  [("binance", "SOL/USDT"), ("coinbase", "SOL/USD")],
+}
+
 SYMBOLS = [
     "BTC-USD", "ETH-USD", "LTC-USD", "XRP-USD",
     "XMR-USD", "ZEC-USD", "DASH-USD", "ETC-USD",
     "XLM-USD", "REP-USD",
 ]
+
+# ⚠️ کف تاریخی: کاندیدها فقط از این تاریخ به بعد بررسی می‌شوند
+# (برای دوری از داده‌های ناقص yfinance در سال‌های ۲۰۱۴–۲۰۱۸)
+MIN_CANDIDATE_DATE = "2019-01-01"
 
 LOOKAHEAD        = 26
 K_PER_SYMBOL     = 20
@@ -38,9 +69,8 @@ EXCLUDE_TEMPORAL = 4
 TARGETS       = [20.0, 50.0]
 DD_THRESHOLDS = [2.0, 3.0]
 
-WEEK_START = "MON"
+WEEK_START = "MON"   # "MON" یا "SUN" (TradingView برای کریپتو معمولاً SUN)
 
-# حداکثر انحراف مجاز تاریخ کندل مرجع از TARGET_DATE (روز)
 MAX_DATE_DRIFT_DAYS = 7
 
 # ① حذف کندل‌هایی که در همان ماه تقویمیِ کندل مرجع هستند
@@ -49,11 +79,100 @@ EXCLUDE_SAME_MONTH_AS_TARGET = True
 # ② از بین کاندیدها، فقط یک کندل در هر ماه تقویمی نگه داشته شود
 ONE_CANDIDATE_PER_MONTH = True
 
+# نحوه ورود:
+#   "next_open" → ورود روی Open کندل هفته‌ی بعدِ الگو (واقع‌گرایانه)
+#   "ref_close" → ورود روی Close کندل الگو (خوش‌بینانه)
+ENTRY_MODE = "next_open"
 
-# ==================== توابع ====================
-def fetch_weekly(symbol):
-    """دریافت روزانه از yfinance و رزمپل به هفتگی با برچسب دوشنبه."""
-    log(f"📥 دریافت هفتگی {symbol}")
+
+# ==================== لایه‌ی داده ====================
+_ccxt_cache = {}
+
+
+def _get_ccxt_exchange(ex_id):
+    if ex_id in _ccxt_cache:
+        return _ccxt_cache[ex_id]
+    cls = getattr(ccxt, ex_id, None)
+    if cls is None:
+        log(f"⚠️ صرافی ccxt «{ex_id}» پیدا نشد.")
+        return None
+    ex = cls({"enableRateLimit": True, "timeout": 30000})
+    _ccxt_cache[ex_id] = ex
+    return ex
+
+
+def _resample_weekly(df):
+    rule = "W-MON" if WEEK_START == "MON" else "W-SUN"
+    df_wk = df.resample(rule, label="left", closed="left").agg({
+        "Open":  "first",
+        "High":  "max",
+        "Low":   "min",
+        "Close": "last",
+    }).dropna()
+    return df_wk if not df_wk.empty else None
+
+
+def fetch_weekly_ccxt(symbol):
+    """دریافت OHLCV روزانه از ccxt و رزمپل به هفتگی."""
+    if not HAS_CCXT:
+        return None
+
+    sources = SYMBOL_SOURCES.get(symbol, [])
+    for ex_id, pair in sources:
+        ex = _get_ccxt_exchange(ex_id)
+        if ex is None:
+            continue
+        try:
+            log(f"📥 ccxt {ex_id} {pair}")
+            all_rows = ex.fetch_ohlcv(pair, timeframe="1d", limit=1000)
+            if not all_rows:
+                continue
+
+            # صفحه‌بندی به عقب تا رسیدن به ابتدای تاریخچه
+            one_day_ms = 24 * 60 * 60 * 1000
+            while True:
+                since = all_rows[0][0] - 1000 * one_day_ms
+                try:
+                    chunk = ex.fetch_ohlcv(pair, timeframe="1d",
+                                           since=since, limit=1000)
+                except Exception as e:
+                    log(f"   paginate stop: {e}")
+                    break
+                if not chunk:
+                    break
+                new = [r for r in chunk if r[0] < all_rows[0][0]]
+                if not new:
+                    break
+                all_rows = new + all_rows
+                if len(new) < 1000:
+                    break
+                time.sleep(ex.rateLimit / 1000.0)
+
+            if not all_rows:
+                continue
+
+            df = pd.DataFrame(all_rows,
+                              columns=["ts", "Open", "High", "Low", "Close", "Volume"])
+            df["ts"] = (pd.to_datetime(df["ts"], unit="ms", utc=True)
+                          .dt.tz_convert("UTC").dt.tz_localize(None))
+            df.set_index("ts", inplace=True)
+            df = df[["Open", "High", "Low", "Close"]].dropna()
+            df = df[df[["Open", "High", "Low", "Close"]].min(axis=1) > 0]
+            if df.empty:
+                continue
+
+            wk = _resample_weekly(df)
+            if wk is not None and not wk.empty:
+                return wk
+        except Exception as e:
+            log(f"❌ ccxt {ex_id} {pair}: {e}")
+            continue
+    return None
+
+
+def fetch_weekly_yf(symbol):
+    """دریافت روزانه از yfinance و رزمپل به هفتگی (fallback)."""
+    log(f"📥 yfinance {symbol}")
     try:
         df = yf.download(symbol, interval="1d", period=SEARCH_PERIOD,
                          progress=False, auto_adjust=True, timeout=60)
@@ -71,21 +190,24 @@ def fetch_weekly(symbol):
             df.index = df.index.tz_convert("UTC").tz_localize(None)
         df.index = df.index.normalize()
 
-        rule = "W-MON" if WEEK_START == "MON" else "W-SUN"
-        df_wk = df.resample(rule, label="left", closed="left").agg({
-            "Open":  "first",
-            "High":  "max",
-            "Low":   "min",
-            "Close": "last",
-        }).dropna()
-
-        return df_wk if not df_wk.empty else None
+        return _resample_weekly(df)
     except Exception as e:
-        log(f"❌ fetch_weekly {symbol}: {e}")
+        log(f"❌ yfinance {symbol}: {e}")
         traceback.print_exc()
         return None
 
 
+def fetch_weekly(symbol):
+    """اول ccxt، اگر شکست خورد yfinance."""
+    if DATA_SOURCE == "ccxt":
+        df = fetch_weekly_ccxt(symbol)
+        if df is not None and not df.empty:
+            return df
+        log(f"⚠️ ccxt برای {symbol} شکست خورد → fallback به yfinance")
+    return fetch_weekly_yf(symbol)
+
+
+# ==================== توابع تحلیل ====================
 def candle_features(i, o, h, l, c):
     op, hi, lo, cl = o[i], h[i], l[i], c[i]
     if op <= 0:
@@ -111,15 +233,30 @@ def pattern_features(end_idx, o, h, l, c, pattern_len=PATTERN_LEN):
 
 
 def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
-    if entry_idx + 1 + lookahead > n:
-        return None
-    entry_price = float(c[entry_idx])
+    """
+    entry_idx: ایندکس آخرین کندل الگو.
+    ورود: طبق ENTRY_MODE.
+    lookahead: تعداد کندل هفتگی به جلو.
+    """
+    if ENTRY_MODE == "next_open":
+        if entry_idx + 1 >= n:
+            return None
+        entry_price = float(o[entry_idx + 1])
+        start = entry_idx + 1
+    else:  # ref_close
+        entry_price = float(c[entry_idx])
+        start = entry_idx + 1
+
     if entry_price <= 0:
         return None
-    end = entry_idx + 1 + lookahead
-    fut_c = c[entry_idx + 1:end]
-    fut_h = h[entry_idx + 1:end]
-    fut_l = l[entry_idx + 1:end]
+
+    end = start + lookahead
+    if end > n:
+        return None
+
+    fut_c = c[start:end]
+    fut_h = h[start:end]
+    fut_l = l[start:end]
     if len(fut_c) == 0:
         return None
 
@@ -147,6 +284,8 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
     candidates_all = []
     skipped_by_date = []
 
+    min_date = pd.Timestamp(MIN_CANDIDATE_DATE)
+
     for sym in SYMBOLS:
         df = dfs.get(sym)
         if df is None:
@@ -163,6 +302,10 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
 
         # فقط کندل‌های قبل از تاریخ هدف
         mask_before = df.index < target_date_naive
+
+        # ⚠️ فقط کندل‌های بعد از کف تاریخی (MIN_CANDIDATE_DATE)
+        mask_after_min = df.index >= min_date
+        mask_before = mask_before & mask_after_min
 
         # ─── ① حذف کندل‌های هم‌ماه با کندل مرجع ───
         if EXCLUDE_SAME_MONTH_AS_TARGET:
@@ -181,15 +324,12 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
             elif STRICT_BEFORE_TARGET:
                 skipped_by_date.append(sym)
                 continue
-            else:
-                log(f"⚠️ {sym}: کندل کافی قبل از "
-                    f"{target_date_naive.date()} نیست → کل داده استفاده می‌شود.")
         else:
             if STRICT_BEFORE_TARGET:
                 skipped_by_date.append(sym)
                 continue
-            log(f"⚠️ {sym}: هیچ کندلی قبل از "
-                f"{target_date_naive.date()} ندارد → کل داده استفاده می‌شود.")
+            log(f"⚠️ {sym}: هیچ کندل معتبری در بازه‌ی مجاز ندارد → رد شد.")
+            continue
 
         if max_i < PATTERN_LEN - 1:
             continue
@@ -225,7 +365,7 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
     candidates_all.sort(key=lambda x: x["dist"])
 
     unique_candidates = []
-    seen_months = set()   # ② (year, month) برای جلوگیری از تکرار ماه
+    seen_months = set()
 
     for c_ in candidates_all:
         # ─── ② فقط یک کاندید در هر ماه تقویمی ───
@@ -235,7 +375,6 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
                 continue
         # ────────────────────────────────────────
 
-        # حذف هم‌نمادهای نزدیک زمانی
         too_close = False
         for u in unique_candidates:
             if u["symbol"] != c_["symbol"]:
@@ -309,8 +448,11 @@ def build_report(results, target_info, baseline):
                  f"سایه‌بالا <code>{target_info['up']*100:.2f}٪</code> | "
                  f"سایه‌پایین <code>{target_info['dn']*100:.2f}٪</code> | "
                  f"دامنه <code>{target_info['rng']*100:.2f}٪</code>")
-    lines.append(f"🔎 الگوهای هفتگی مشابه: <code>{n}</code> | "
+    lines.append(f"🔎 الگوهای مشابه: <code>{n}</code> | "
                  f"Lookahead: <code>{LOOKAHEAD}w</code>")
+    lines.append(f"📡 منبع داده: <code>{DATA_SOURCE}</code> | "
+                 f"حالت ورود: <code>{ENTRY_MODE}</code>")
+    lines.append(f"🗓 کف تاریخی کاندیدها: <code>{MIN_CANDIDATE_DATE}</code>")
     lines.append("")
 
     lines.append(f"💰 <b>سوددهی کلی:</b> <code>{win_pct:.1f}٪</code> "
@@ -330,7 +472,7 @@ def build_report(results, target_info, baseline):
             )
         lines.append("")
 
-    lines.append("📋 <b>۱۰ کندل هفتگی مشابه برتر (برای تأیید در TradingView):</b>")
+    lines.append("📋 <b>۱۰ الگوی برتر (برای تأیید در TradingView):</b>")
     for r in results[:10]:
         f0 = r["feat"][0]
         lines.append(
@@ -339,7 +481,6 @@ def build_report(results, target_info, baseline):
             f"بدنه <code>{f0*100:+.2f}٪</code>"
         )
 
-    # ============ تاریخ + نام نماد کندل‌های موفق ============
     hit_50_dd2 = [r for r in results if r.get("hit_50.0_dd2.0", False)]
     hit_50_dd3 = [r for r in results if r.get("hit_50.0_dd3.0", False)]
 
@@ -365,10 +506,14 @@ def build_report(results, target_info, baseline):
 # ==================== اجرای اصلی ====================
 def main():
     log("=" * 60)
-    log(f"🚀 مشابه‌یابی: هدف=هفتگی {TARGET_SYMBOL} | جستجو=هفتگی")
+    log(f"🚀 مشابه‌یابی | هدف=هفتگی {TARGET_SYMBOL} | "
+        f"منبع داده={DATA_SOURCE} | ورود={ENTRY_MODE}")
     log("=" * 60)
 
-    # ۱) کندل مرجع هفتگی (از همان BTC)
+    if DATA_SOURCE == "ccxt" and not HAS_CCXT:
+        raise RuntimeError("ccxt نصب نیست. pip install ccxt")
+
+    # ۱) کندل مرجع هفتگی
     df_target = fetch_weekly(TARGET_SYMBOL)
     if df_target is None or len(df_target) < PATTERN_LEN:
         raise RuntimeError(f"داده‌ی هفتگی {TARGET_SYMBOL} موجود نیست.")
@@ -385,13 +530,13 @@ def main():
         raise RuntimeError(
             f"⛔ کندل مرجع یافت‌شده ({actual_date.date()}) "
             f"{drift_days} روز از تاریخ هدف ({TARGET_DATE}) فاصله دارد.\n"
-            f"   یعنی yfinance داده‌ی هفتگی {TARGET_SYMBOL} را فقط از "
-            f"{df_target.index[0].date()} به بعد دارد.\n"
+            f"   یعنی داده‌ی هفتگی {TARGET_SYMBOL} فقط از "
+            f"{df_target.index[0].date()} به بعد موجود است.\n"
             f"   TARGET_DATE را داخل این محدوده تنظیم کنید."
         )
 
-    log(f"🎯 کندل مرجع هفتگی: {actual_date.date()} ({actual_date.day_name()}) | "
-        f"انحراف از هدف: {drift_days} روز")
+    log(f"🎯 کندل مرجع: {actual_date.date()} ({actual_date.day_name()}) | "
+        f"انحراف: {drift_days} روز")
 
     o_t = df_target["Open"].values.astype(float)
     h_t = df_target["High"].values.astype(float)
@@ -417,12 +562,10 @@ def main():
         df = fetch_weekly(sym)
         if df is not None and len(df) > LOOKAHEAD + 10:
             dfs[sym] = df
-            wd = set(d.weekday() for d in df.index)
             wd_names = {0:'Mon',1:'Tue',2:'Wed',3:'Thu',4:'Fri',5:'Sat',6:'Sun'}
-            wd_str = ",".join(wd_names[w] for w in sorted(wd))
-            log(f"   ↳ {sym}: {len(df)} کندل هفتگی "
-                f"({df.index[0].date()} → {df.index[-1].date()}) | "
-                f"wd={wd_str}")
+            wd_str = ",".join(wd_names[w] for w in sorted(set(d.weekday() for d in df.index)))
+            log(f"   ↳ {sym}: {len(df)} کندل ({df.index[0].date()} → "
+                f"{df.index[-1].date()}) | wd={wd_str}")
 
     missing = [s for s in SYMBOLS if s not in dfs]
     if missing:
@@ -430,8 +573,8 @@ def main():
     if not dfs:
         raise RuntimeError("هیچ نمادی داده‌ی هفتگی ندارد.")
 
-    # ۳) نرخ پایه (روی کندل‌های هفتگی)
-    log("\n📊 محاسبه‌ی نرخ پایه (هفتگی)...")
+    # ۳) نرخ پایه
+    log("\n📊 محاسبه‌ی نرخ پایه...")
     all_outcomes = []
     for sym, df in dfs.items():
         o = df["Open"].values.astype(float)
@@ -445,6 +588,8 @@ def main():
                 all_outcomes.append(out)
 
     n_base = len(all_outcomes)
+    if n_base == 0:
+        raise RuntimeError("نمونه‌ی پایه صفر است.")
     baseline = {
         "win": sum(1 for o in all_outcomes if o["ret"] > 0) / n_base * 100.0
     }
@@ -459,7 +604,7 @@ def main():
         for D in DD_THRESHOLDS:
             log(f"   +{T:.0f}٪ / DD≤{D:.0f}٪: {baseline[(T, D)]:.2f}٪")
 
-    # ۴) جستجوی الگوهای هفتگی مشابه
+    # ۴) جستجوی الگوهای مشابه
     log("\n🔍 جستجوی الگوهای هفتگی مشابه...")
     candidates = find_similar_weekly(target_feat, target_date_naive, dfs)
     if not candidates:
