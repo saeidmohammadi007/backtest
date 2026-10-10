@@ -32,7 +32,10 @@ SYMBOLS = [
 # کف تاریخی (yfinance قبل از این تاریخ سایه‌های کریپتو را ناقص می‌دهد)
 MIN_CANDIDATE_DATE = "2019-01-01"
 
-# کاندیدهای بعد از تاریخ هدف هم مجاز باشند
+# سقف تاریخی کاندیدها — هیچ کندل هفتگی بعد از این تاریخ کاندید نمی‌شود
+MAX_CANDIDATE_DATE = "2025-01-01"
+
+# کاندیدهای بعد از تاریخ هدف هم مجاز باشند (تا زمانی که زیر MAX_CANDIDATE_DATE باشند)
 ALLOW_CANDIDATES_AFTER_TARGET = True
 
 # فقط دقیقاً خودِ کندل مرجع حذف شود
@@ -170,11 +173,11 @@ def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
 def find_similar_weekly(target_feat, target_date_naive, dfs):
     """
     جستجوی الگوهای مشابه با استفاده از mask بولی.
-    کاندیدها می‌توانند قبل یا بعد از تاریخ هدف باشند
-    (به‌جز خودِ کندل مرجع در صورت EXCLUDE_EXACT_TARGET_CANDLE).
+    کاندیدها فقط در بازه‌ی [MIN_CANDIDATE_DATE, MAX_CANDIDATE_DATE) هستند.
     """
     candidates_all = []
     sym_floor_global = pd.Timestamp(MIN_CANDIDATE_DATE)
+    sym_cap_global   = pd.Timestamp(MAX_CANDIDATE_DATE)
 
     for sym in SYMBOLS:
         df = dfs.get(sym)
@@ -191,6 +194,9 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
 
         # ─── کف تاریخی ───
         mask = df.index >= sym_floor_global
+
+        # ─── سقف تاریخی: هیچ کاندیدی بعد از MAX_CANDIDATE_DATE نباشد ───
+        mask = mask & (df.index < sym_cap_global)
 
         # ─── آیا فقط قبل از تاریخ هدف؟ ───
         if not ALLOW_CANDIDATES_AFTER_TARGET:
@@ -332,7 +338,8 @@ def build_report(results, target_info, baseline):
     lines.append(f"🔎 الگوهای مشابه: <code>{n}</code> | "
                  f"Lookahead: <code>{LOOKAHEAD}w</code> | "
                  f"ورود: <code>{ENTRY_MODE}</code>")
-    lines.append(f"🗓 کف تاریخی: <code>{MIN_CANDIDATE_DATE}</code>")
+    lines.append(f"🗓 بازه‌ی کاندیدها: "
+                 f"<code>{MIN_CANDIDATE_DATE} → {MAX_CANDIDATE_DATE}</code>")
     lines.append("")
 
     lines.append(f"💰 <b>سوددهی کلی:</b> <code>{win_pct:.1f}٪</code> "
@@ -388,8 +395,20 @@ def main():
     log("=" * 60)
     log(f"🚀 مشابه‌یابی: هدف=هفتگی {TARGET_SYMBOL} | ورود={ENTRY_MODE}")
     log(f"   کف تاریخی کاندیدها: {MIN_CANDIDATE_DATE}")
+    log(f"   سقف تاریخی کاندیدها: {MAX_CANDIDATE_DATE}")
     log(f"   کاندیدهای بعد از هدف: {ALLOW_CANDIDATES_AFTER_TARGET}")
     log("=" * 60)
+
+    # اعتبارسنجی بازه
+    if pd.Timestamp(TARGET_DATE) >= pd.Timestamp(MAX_CANDIDATE_DATE):
+        raise RuntimeError(
+            f"⛔ TARGET_DATE ({TARGET_DATE}) باید قبل از "
+            f"MAX_CANDIDATE_DATE ({MAX_CANDIDATE_DATE}) باشد."
+        )
+    if pd.Timestamp(MIN_CANDIDATE_DATE) >= pd.Timestamp(MAX_CANDIDATE_DATE):
+        raise RuntimeError(
+            "⛔ MIN_CANDIDATE_DATE باید قبل از MAX_CANDIDATE_DATE باشد."
+        )
 
     # ۱) کندل مرجع هفتگی
     df_target = fetch_weekly(TARGET_SYMBOL)
