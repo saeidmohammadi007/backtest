@@ -49,9 +49,6 @@ EXCLUDE_SAME_MONTH_AS_TARGET = True
 # ② از بین کاندیدها، فقط یک کندل در هر ماه تقویمی نگه داشته شود
 ONE_CANDIDATE_PER_MONTH = True
 
-# ③ حداکثر تعداد کاندید از هر سال تقویمی (None = بدون محدودیت)
-MAX_CANDIDATES_PER_YEAR = 3
-
 
 # ==================== توابع ====================
 def fetch_weekly(symbol):
@@ -228,8 +225,7 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
     candidates_all.sort(key=lambda x: x["dist"])
 
     unique_candidates = []
-    seen_months = set()     # ② (year, month)
-    year_counts = {}        # ③ شمارش کاندید به تفکیک سال
+    seen_months = set()   # ② (year, month) برای جلوگیری از تکرار ماه
 
     for c_ in candidates_all:
         # ─── ② فقط یک کاندید در هر ماه تقویمی ───
@@ -238,13 +234,6 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
             if ym in seen_months:
                 continue
         # ────────────────────────────────────────
-
-        # ─── ③ سقف تعداد کاندید در هر سال ───
-        if MAX_CANDIDATES_PER_YEAR is not None:
-            yr = c_["date"].year
-            if year_counts.get(yr, 0) >= MAX_CANDIDATES_PER_YEAR:
-                continue
-        # ─────────────────────────────────────
 
         # حذف هم‌نمادهای نزدیک زمانی
         too_close = False
@@ -260,22 +249,12 @@ def find_similar_weekly(target_feat, target_date_naive, dfs):
         unique_candidates.append(c_)
         if ONE_CANDIDATE_PER_MONTH:
             seen_months.add((c_["date"].year, c_["date"].month))
-        if MAX_CANDIDATES_PER_YEAR is not None:
-            yr = c_["date"].year
-            year_counts[yr] = year_counts.get(yr, 0) + 1
 
         if len(unique_candidates) >= TOTAL_TOP:
             break
 
-    # لاگ توزیع سالانه
-    ydist = {}
-    for u in unique_candidates:
-        yr = u["date"].year
-        ydist[yr] = ydist.get(yr, 0) + 1
-    log(f"🧹 بعد از فیلترها: {len(unique_candidates)} الگو")
-    log(f"📅 توزیع سالانه: " +
-        ", ".join(f"{y}:{n}" for y, n in sorted(ydist.items())))
-
+    log(f"🧹 بعد از حذف هم‌نمادهای نزدیک و هم‌ماه‌ها: "
+        f"{len(unique_candidates)} الگو")
     return unique_candidates
 
 
