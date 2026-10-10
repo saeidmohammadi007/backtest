@@ -16,13 +16,13 @@ def log(m):
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-TARGET_SYMBOL = "DOGE-USD"
-TARGET_DATE   = "2025-07-04"
+TARGET_SYMBOL = "DOGE-USD"      # نماد هدف
+TARGET_DATE   = "2025-07-04"    # تاریخ کندل مرجع (روزانه)
 
-TARGET_INTERVAL = "1d"
-SEARCH_PERIOD_HOURLY = "730d"
+TARGET_INTERVAL = "1d"          # کندل مرجع
+SEARCH_PERIOD_HOURLY = "730d"   # بازه‌ی داده‌ی ۱ ساعته (حداکثر Yahoo)
 
-PATTERN_LEN = 1
+PATTERN_LEN = 1                 # تعداد کندل الگو (روی کندل مرجع)
 
 SYMBOLS = [
     "LUMIA-USD", "API3-USD", "FIL-USD",
@@ -30,24 +30,12 @@ SYMBOLS = [
     "BLESS-USD", "ROSE-USD", "LINEA-USD", "JTO-USD",
 ]
 
-LOOKAHEAD    = 100
+LOOKAHEAD    = 100              # تعداد کندل ۴ساعته‌ی بعدی
 K_PER_SYMBOL = 20
 TOTAL_TOP    = 100
 
-TARGETS       = [20.0, 50.0]
-DD_THRESHOLDS = [2.0]           # فقط ۲٪ (با اهرم ۳۰x)
-
-# ---------- مدیریت سرمایه ----------
-MARGIN_PCT   = 1.0
-LEVERAGE     = 30.0
-NOTIONAL_PCT = MARGIN_PCT * LEVERAGE
-
-# ---------- کارمزد و هزینه‌ها ----------
-FEE_OPEN_PCT  = 0.05           # کارمزد ورود (٪ نهional)
-FEE_CLOSE_PCT = 0.05           # کارمزد خروج (٪ نهional)
-FUNDING_PER_8H = 0.01          # funding تقریبی هر ۸ ساعت (٪ نهional)
-# توجه: funding بسته به جهت پوزیشن می‌تونه مثبت یا منفی باشه؛
-# محافظه‌کارانه همیشه مثبت (هزینه) فرض می‌کنیم.
+TARGETS = [20.0, 50.0]          # اهداف سود (درصد)
+DD_THRESHOLDS = [2.0, 3.0]      # آستانه‌ی ریزش (درصد)
 
 
 # ==================== توابع ====================
@@ -114,19 +102,6 @@ def pattern_features(end_idx, o, h, l, c, pattern_len=PATTERN_LEN):
     return np.concatenate(feats)
 
 
-def cost_on_capital(bars_held):
-    """
-    هزینه‌ی کل روی سرمایه (٪):
-    کارمزد ورود + خروج + funding برای مدت نگه‌داری.
-    هر کندل ۴ساعته = ۴ ساعت → هر ۸ ساعت یک دوره funding.
-    """
-    fee_open  = NOTIONAL_PCT * (FEE_OPEN_PCT  / 100.0)   # ٪ سرمایه
-    fee_close = NOTIONAL_PCT * (FEE_CLOSE_PCT / 100.0)  # ٪ سرمایه
-    periods_8h = bars_held * 4.0 / 8.0
-    funding   = NOTIONAL_PCT * (FUNDING_PER_8H / 100.0) * periods_8h
-    return fee_open + fee_close + funding
-
-
 def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
     if entry_idx + 1 + lookahead > n:
         return None
@@ -141,52 +116,22 @@ def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
     final_price = float(fut_c[-1])
     total_ret   = (final_price - entry_price) / entry_price * 100.0
 
-    out = {'ret': total_ret, 'entry': entry_price, 'final': final_price}
+    out = {'ret': total_ret}
 
-    for D in DD_THRESHOLDS:
-        sl_price = entry_price * (1 - D / 100.0)
-        for T in TARGETS:
-            tp_price = entry_price * (1 + T / 100.0)
-            outcome = None
-            exit_ret = 0.0
-            bars_held = 0
-            for k in range(len(fut_c)):
-                lo = float(fut_l[k]); hi = float(fut_h[k])
-                if lo <= sl_price:
-                    outcome = 'sl'; exit_ret = -D; bars_held = k + 1; break
-                if hi >= tp_price:
-                    outcome = 'tp'; exit_ret = +T; bars_held = k + 1; break
-            if outcome is None:
-                outcome = 'time'
-                bars_held = len(fut_c)
-                exit_ret = (float(fut_c[-1]) - entry_price) / entry_price * 100.0
-
-            # بازده ناخالص روی سرمایه
-            gross_cap_ret = NOTIONAL_PCT * (exit_ret / 100.0)
-            # هزینه روی سرمایه
-            cost = cost_on_capital(bars_held)
-            # بازده خالص
-            net_cap_ret = gross_cap_ret - cost
-
-            # لیکویید تقریبی؟ (وقتی قیمت ~3.3٪ بره خلاف پوزیشن)
-            liq_pct = 100.0 / LEVERAGE
-            liq_hit = False
-            if liq_pct <= D:
-                # SL قبل از لیکویید می‌خوره، پس لیکویید نمی‌شیم
-                pass
-            else:
-                # اگه SL بالاتر از لیکویید باشه، قبل از SL لیکویید می‌شیم
-                # اما اینجا D≤2 و liq=3.33 پس همیشه SL اوله
-                pass
-
-            out[f'{D}_{T}'] = {
-                'outcome':     outcome,
-                'exit_ret':    exit_ret,
-                'gross':       gross_cap_ret,
-                'cost':        cost,
-                'cap_ret':     net_cap_ret,
-                'bars_held':   bars_held,
-            }
+    # برای هر هدف: آیا رسید؟ و اگر رسید، ریزش قبل از رسیدن چقدر بود؟
+    for T in TARGETS:
+        target_price = entry_price * (1 + T / 100.0)
+        hits = np.where(fut_h >= target_price)[0]
+        if len(hits) == 0:
+            out[f'hit_{T}'] = False
+            for D in DD_THRESHOLDS:
+                out[f'hit_{T}_dd{D}'] = False
+        else:
+            out[f'hit_{T}'] = True
+            k = int(hits[0])
+            dd = (float(np.min(fut_l[:k + 1])) - entry_price) / entry_price * 100.0
+            for D in DD_THRESHOLDS:
+                out[f'hit_{T}_dd{D}'] = dd >= -D
     return out
 
 
@@ -301,52 +246,23 @@ def build_report(results):
 
     wins = sum(1 for r in results if r['ret'] > 0)
     win_pct = wins / n * 100.0
-    liq_pct = 100.0 / LEVERAGE
-
-    # هزینه‌ی تیپیک (برای ۵۰ کندل نگه‌داری)
-    sample_cost = cost_on_capital(50)
 
     lines = []
     lines.append(f"🕯 <b>الگوی {TARGET_SYMBOL} | {TARGET_DATE}</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append(f"🔎 تعداد الگوهای مشابه: <code>{n}</code>")
-    lines.append(f"💰 سوددهی کلی (قیمتی): "
-                 f"<code>{win_pct:.1f}٪</code> ({wins} از {n})")
     lines.append("")
-    lines.append(f"⚙️ <b>مارجین {MARGIN_PCT:.0f}٪ × اهرم "
-                 f"{LEVERAGE:.0f}x  (نotional ≈ "
-                 f"{NOTIONAL_PCT:.0f}٪ سرمایه)</b>")
-    lines.append(f"💸 کارمزد رفت+برگشت: "
-                 f"<code>−{NOTIONAL_PCT*(FEE_OPEN_PCT+FEE_CLOSE_PCT)/100:.1f}٪</code>"
-                 f" سرمایه در هر معامله")
-    lines.append(f"💸 هزینه‌ی ۵۰ کندل (~۸ روز): "
-                 f"<code>−{sample_cost:.1f}٪</code> سرمایه")
-    lines.append(f"⚠️ لیکویید تقریبی: حدود <code>−{liq_pct:.1f}٪</code>")
+    lines.append(f"💰 <b>سوددهی کلی:</b> <code>{win_pct:.1f}٪</code> "
+                 f"({wins} از {n})")
     lines.append("")
 
     for D in DD_THRESHOLDS:
-        warn = " ⚠️ خیلی نزدیک به لیکویید" if D >= liq_pct * 0.9 else ""
-        lines.append(f"📉 <b>SL = {D:.0f}٪</b>{warn}")
+        lines.append(f"📉 <b>ریزش زیر {D:.0f}٪</b>")
         for T in TARGETS:
-            tp = sum(1 for r in results if r[f'{D}_{T}']['outcome'] == 'tp')
-            sl = sum(1 for r in results if r[f'{D}_{T}']['outcome'] == 'sl')
-            tm = n - tp - sl
-            cap_rets = [r[f'{D}_{T}']['cap_ret'] for r in results]
-            ev = float(np.mean(cap_rets))
-            total = float(np.sum(cap_rets))
-
-            tp_pct = tp / n * 100.0
-            sl_pct = sl / n * 100.0
-            tm_pct = tm / n * 100.0
-
-            lines.append(f"🎯 هدف +{T:.0f}٪  →  "
-                         f"<code>{tp_pct:.1f}٪</code> TP  |  "
-                         f"<code>{sl_pct:.1f}٪</code> SL  |  "
-                         f"<code>{tm_pct:.1f}٪</code> زمانی")
-            lines.append(f"   ├ میانگین هر معامله (خالص): "
-                         f"<code>{ev:+.2f}٪</code> سرمایه")
-            lines.append(f"   └ بازده کل ({n} معامله): "
-                         f"<code>{total:+.0f}٪</code> سرمایه")
+            cnt = sum(1 for r in results if r[f'hit_{T}_dd{D}'])
+            pct = cnt / n * 100.0
+            lines.append(f"├ رسیدن به هدف +{T:.0f}٪: "
+                         f"<code>{pct:.1f}٪</code> ({cnt} از {n})")
         lines.append("")
 
     return "\n".join(lines).rstrip()
@@ -356,10 +272,9 @@ def build_report(results):
 def main():
     log("=" * 60)
     log(f"🚀 مشابه‌یابی الگوی {TARGET_SYMBOL}")
-    log(f"   مارجین {MARGIN_PCT}٪ × اهرم {LEVERAGE}x  "
-        f"(نotional ≈ {NOTIONAL_PCT}٪ سرمایه)")
     log("=" * 60)
 
+    # ۱) داده‌ی روزانه‌ی نماد هدف
     df_target_daily = fetch(TARGET_SYMBOL, TARGET_INTERVAL, "10y")
     if df_target_daily is None or len(df_target_daily) < PATTERN_LEN:
         raise RuntimeError(f"داده‌ی روزانه‌ی {TARGET_SYMBOL} موجود نیست.")
@@ -387,6 +302,7 @@ def main():
     if getattr(target_date_naive, 'tz', None) is not None:
         target_date_naive = target_date_naive.tz_localize(None)
 
+    # ۲) داده‌ی ۴ساعته‌ی همه‌ی نمادها
     dfs = {}
     for sym in SYMBOLS:
         df = fetch_4h(sym)
@@ -399,12 +315,14 @@ def main():
     if not dfs:
         raise RuntimeError("هیچ نمادی داده‌ی ۴ساعته ندارد.")
 
+    # ۳) جستجوی الگوهای مشابه
     log("\n🔍 جستجوی الگوهای ۴ساعته‌ی مشابه...")
     candidates = find_similar_candles(target_feat, target_date_naive, dfs)
     if not candidates:
         raise RuntimeError("هیچ الگوی مشابهی یافت نشد.")
     log(f"🏆 {len(candidates)} الگوی مشابه برتر.")
 
+    # ۴) تحلیل فوروارد
     results = []
     for c_ in candidates:
         sym = c_['symbol']; df = dfs[sym]
@@ -422,6 +340,7 @@ def main():
     if not results:
         raise RuntimeError("نتیجه‌ای محاسبه نشد.")
 
+    # ۵) گزارش
     report = build_report(results)
     plain = (report.replace("<b>", "").replace("</b>", "")
                    .replace("<code>", "").replace("</code>", ""))
