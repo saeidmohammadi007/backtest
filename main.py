@@ -1,5 +1,5 @@
 # main.py
-# تحلیل MAE/MFE + SL/TP + شمارش دقیق رسیدن به سطوح سود
+# نسخهٔ دقیق: تفکیک کامل TP hit، SL hit، timeout، و سطوح سود
 
 import yfinance as yf
 import pandas as pd
@@ -16,10 +16,7 @@ FORWARD_BARS = 100
 
 CCI_LENGTH = 20
 CCI_SMA_LENGTH = 14
-
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
+MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 
 TOP_10_SYMBOLS = [
     'BTC-USD', 'ETH-USD', 'BNB-USD', 'XRP-USD', 'SOL-USD',
@@ -27,9 +24,8 @@ TOP_10_SYMBOLS = [
 ]
 
 SL_LEVELS = [3, 5, 8, 10, 15, 20, 25, 30]
-TP_LEVELS = [5, 10, 15, 20, 30, 40, 50, 75]
+TP_LEVELS = [5, 10, 15, 20, 30, 40, 50, 65, 75, 100]
 
-# سطوح سود برای شمارش دقیق
 PROFIT_THRESHOLDS = [10, 15, 20, 30, 40, 50, 65, 75, 100, 150, 200, 300]
 
 # ==================== تلگرام ====================
@@ -38,382 +34,370 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("  [هشدار] توکن یا chat_id تلگرام تنظیم نشده است.")
+        print("  [هشدار] توکن یا chat_id تنظیم نشده.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
-        response = requests.post(url, json=payload, timeout=30)
-        response.raise_for_status()
-        print("  پیام تلگرام با موفقیت ارسال شد.")
+        r = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "Markdown"
+        }, timeout=30)
+        r.raise_for_status()
+        print("  پیام تلگرام ارسال شد.")
     except Exception as e:
-        print(f"  خطا در ارسال پیام تلگرام: {e}")
+        print(f"  خطا در ارسال: {e}")
 
-# ==================== دریافت داده ====================
-def fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LIMIT):
-    print(f"  در حال دریافت داده {symbol}...")
+# ==================== داده ====================
+def fetch_ohlcv(symbol):
+    print(f"  دریافت {symbol}...")
     try:
-        df = yf.download(symbol, period='max', interval=timeframe,
+        df = yf.download(symbol, period='max', interval=TIMEFRAME,
                          progress=False, auto_adjust=True, threads=False)
         if df is None or df.empty:
             return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df.columns = [c.lower() for c in df.columns]
-        cols = ['open', 'high', 'low', 'close', 'volume']
-        df = df[[c for c in cols if c in df.columns]]
-        return df.dropna().tail(limit)
+        df = df[['open', 'high', 'low', 'close', 'volume']]
+        return df.dropna().tail(LIMIT)
     except Exception as e:
-        print(f"  خطا در دریافت {symbol}: {e}")
+        print(f"  خطا: {e}")
         return None
 
-# ==================== محاسبهٔ اندیکاتورها ====================
-def calculate_cci(high, low, close, length=20):
+# ==================== اندیکاتورها ====================
+def calc_cci(high, low, close, length=20):
     tp = (high + low + close) / 3
     sma_tp = tp.rolling(window=length).mean()
-
-    def mean_deviation(x):
-        return np.mean(np.abs(x - x.mean()))
-
-    mad = tp.rolling(window=length).apply(mean_deviation, raw=True)
+    mad = tp.rolling(window=length).apply(
+        lambda x: np.mean(np.abs(x - x.mean())), raw=True)
     return (tp - sma_tp) / (0.015 * mad)
 
-def calculate_macd(close, fast=12, slow=26, signal=9):
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line
+def calc_macd(close, fast=12, slow=26, signal=9):
+    ema_f = close.ewm(span=fast, adjust=False).mean()
+    ema_s = close.ewm(span=slow, adjust=False).mean()
+    macd = ema_f - ema_s
+    return macd, macd.ewm(span=signal, adjust=False).mean()
 
 def compute_indicators(df):
     df = df.copy()
-    df['cci'] = calculate_cci(df['high'], df['low'], df['close'], length=CCI_LENGTH)
+    df['cci'] = calc_cci(df['high'], df['low'], df['close'], CCI_LENGTH)
     df['cci_sma'] = df['cci'].rolling(window=CCI_SMA_LENGTH).mean()
-    macd_line, signal_line = calculate_macd(df['close'], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
-    df['macd'] = macd_line
-    df['macd_signal'] = signal_line
+    m, s = calc_macd(df['close'], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    df['macd'], df['macd_signal'] = m, s
     return df
 
-# ==================== تشخیص سیگنال ====================
-def detect_crossovers(df):
+# ==================== سیگنال ====================
+def detect_signals(df):
     df = df.copy()
-
-    df['cci_cross_up'] = (
-        (df['cci'] > df['cci_sma']) &
-        (df['cci'].shift(1) <= df['cci_sma'].shift(1))
-    )
-    df['macd_cross_up'] = (
-        (df['macd'] > df['macd_signal']) &
-        (df['macd'].shift(1) <= df['macd_signal'].shift(1))
-    )
+    df['cci_cross'] = (df['cci'] > df['cci_sma']) & (df['cci'].shift(1) <= df['cci_sma'].shift(1))
+    df['macd_cross'] = (df['macd'] > df['macd_signal']) & (df['macd'].shift(1) <= df['macd_signal'].shift(1))
 
     signal = pd.Series(False, index=df.index)
-    for idx in df.index[df['cci_cross_up']]:
+    for idx in df.index[df['cci_cross']]:
         pos = df.index.get_loc(idx)
-        end_pos = min(pos + 3, len(df))
-        if df['macd_cross_up'].iloc[pos:end_pos].any():
+        end = min(pos + 3, len(df))
+        if df['macd_cross'].iloc[pos:end].any():
             signal.iloc[pos] = True
-
     df['signal'] = signal
     return df
 
-# ==================== تحلیل MAE/MFE ====================
-def analyze_mae_mfe(df, symbol):
-    results = []
+# ==================== تحلیل ====================
+def analyze_all_signals(df, symbol):
+    """
+    برای هر سیگنال سه چیز محاسبه می‌کند:
+    1. سقف سود (بر اساس high) و کندل آن
+    2. کف (بر اساس low) و کندل آن
+    3. MAE قبل از سقف (بر اساس low)
+    """
+    out = []
     for idx in df.index[df['signal']]:
         pos = df.index.get_loc(idx)
         if pos + FORWARD_BARS >= len(df):
             continue
 
         entry = df['close'].iloc[pos]
-        future = df['close'].iloc[pos+1 : pos+1+FORWARD_BARS]
-        future_high = df['high'].iloc[pos+1 : pos+1+FORWARD_BARS]
-        future_low = df['low'].iloc[pos+1 : pos+1+FORWARD_BARS]
+        f_close = df['close'].iloc[pos+1 : pos+1+FORWARD_BARS]
+        f_high = df['high'].iloc[pos+1 : pos+1+FORWARD_BARS]
+        f_low = df['low'].iloc[pos+1 : pos+1+FORWARD_BARS]
 
-        if len(future) < FORWARD_BARS:
+        if len(f_close) < FORWARD_BARS:
             continue
 
-        # سقف بر اساس high کندل‌ها (چون TP روی high می‌خورد)
-        peak_pos = int(future_high.values.argmax())
-        peak_price = future_high.iloc[peak_pos]
-        peak_return = (peak_price / entry - 1) * 100
+        # سقف (بر اساس high)
+        peak_pos = int(f_high.values.argmax())
+        peak_ret = (f_high.iloc[peak_pos] / entry - 1) * 100
         peak_candle = peak_pos + 1
 
-        # کف بر اساس low
-        trough_pos = int(future_low.values.argmin())
-        trough_return = (future_low.iloc[trough_pos] / entry - 1) * 100
+        # کف کل (بر اساس low)
+        trough_pos = int(f_low.values.argmin())
+        trough_ret = (f_low.iloc[trough_pos] / entry - 1) * 100
         trough_candle = trough_pos + 1
 
-        # MAE قبل از سقف بر اساس low
-        pre_peak_low = future_low.iloc[:peak_pos + 1]
-        pre_peak_min = (pre_peak_low.min() / entry - 1) * 100
+        # MAE قبل از سقف
+        pre_peak_low = f_low.iloc[:peak_pos + 1]
+        mae_before_peak = (pre_peak_low.min() / entry - 1) * 100
 
-        final_return = (future.iloc[-1] / entry - 1) * 100
+        # بازدهی کندل ۱۰۰
+        final_ret = (f_close.iloc[-1] / entry - 1) * 100
 
-        results.append({
+        out.append({
             'symbol': symbol,
             'signal_date': idx,
-            'entry_price': entry,
-            'final_return_pct': final_return,
-            'peak_return_pct': peak_return,
+            'entry': entry,
+            'final_return': final_ret,
+            'peak_return': peak_ret,
             'peak_candle': peak_candle,
-            'trough_return_pct': trough_return,
+            'trough_return': trough_ret,
             'trough_candle': trough_candle,
-            'mae_before_peak_pct': pre_peak_min,
-            'win_at_100': final_return > 0
+            'mae_before_peak': mae_before_peak,
+            'win_at_100': final_ret > 0
         })
+    return out
 
-    return results
-
-# ==================== شبیه‌سازی SL/TP ====================
-def simulate_sl_tp(df, symbol, sl_levels, tp_levels):
-    results = []
+def simulate_sl_tp(symbol, df, sl, tp):
+    """
+    برای یک ترکیب SL/TP خاص، همهٔ سیگنال‌ها را شبیه‌سازی می‌کند.
+    خروجی: لیستی از dict شامل exit_reason و return_pct
+    """
+    out = []
     for idx in df.index[df['signal']]:
         pos = df.index.get_loc(idx)
         if pos + FORWARD_BARS >= len(df):
             continue
 
         entry = df['close'].iloc[pos]
-        future = df['close'].iloc[pos+1 : pos+1+FORWARD_BARS]
-        future_high = df['high'].iloc[pos+1 : pos+1+FORWARD_BARS]
-        future_low = df['low'].iloc[pos+1 : pos+1+FORWARD_BARS]
-        if len(future) < FORWARD_BARS:
+        f_high = df['high'].iloc[pos+1 : pos+1+FORWARD_BARS]
+        f_low = df['low'].iloc[pos+1 : pos+1+FORWARD_BARS]
+        f_close = df['close'].iloc[pos+1 : pos+1+FORWARD_BARS]
+
+        if len(f_close) < FORWARD_BARS:
             continue
 
-        for sl in sl_levels:
-            for tp in tp_levels:
-                sl_price = entry * (1 - sl / 100)
-                tp_price = entry * (1 + tp / 100)
+        sl_price = entry * (1 - sl / 100)
+        tp_price = entry * (1 + tp / 100)
 
-                exit_reason = 'timeout'
-                exit_return = (future.iloc[-1] / entry - 1) * 100
+        exit_reason = 'timeout'
+        exit_return = (f_close.iloc[-1] / entry - 1) * 100
 
-                for j in range(len(future)):
-                    hit_sl = future_low.iloc[j] <= sl_price
-                    hit_tp = future_high.iloc[j] >= tp_price
+        for j in range(len(f_close)):
+            hit_sl = f_low.iloc[j] <= sl_price
+            hit_tp = f_high.iloc[j] >= tp_price
 
-                    if hit_sl and hit_tp:
-                        exit_reason = 'sl_first'
-                        exit_return = -sl
-                        break
-                    elif hit_sl:
-                        exit_reason = 'sl'
-                        exit_return = -sl
-                        break
-                    elif hit_tp:
-                        exit_reason = 'tp'
-                        exit_return = tp
-                        break
+            if hit_sl and hit_tp:
+                # محافظه‌کارانه: SL اول
+                exit_reason = 'sl'
+                exit_return = -sl
+                break
+            elif hit_sl:
+                exit_reason = 'sl'
+                exit_return = -sl
+                break
+            elif hit_tp:
+                exit_reason = 'tp'
+                exit_return = tp
+                break
 
-                results.append({
-                    'symbol': symbol,
-                    'sl': sl,
-                    'tp': tp,
-                    'exit_reason': exit_reason,
-                    'return_pct': exit_return
-                })
+        out.append({
+            'symbol': symbol,
+            'exit_reason': exit_reason,
+            'return_pct': exit_return
+        })
+    return out
 
-    return results
-
-# ==================== شمارش دقیق سطوح سود ====================
-def count_profit_levels(results_df, thresholds):
-    """
-    برای هر سطح سود، دقیقاً می‌شمارد چند سیگنال به آن سطح یا بالاتر رسیدند.
-    بر اساس high کندل‌ها (چون TP روی high می‌خورد).
-    """
-    total = len(results_df)
-    lines = []
-    lines.append("")
-    lines.append("🎯 *شمارش دقیق: چند سیگنال به هر سطح سود رسیدند؟*")
-    lines.append("")
-    lines.append(f"کل سیگنال‌ها: {total}")
-    lines.append("")
-    lines.append("| سطح سود | تعداد | درصد |")
-    lines.append("|---------|-------|-------|")
-
-    for th in thresholds:
-        count = (results_df['peak_return_pct'] >= th).sum()
-        pct = count / total * 100 if total > 0 else 0
-        lines.append(f"| +{th}% | {count} | {pct:.1f}% |")
-
-    return "\n".join(lines)
-
-# ==================== گزارش MAE/MFE ====================
-def build_mae_mfe_report(results_df):
-    lines = []
-    lines.append("📉 *تحلیل MAE/MFE*")
-    lines.append("")
-
+# ==================== گزارش‌ها ====================
+def report_basic(results_df):
     total = len(results_df)
     winners = results_df[results_df['win_at_100']]
     losers = results_df[~results_df['win_at_100']]
 
-    lines.append(f"کل سیگنال‌ها: {total}")
-    lines.append(f"برنده (کندل ۱۰۰): {len(winners)} ({len(winners)/total*100:.1f}%)")
-    lines.append(f"بازنده: {len(losers)} ({len(losers)/total*100:.1f}%)")
-    lines.append("")
-
-    lines.append("✅ *برنده‌ها چه ریزشی قبل از سقف داشتند؟*")
-    w = winners['mae_before_peak_pct']
-    lines.append(f"میانگین MAE: {w.mean():.2f}%")
-    lines.append(f"میانه MAE: {w.median():.2f}%")
-
-    for level in [3, 5, 8, 10, 15, 20]:
-        pct = (w >= -level).mean() * 100
-        lines.append(f"  بدون ریزش بیش از -{level}%: {pct:.1f}%")
-    lines.append("")
-
-    lines.append("🎯 *برنده‌ها چه سودی رسیدند؟*")
-    p = winners['peak_return_pct']
-    lines.append(f"میانگین سقف: {p.mean():.2f}%")
-    lines.append(f"میانه سقف: {p.median():.2f}%")
-    lines.append("")
-
-    lines.append("❌ *بازنده‌ها چه سودی قبل از ریزش داشتند؟*")
-    l = losers['peak_return_pct']
-    lines.append(f"میانگین سقف: {l.mean():.2f}%")
-    lines.append(f"میانه سقف: {l.median():.2f}%")
-
+    lines = [
+        "📉 *آمار پایه*",
+        "",
+        f"کل سیگنال: {total}",
+        f"سودآور در کندل ۱۰۰: {len(winners)} ({len(winners)/total*100:.1f}%)",
+        f"زیان‌ده در کندل ۱۰۰: {len(losers)} ({len(losers)/total*100:.1f}%)",
+        "",
+        f"میانگین سقف (high): {results_df['peak_return'].mean():.2f}%",
+        f"میانه سقف: {results_df['peak_return'].median():.2f}%",
+        f"میانگین MAE: {results_df['mae_before_peak'].mean():.2f}%",
+        f"میانه MAE: {results_df['mae_before_peak'].median():.2f}%",
+    ]
     return "\n".join(lines)
 
-# ==================== تحلیل تلاقی ریزش × سقف ====================
-def build_cross_analysis(results_df):
-    lines = []
-    lines.append("")
-    lines.append("🔬 *تحلیل تلاقی ریزش و سقف (فقط برنده‌ها):*")
-    lines.append("")
-
-    winners = results_df[results_df['win_at_100']].copy()
-    if len(winners) == 0:
-        return ""
-
-    def bucket(mae):
-        if mae >= -3:
-            return "۰ تا -۳٪"
-        elif mae >= -5:
-            return "-۳٪ تا -۵٪"
-        elif mae >= -10:
-            return "-۵٪ تا -۱۰٪"
-        elif mae >= -15:
-            return "-۱۰٪ تا -۱۵٪"
-        else:
-            return "بیش از -۱۵٪"
-
-    winners['mae_bucket'] = winners['mae_before_peak_pct'].apply(bucket)
-
-    order = ["۰ تا -۳٪", "-۳٪ تا -۵٪", "-۵٪ تا -۱۰٪", "-۱۰٪ تا -۱۵٪", "بیش از -۱۵٪"]
-
-    for b in order:
-        subset = winners[winners['mae_bucket'] == b]
-        if len(subset) == 0:
-            continue
-
-        p = subset['peak_return_pct']
-        p25 = p.quantile(0.25)
-        p50 = p.quantile(0.50)
-        p75 = p.quantile(0.75)
-        p90 = p.quantile(0.90)
-
-        lines.append(f"▫️ *ریزش {b}*  ({len(subset)} سیگنال)")
-        lines.append(f"   کمترین: +{p.min():.1f}%")
-        lines.append(f"   ۲۵٪ بالای: +{p25:.1f}%")
-        lines.append(f"   میانه: +{p50:.1f}%")
-        lines.append(f"   ۷۵٪ بالای: +{p75:.1f}%")
-        lines.append(f"   ۹۰٪ بالای: +{p90:.1f}%")
-        lines.append(f"   بیشترین: +{p.max():.1f}%")
-        lines.append("")
-
+def report_profit_levels(results_df, thresholds):
+    """
+    تعداد دقیق سیگنال‌هایی که سقفشان به هر سطح رسیده.
+    این عدد دقیق است — نه تخمین.
+    """
+    total = len(results_df)
+    lines = [
+        "",
+        "🎯 *تعداد دقیق سیگنال‌هایی که به هر سطح سود رسیدند*",
+        "",
+        "| سطح | تعداد | درصد |",
+        "|------|-------|------|",
+    ]
+    for th in thresholds:
+        c = (results_df['peak_return'] >= th).sum()
+        lines.append(f"| +{th}% | {c} | {c/total*100:.1f}% |")
     return "\n".join(lines)
 
-# ==================== گزارش SL/TP ====================
-def build_sl_tp_report(sim_df):
-    lines = []
+def report_sl_tp_matrix(all_sim_df):
+    """
+    ماتریس کامل SL/TP با تفکیک دقیق:
+    - tp_hits: تعداد واقعی رسیدن به TP
+    - sl_hits: تعداد خوردن SL
+    - timeout: تعداد رسیدن به پایان ۱۰۰ کندل
+    - avg: بازدهی میانگین
+    """
+    lines = [
+        "",
+        "🧮 *ماتریس کامل SL/TP (تفکیک دقیق)*",
+        "",
+        "برای هر ترکیب:",
+        "- `TP` = تعداد واقعی که به هدف سود رسید",
+        "- `SL` = تعداد که حد ضرر خورد",
+        "- `TO` = تعداد که در کندل ۱۰۰ بسته شد",
+        "- `میانگین` = بازدهی میانگین",
+        "",
+    ]
+
+    grouped = all_sim_df.groupby(['sl', 'tp'])
+
+    # ساخت جدول
+    rows = []
+    for (sl, tp), group in grouped:
+        total = len(group)
+        tp_hits = (group['exit_reason'] == 'tp').sum()
+        sl_hits = (group['exit_reason'] == 'sl').sum()
+        to_hits = (group['exit_reason'] == 'timeout').sum()
+        avg = group['return_pct'].mean()
+        profitable = (group['return_pct'] > 0).sum()
+        rows.append({
+            'SL': sl, 'TP': tp, 'total': total,
+            'tp_hits': tp_hits, 'sl_hits': sl_hits, 'to_hits': to_hits,
+            'avg': avg, 'profitable': profitable,
+            'profitable_pct': profitable / total * 100
+        })
+
+    df = pd.DataFrame(rows).sort_values('avg', ascending=False)
+
+    lines.append("*۱۰ ترکیب با بالاترین میانگین بازدهی:*")
     lines.append("")
-    lines.append("🧮 *۱۰ ترکیب برتر SL/TP:*")
-    lines.append("")
-
-    grouped = sim_df.groupby(['sl', 'tp']).agg(
-        avg_return=('return_pct', 'mean'),
-        win_rate=('return_pct', lambda x: (x > 0).mean() * 100),
-        count=('return_pct', 'size')
-    ).reset_index()
-
-    grouped = grouped.sort_values('avg_return', ascending=False)
-    top = grouped.head(10)
-
-    for _, row in top.iterrows():
+    lines.append("`SL/TP | TP-hit | SL-hit | TO | میانگین | سودآور`")
+    for _, r in df.head(10).iterrows():
         lines.append(
-            f"SL=-{int(row['sl'])}% / TP=+{int(row['tp'])}% | "
-            f"بازدهی: {row['avg_return']:.2f}% | "
-            f"برد: {row['win_rate']:.1f}%"
+            f"`-{int(r['SL'])}/+{int(r['TP'])}` | "
+            f"{int(r['tp_hits'])} | {int(r['sl_hits'])} | {int(r['to_hits'])} | "
+            f"{r['avg']:.2f}% | {r['profitable_pct']:.1f}%"
+        )
+
+    lines.append("")
+    lines.append("*۵ ترکیب با بالاترین نرخ TP-hit واقعی:*")
+    lines.append("")
+    df_by_tp = df.sort_values('tp_hits', ascending=False)
+    for _, r in df_by_tp.head(5).iterrows():
+        lines.append(
+            f"`-{int(r['SL'])}/+{int(r['TP'])}` → "
+            f"{int(r['tp_hits'])} TP | {int(r['sl_hits'])} SL | "
+            f"میانگین {r['avg']:.2f}%"
         )
 
     return "\n".join(lines)
 
-# ==================== اجرای اصلی ====================
+def report_mae_groups(results_df):
+    lines = [
+        "",
+        "🔬 *تفکیک بر اساس میزان ریزش (MAE قبل از سقف)*",
+        "",
+        "فقط سیگنال‌هایی که در کندل ۱۰۰ سودآور بودند.",
+        "",
+    ]
+
+    winners = results_df[results_df['win_at_100']].copy()
+    if len(winners) == 0:
+        return "\n".join(lines)
+
+    def bucket(x):
+        if x >= -3: return "۰ تا -۳٪"
+        if x >= -5: return "-۳٪ تا -۵٪"
+        if x >= -10: return "-۵٪ تا -۱۰٪"
+        if x >= -15: return "-۱۰٪ تا -۱۵٪"
+        return "بیش از -۱۵٪"
+
+    winners['bucket'] = winners['mae_before_peak'].apply(bucket)
+    order = ["۰ تا -۳٪", "-۳٪ تا -۵٪", "-۵٪ تا -۱۰٪", "-۱۰٪ تا -۱۵٪", "بیش از -۱۵٪"]
+
+    for b in order:
+        sub = winners[winners['bucket'] == b]
+        if len(sub) == 0:
+            continue
+        p = sub['peak_return']
+        lines.append(f"▫️ *{b}* — {len(sub)} سیگنال")
+        lines.append(f"   کمترین: +{p.min():.1f}%")
+        lines.append(f"   میانه: +{p.median():.1f}%")
+        lines.append(f"   بیشترین: +{p.max():.1f}%")
+        lines.append(f"   تعداد بالای +65٪: {(p >= 65).sum()}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+# ==================== اجرا ====================
 def main():
-    all_mae_mfe = []
-    all_sim = []
+    all_signals = []
+    all_sims = []
 
     print("=" * 60)
-    print("تحلیل MAE/MFE و شمارش دقیق سطوح سود")
+    print("شروع تحلیل")
     print("=" * 60)
 
     for symbol in TOP_10_SYMBOLS:
-        print(f"\nپردازش {symbol}...")
-
         df = fetch_ohlcv(symbol)
         if df is None or len(df) < 200:
             continue
-
         df = compute_indicators(df)
-        df = detect_crossovers(df)
+        df = detect_signals(df)
 
-        signal_count = int(df['signal'].sum())
-        print(f"  تعداد سیگنال: {signal_count}")
-        if signal_count == 0:
+        sig_count = int(df['signal'].sum())
+        print(f"  {symbol}: {sig_count} سیگنال")
+        if sig_count == 0:
             continue
 
-        mae_mfe = analyze_mae_mfe(df, symbol)
-        all_mae_mfe.extend(mae_mfe)
+        # تحلیل پایه
+        all_signals.extend(analyze_all_signals(df, symbol))
 
-        sim = simulate_sl_tp(df, symbol, SL_LEVELS, TP_LEVELS)
-        all_sim.extend(sim)
+        # شبیه‌سازی همهٔ ترکیب‌های SL/TP
+        for sl in SL_LEVELS:
+            for tp in TP_LEVELS:
+                all_sims.extend(simulate_sl_tp(symbol, df, sl, tp))
 
         time.sleep(1)
 
-    mae_df = pd.DataFrame(all_mae_mfe)
-    sim_df = pd.DataFrame(all_sim)
+    signals_df = pd.DataFrame(all_signals)
+    sims_df = pd.DataFrame(all_sims)
 
-    if len(mae_df) == 0:
+    if len(signals_df) == 0:
         send_telegram_message("هیچ سیگنالی یافت نشد.")
         return
 
-    # چاپ در لاگ
-    print("\n" + "=" * 60)
-    print("شمارش دقیق سطوح سود:")
-    print("=" * 60)
-    total = len(mae_df)
-    for th in PROFIT_THRESHOLDS:
-        count = (mae_df['peak_return_pct'] >= th).sum()
-        pct = count / total * 100
-        print(f"  +{th}%: {count} سیگنال ({pct:.1f}%)")
+    print(f"\nمجموع سیگنال‌ها: {len(signals_df)}")
 
-    # ==================== ساخت پیام ====================
-    message = "📊 *تحلیل جامع CCI > SMA + MACD*\n"
-    message += f"🗓 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-    message += build_mae_mfe_report(mae_df)
-    message += count_profit_levels(mae_df, PROFIT_THRESHOLDS)
-    message += build_cross_analysis(mae_df)
-    message += build_sl_tp_report(sim_df)
+    # ==================== پیام تلگرام ====================
+    msg = "📊 *تحلیل دقیق CCI>SMA + MACD*\n"
+    msg += f"🗓 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+    msg += report_basic(signals_df)
+    msg += report_profit_levels(signals_df, PROFIT_THRESHOLDS)
+    msg += report_mae_groups(signals_df)
+    msg += report_sl_tp_matrix(sims_df)
 
-    send_telegram_message(message)
+    send_telegram_message(msg)
 
     # ذخیره CSV
-    mae_df.to_csv('mae_mfe.csv', index=False)
-    sim_df.to_csv('sl_tp_simulation.csv', index=False)
+    signals_df.to_csv('signals.csv', index=False)
+    sims_df.to_csv('sims.csv', index=False)
 
-    print("\nپایان اجرا.")
+    print("\nپایان.")
 
 if __name__ == '__main__':
     main()
