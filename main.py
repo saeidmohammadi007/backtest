@@ -1,5 +1,5 @@
 # main.py
-# تحلیل MAE/MFE + شبیه‌سازی SL/TP + تحلیل تلاقی ریزش × سقف
+# تحلیل MAE/MFE + شبیه‌سازی SL/TP + تحلیل تلاقی ریزش × سقف با چندک‌ها
 
 import yfinance as yf
 import pandas as pd
@@ -143,6 +143,7 @@ def analyze_mae_mfe(df, symbol):
 
         results.append({
             'symbol': symbol,
+            'signal_date': idx,
             'entry_price': entry,
             'final_return_pct': final_return,
             'peak_return_pct': peak_return,
@@ -234,10 +235,6 @@ def build_mae_mfe_report(results_df):
     p = winners['peak_return_pct']
     lines.append(f"میانگین سقف: {p.mean():.2f}%")
     lines.append(f"میانه سقف: {p.median():.2f}%")
-
-    for level in [5, 10, 15, 20, 30, 50]:
-        pct = (p >= level).mean() * 100
-        lines.append(f"  سقف بالای +{level}%: {pct:.1f}%")
     lines.append("")
 
     lines.append("❌ *بازنده‌ها چه سودی قبل از ریزش داشتند؟*")
@@ -245,15 +242,10 @@ def build_mae_mfe_report(results_df):
     lines.append(f"میانگین سقف بازنده‌ها: {l.mean():.2f}%")
     lines.append(f"میانه سقف بازنده‌ها: {l.median():.2f}%")
 
-    for level in [3, 5, 10, 15, 20]:
-        pct = (l >= level).mean() * 100
-        lines.append(f"  سقف بالای +{level}%: {pct:.1f}%")
-
     return "\n".join(lines)
 
-# ==================== تحلیل تلاقی ریزش × سقف ====================
+# ==================== تحلیل تلاقی ریزش × سقف با چندک‌ها ====================
 def build_cross_analysis(results_df):
-    """تحلیل تلاقی: ریزش × سقف (برای برنده‌ها)"""
     lines = []
     lines.append("")
     lines.append("🔬 *تحلیل تلاقی ریزش و سقف (فقط برنده‌ها):*")
@@ -280,24 +272,28 @@ def build_cross_analysis(results_df):
 
     order = ["۰ تا -۳٪", "-۳٪ تا -۵٪", "-۵٪ تا -۱۰٪", "-۱۰٪ تا -۱۵٪", "بیش از -۱۵٪"]
 
-    lines.append("*📊 برنده‌ها بر اساس میزان ریزش:*")
-    lines.append("")
     for b in order:
         subset = winners[winners['mae_bucket'] == b]
         if len(subset) == 0:
             continue
-        lines.append(
-            f"▫️ ریزش {b}\n"
-            f"   تعداد: {len(subset)} | "
-            f"میانگین سقف: +{subset['peak_return_pct'].mean():.1f}% | "
-            f"میانه سقف: +{subset['peak_return_pct'].median():.1f}%"
-        )
 
-    lines.append("")
+        p = subset['peak_return_pct']
+        p25 = p.quantile(0.25)
+        p50 = p.quantile(0.50)
+        p75 = p.quantile(0.75)
+        p90 = p.quantile(0.90)
+        p100 = p.max()
+        p0 = p.min()
 
-    # میانگین کلی سقف برنده‌ها برای مقایسه
-    lines.append(f"میانگین کلی سقف همهٔ برنده‌ها: +{winners['peak_return_pct'].mean():.1f}%")
-    lines.append(f"میانه کلی سقف همهٔ برنده‌ها: +{winners['peak_return_pct'].median():.1f}%")
+        lines.append(f"▫️ *ریزش {b}*  ({len(subset)} سیگنال)")
+        lines.append(f"   کمترین سقف: +{p0:.1f}%")
+        lines.append(f"   ۲۵٪ بالای: +{p25:.1f}%")
+        lines.append(f"   میانه (۵۰٪): +{p50:.1f}%")
+        lines.append(f"   ۷۵٪ بالای: +{p75:.1f}%")
+        lines.append(f"   ۹۰٪ بالای: +{p90:.1f}%")
+        lines.append(f"   بیشترین سقف: +{p100:.1f}%")
+        lines.append(f"   میانگین: +{p.mean():.1f}%")
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -325,16 +321,6 @@ def build_sl_tp_report(sim_df):
             f"برد: {row['win_rate']:.1f}%"
         )
 
-    lines.append("")
-    lines.append("*بدترین ۵ ترکیب:*")
-    bottom = grouped.tail(5)
-    for _, row in bottom.iterrows():
-        lines.append(
-            f"SL=-{int(row['sl'])}% / TP=+{int(row['tp'])}% | "
-            f"بازدهی: {row['avg_return']:.2f}% | "
-            f"برد: {row['win_rate']:.1f}%"
-        )
-
     return "\n".join(lines)
 
 # ==================== اجرای اصلی ====================
@@ -343,7 +329,7 @@ def main():
     all_sim = []
 
     print("=" * 60)
-    print("تحلیل MAE/MFE و شبیه‌سازی SL/TP")
+    print("تحلیل MAE/MFE و شبیه‌سازی SL/TP با چندک‌ها")
     print("=" * 60)
 
     for symbol in TOP_10_SYMBOLS:
@@ -376,18 +362,21 @@ def main():
         send_telegram_message("هیچ سیگنالی یافت نشد.")
         return
 
+    # نمایش در لاگ
     print("\n" + "=" * 60)
-    print("تحلیل MAE/MFE")
+    print("سیگنال‌های برنده با ریزش زیر -۳٪ (مرتب‌شده بر اساس سقف):")
     print("=" * 60)
-    print(mae_df[['symbol', 'peak_return_pct', 'mae_before_peak_pct',
-                  'peak_candle', 'final_return_pct', 'win_at_100']].round(2).to_string(index=False))
+    low_dd = mae_df[(mae_df['win_at_100']) & (mae_df['mae_before_peak_pct'] >= -3)]
+    low_dd_sorted = low_dd.sort_values('peak_return_pct', ascending=False)
+    if len(low_dd_sorted) > 0:
+        print(low_dd_sorted[['symbol', 'signal_date', 'peak_return_pct',
+                              'peak_candle', 'mae_before_peak_pct']].round(2).to_string(index=False))
 
-    # ==================== ساخت پیام تلگرام ====================
+    # ==================== ساخت پیام ====================
     message = "📊 *تحلیل MAE/MFE و SL/TP*\n"
     message += f"🗓 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
     message += build_mae_mfe_report(mae_df)
     message += build_cross_analysis(mae_df)
-    message += "\n"
     message += build_sl_tp_report(sim_df)
 
     send_telegram_message(message)
