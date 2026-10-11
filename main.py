@@ -1,6 +1,6 @@
 # main.py
-# تحلیل سیگنال CCI SMA 14 + MACD با دادهٔ یاهو فایننس
-# همراه با ثبت موقعیت (کندل) سقف و کف در ۱۰۰ کندل بعدی
+# تحلیل سیگنال CCI(20) + SMA(14) + MACD با دادهٔ یاهو فایننس
+# شرط: CCI رو به بالا SMA را کراس کند، سپس در ۰ تا ۲ کندل بعد MACD کراس طلایی بزند
 
 import yfinance as yf
 import pandas as pd
@@ -94,21 +94,28 @@ def compute_indicators(df):
 
 # ==================== تشخیص کراس‌ها ====================
 def detect_crossovers(df):
+    """
+    شرط ۱: CCI(20) رو به بالا SMA(14) را کراس کند
+           (قبلاً CCI ≤ SMA بود، الان CCI > SMA شده)
+    شرط ۲: در بازهٔ ۰ تا ۲ کندل بعد، MACD کراس طلایی بزند
+    """
     df = df.copy()
 
-    df['cci_sma_cross_up'] = (
-        (df['cci_sma'] > df['cci']) &
-        (df['cci_sma'].shift(1) <= df['cci'].shift(1))
+    # ✅ اصلاح شد: CCI از SMA رو به بالا
+    df['cci_cross_up'] = (
+        (df['cci'] > df['cci_sma']) &
+        (df['cci'].shift(1) <= df['cci_sma'].shift(1))
     )
+
     df['macd_cross_up'] = (
         (df['macd'] > df['macd_signal']) &
         (df['macd'].shift(1) <= df['macd_signal'].shift(1))
     )
 
     signal = pd.Series(False, index=df.index)
-    for idx in df.index[df['cci_sma_cross_up']]:
+    for idx in df.index[df['cci_cross_up']]:
         pos = df.index.get_loc(idx)
-        end_pos = min(pos + 3, len(df))
+        end_pos = min(pos + 3, len(df))  # همان کندل + ۲ کندل بعد
         if df['macd_cross_up'].iloc[pos:end_pos].any():
             signal.iloc[pos] = True
 
@@ -138,6 +145,8 @@ def analyze_forward_returns(df, symbol):
         peak_candle = int(future_prices.values.argmax() + 1)
         trough_candle = int(future_prices.values.argmin() + 1)
 
+        ret_10 = (future_prices.iloc[9] / entry_price - 1) * 100 if len(future_prices) >= 10 else np.nan
+        ret_20 = (future_prices.iloc[19] / entry_price - 1) * 100 if len(future_prices) >= 20 else np.nan
         ret_30 = (future_prices.iloc[29] / entry_price - 1) * 100 if len(future_prices) >= 30 else np.nan
         ret_50 = (future_prices.iloc[49] / entry_price - 1) * 100 if len(future_prices) >= 50 else np.nan
         ret_60 = (future_prices.iloc[59] / entry_price - 1) * 100 if len(future_prices) >= 60 else np.nan
@@ -151,6 +160,8 @@ def analyze_forward_returns(df, symbol):
             'max_return_candle': peak_candle,
             'min_return_pct': min_return,
             'min_return_candle': trough_candle,
+            'ret_10_pct': ret_10,
+            'ret_20_pct': ret_20,
             'ret_30_pct': ret_30,
             'ret_50_pct': ret_50,
             'ret_60_pct': ret_60,
@@ -162,7 +173,7 @@ def analyze_forward_returns(df, symbol):
 # ==================== فرمت‌دهی پیام تلگرام ====================
 def format_telegram_message(summary_df, results_df):
     lines = []
-    lines.append("📊 *نتایج تحلیل CCI SMA 14 + MACD (یاهو فایننس)*")
+    lines.append("📊 *نتایج تحلیل CCI > SMA + MACD (یاهو فایننس)*")
     lines.append(f"🗓 تاریخ اجرا: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     lines.append("")
 
@@ -196,6 +207,8 @@ def format_telegram_message(summary_df, results_df):
 
         lines.append("")
         lines.append("📊 *مقایسهٔ بازدهی در زمان‌های مختلف:*")
+        lines.append(f"کندل ۱۰: {results_df['ret_10_pct'].mean():.2f}%")
+        lines.append(f"کندل ۲۰: {results_df['ret_20_pct'].mean():.2f}%")
         lines.append(f"کندل ۳۰: {results_df['ret_30_pct'].mean():.2f}%")
         lines.append(f"کندل ۵۰: {results_df['ret_50_pct'].mean():.2f}%")
         lines.append(f"کندل ۶۰: {results_df['ret_60_pct'].mean():.2f}%")
@@ -220,7 +233,7 @@ def main():
     summary = []
 
     print("=" * 60)
-    print("تحلیل سیگنال: کراس SMA(14) روی CCI(20) + کراس MACD")
+    print("تحلیل سیگنال: کراس CCI(20) از SMA(14) رو به بالا + کراس MACD")
     print(f"منبع داده: یاهو فایننس  |  کندل‌های آینده: {FORWARD_BARS}")
     print("=" * 60)
 
@@ -276,6 +289,8 @@ def main():
         print(f"  میانگین کندل کف:  {results_df['min_return_candle'].mean():.1f}")
         print(f"  سقف قبل از کندل ۵۰: {(results_df['max_return_candle'] <= 50).mean() * 100:.1f}٪")
         print("\n  مقایسهٔ بازدهی میانگین در زمان‌های مختلف:")
+        print(f"    کندل ۱۰:  {results_df['ret_10_pct'].mean():.2f}%")
+        print(f"    کندل ۲۰:  {results_df['ret_20_pct'].mean():.2f}%")
         print(f"    کندل ۳۰:  {results_df['ret_30_pct'].mean():.2f}%")
         print(f"    کندل ۵۰:  {results_df['ret_50_pct'].mean():.2f}%")
         print(f"    کندل ۶۰:  {results_df['ret_60_pct'].mean():.2f}%")
