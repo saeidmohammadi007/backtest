@@ -2,6 +2,7 @@ import os
 import time
 import numpy as np
 import pandas as pd
+import yfinance as yf
 import requests
 from datetime import datetime, timedelta
 
@@ -9,11 +10,25 @@ from datetime import datetime, timedelta
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOL = "BTCUSDT"
-TARGET_DATE = "2024-11-05"
+# ۱۰ ارز برتر (به ترتیب حجم بازار)
+COINS = [
+    {"symbol": "BTC-USD",  "name": "Bitcoin"},
+    {"symbol": "ETH-USD",  "name": "Ethereum"},
+    {"symbol": "BNB-USD",  "name": "Binance Coin"},
+    {"symbol": "SOL-USD",  "name": "Solana"},
+    {"symbol": "XRP-USD",  "name": "XRP"},
+    {"symbol": "ADA-USD",  "name": "Cardano"},
+    {"symbol": "DOGE-USD", "name": "Dogecoin"},
+    {"symbol": "TRX-USD",  "name": "TRON"},
+    {"symbol": "DOT-USD",  "name": "Polkadot"},
+    {"symbol": "MATIC-USD","name": "Polygon"},
+]
+
 DATA_START_DATE = "2019-01-01"
-MIN_GAP_DAYS = 30
-TOP_N_SIMILAR = 20
+DATA_END_DATE   = "2024-12-31"   # ✅ فقط تا ۲۰۲۴
+TARGET_DATE     = "2024-11-05"
+MIN_GAP_DAYS    = 30
+TOP_N_SIMILAR   = 15
 FUTURE_HORIZONS = [1, 3, 7, 14, 30, 60, 90]
 
 SCENARIOS = [
@@ -23,79 +38,51 @@ SCENARIOS = [
     {"name": "ریزش زیر ۲٪ و رشد بالای ۲۰٪", "drawdown": -0.02, "up_side": 0.20},
     {"name": "ریزش زیر ۳٪ و رشد بالای ۱۰٪", "drawdown": -0.03, "up_side": 0.10},
     {"name": "ریزش زیر ۳٪ و رشد بالای ۲۰٪", "drawdown": -0.03, "up_side": 0.20},
-    {"name": "ریزش زیر ۴٪ و رشد بالای ۲۵٪", "drawdown": -0.04, "up_side": 0.25},
-    {"name": "ریزش زیر ۵٪ و رشد بالای ۱۵٪", "drawdown": -0.05, "up_side": 0.15},
 ]
 
 
-# ================== دریافت داده از Binance ==================
-def fetch_data(symbol="BTCUSDT", start_date="2019-01-01", end_date=None):
-    """دریافت داده روزانه از Binance API"""
-    if end_date is None:
-        end_date = datetime.now().strftime("%Y-%m-%d")
+# ================== دریافت داده از Yahoo Finance ==================
+def fetch_data(symbol, start_date, end_date):
+    """دریافت داده روزانه از Yahoo Finance"""
+    print(f"  دریافت {symbol} از {start_date} تا {end_date}...")
+    df = yf.download(symbol, start=start_date, end=end_date,
+                     interval="1d", auto_adjust=False, progress=False)
 
-    start_ts = int(datetime.strptime(start_date, "%Y-%m-%d").timestamp() * 1000)
-    end_ts = int(datetime.strptime(end_date, "%Y-%m-%d").timestamp() * 1000)
+    if df.empty:
+        print(f"  ⚠️ داده‌ای برای {symbol} دریافت نشد.")
+        return None
 
-    url = "https://api.binance.com/api/v3/klines"
-    all_data = []
-    current = start_ts
+    # اگر ستون‌ها MultiIndex هستند، تخت کن
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-    print(f"دریافت داده {symbol} از {start_date} تا {end_date} از Binance...")
+    df.columns = [c.lower() for c in df.columns]
+    if "adj close" in df.columns:
+        df = df.drop(columns=["adj close"])
 
-    while current < end_ts:
-        params = {
-            "symbol": symbol,
-            "interval": "1d",
-            "startTime": current,
-            "limit": 1000,
-        }
-        try:
-            r = requests.get(url, params=params, timeout=30)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            print(f"خطا در دریافت داده: {e}")
-            break
-
-        if not data:
-            break
-        all_data.extend(data)
-        current = data[-1][0] + 86400000
-        time.sleep(0.2)
-
-    if not all_data:
-        raise ValueError("داده‌ای از Binance دریافت نشد.")
-
-    df = pd.DataFrame(all_data, columns=[
-        "date", "open", "high", "low", "close", "volume",
-        "close_time", "qav", "trades", "tbbav", "tbqav", "ignore",
-    ])
-    df["date"] = pd.to_datetime(df["date"], unit="ms")
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
-
-    df = df[["date", "open", "high", "low", "close", "volume"]]
+    df = df.reset_index()
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
     df = df.sort_values("date").reset_index(drop=True)
 
-    print(f"تعداد کل کندل‌ها از Binance: {len(df)}")
+    # فقط ۲۰۱۹ تا ۲۰۲۴
+    df = df[(df["date"] >= pd.Timestamp(start_date)) &
+            (df["date"] <= pd.Timestamp(end_date))].reset_index(drop=True)
+
+    print(f"  ✅ {len(df)} کندل دریافت شد.")
     return df
 
 
 # ================== محاسبه فاصله اقلیدسی ==================
 def candle_vector(row):
-    """تبدیل کندل به بردار نرمال‌شده"""
     o, h, l, c = row["open"], row["high"], row["low"], row["close"]
     body = c - o
-    range_total = h - l
-    if range_total == 0:
-        range_total = 1e-9
+    rng = h - l if (h - l) != 0 else 1e-9
     return np.array([
-        (o - c) / range_total,
-        (h - c) / range_total,
-        (l - c) / range_total,
-        body / range_total,
-        (c - o) / o,
+        (o - c) / rng,
+        (h - c) / rng,
+        (l - c) / rng,
+        body / rng,
+        (c - o) / o if o != 0 else 0,
     ])
 
 
@@ -103,14 +90,11 @@ def euclidean_distance(v1, v2):
     return float(np.sqrt(np.sum((v1 - v2) ** 2)))
 
 
-def find_similar_candles(df, target_date, top_n=20, min_gap_days=30):
-    """پیدا کردن کندل‌های مشابه با فاصله اقلیدسی"""
+def find_similar_candles(df, target_date, top_n=15, min_gap_days=30):
     df = df.copy()
-    df["date"] = pd.to_datetime(df["date"])
-
     target_row = df[df["date"] == pd.Timestamp(target_date)]
     if target_row.empty:
-        raise ValueError(f"کندل تاریخ {target_date} پیدا نشد.")
+        return None, None
 
     target_vec = candle_vector(target_row.iloc[0])
     target_price = float(target_row.iloc[0]["close"])
@@ -119,28 +103,22 @@ def find_similar_candles(df, target_date, top_n=20, min_gap_days=30):
     for _, row in df.iterrows():
         if row["date"] == pd.Timestamp(target_date):
             continue
-        time_gap = abs((row["date"] - pd.Timestamp(target_date)).days)
-        if time_gap < min_gap_days:
+        gap = abs((row["date"] - pd.Timestamp(target_date)).days)
+        if gap < min_gap_days:
             continue
-
         vec = candle_vector(row)
-        dist = euclidean_distance(target_vec, vec)
         distances.append({
             "date": row["date"],
-            "distance": dist,
-            "open": row["open"],
-            "high": row["high"],
-            "low": row["low"],
+            "distance": euclidean_distance(target_vec, vec),
             "close": row["close"],
         })
 
     if not distances:
-        raise ValueError("هیچ کندل مشابهی پیدا نشد.")
+        return None, None
 
     dist_df = pd.DataFrame(distances).sort_values("distance").reset_index(drop=True)
 
-    selected = []
-    last_date = None
+    selected, last_date = [], None
     for _, row in dist_df.iterrows():
         if last_date is None or abs((row["date"] - last_date).days) >= min_gap_days:
             selected.append(row)
@@ -148,173 +126,155 @@ def find_similar_candles(df, target_date, top_n=20, min_gap_days=30):
         if len(selected) >= top_n:
             break
 
-    result_df = pd.DataFrame(selected)
-    print(f"تعداد کندل مشابه پیدا شده: {len(result_df)}")
-    print(f"میانگین فاصله اقلیدسی: {result_df['distance'].mean():.4f}")
-
-    return result_df, target_price
+    return pd.DataFrame(selected), target_price
 
 
 # ================== محاسبه احتمالات ==================
 def calculate_outcomes(df, similar_df):
-    """محاسبه درصد احتمال تحقق سناریوها"""
     results = []
-
     for horizon in FUTURE_HORIZONS:
         outcomes = []
         for _, row in similar_df.iterrows():
-            match_date = row["date"]
-            future = df[df["date"] > match_date].head(horizon)
+            future = df[df["date"] > row["date"]].head(horizon)
             if len(future) < horizon:
                 continue
-
-            entry_price = row["close"]
-            future_close = future["close"].values
-
-            max_drawdown = (future_close.min() - entry_price) / entry_price
-            max_runup = (future_close.max() - entry_price) / entry_price
-
+            entry = row["close"]
+            fc = future["close"].values
             outcomes.append({
-                "max_drawdown": max_drawdown,
-                "max_runup": max_runup,
-                "final_return": (future_close[-1] - entry_price) / entry_price,
+                "max_drawdown": (fc.min() - entry) / entry,
+                "max_runup": (fc.max() - entry) / entry,
+                "final_return": (fc[-1] - entry) / entry,
             })
-
         if not outcomes:
             continue
-
         out_df = pd.DataFrame(outcomes)
-        total = len(out_df)
-
-        horizon_result = {
+        res = {
             "horizon": horizon,
-            "total_cases": total,
-            "avg_max_drawdown": out_df["max_drawdown"].mean(),
-            "avg_max_runup": out_df["max_runup"].mean(),
-            "avg_final_return": out_df["final_return"].mean(),
+            "total": len(out_df),
+            "avg_dd": out_df["max_drawdown"].mean(),
+            "avg_up": out_df["max_runup"].mean(),
         }
-
-        for scenario in SCENARIOS:
-            dd = scenario["drawdown"]
-            up = scenario["up_side"]
-            condition = (out_df["max_drawdown"] >= dd) & (out_df["max_runup"] >= up)
-            horizon_result[f"prob_{scenario['name']}"] = condition.mean() * 100
-
-        results.append(horizon_result)
-
+        for s in SCENARIOS:
+            cond = (out_df["max_drawdown"] >= s["drawdown"]) & \
+                   (out_df["max_runup"] >= s["up_side"])
+            res[f"p_{s['name']}"] = cond.mean() * 100
+        results.append(res)
     return pd.DataFrame(results)
 
 
-# ================== ارسال به تلگرام ==================
-def send_telegram_message(token, chat_id, message):
+# ================== ارسال تلگرام ==================
+def send_telegram(token, chat_id, text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
     try:
-        response = requests.post(url, json=payload, timeout=30)
-        response.raise_for_status()
-        print("پیام با موفقیت به تلگرام ارسال شد.")
+        r = requests.post(url, json={
+            "chat_id": chat_id, "text": text,
+            "parse_mode": "HTML", "disable_web_page_preview": True,
+        }, timeout=30)
+        r.raise_for_status()
         return True
     except Exception as e:
-        print(f"خطا در ارسال پیام تلگرام: {e}")
+        print(f"خطا تلگرام: {e}")
         return False
 
 
-def send_long_message(token, chat_id, message, max_len=3800):
-    """ارسال پیام طولانی به صورت تکه‌تکه"""
-    if len(message) <= max_len:
-        return send_telegram_message(token, chat_id, message)
-
-    parts = []
-    current = ""
-    for line in message.split("\n"):
-        if len(current) + len(line) + 1 > max_len:
-            parts.append(current)
-            current = line
+def send_long(token, chat_id, text, max_len=3800):
+    if len(text) <= max_len:
+        return send_telegram(token, chat_id, text)
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > max_len:
+            parts.append(cur)
+            cur = line
         else:
-            current = current + "\n" + line if current else line
-    if current:
-        parts.append(current)
-
-    for i, part in enumerate(parts):
-        header = f"<b>({i+1}/{len(parts)})</b>\n" if len(parts) > 1 else ""
-        send_telegram_message(token, chat_id, header + part)
+            cur = cur + "\n" + line if cur else line
+    if cur:
+        parts.append(cur)
+    for i, p in enumerate(parts):
+        hdr = f"<b>({i+1}/{len(parts)})</b>\n" if len(parts) > 1 else ""
+        send_telegram(token, chat_id, hdr + p)
         time.sleep(1)
 
 
-def format_results(similar_df, target_price, prob_df):
+# ================== قالب‌بندی نتایج ==================
+def format_coin_result(coin_name, symbol, similar_df, target_price, prob_df):
     lines = []
-    lines.append("📊 <b>تحلیل شباهت کندل BTC/USDT</b>")
-    lines.append(f"📅 کندل مرجع: <b>{TARGET_DATE}</b>")
-    lines.append(f"💰 قیمت بسته شدن: <b>${target_price:,.2f}</b>")
+    lines.append(f"🪙 <b>{coin_name} ({symbol})</b>")
+    lines.append(f"💰 قیمت بسته شدن مرجع: <b>${target_price:,.4f}</b>")
     lines.append(f"🔍 تعداد کندل مشابه: <b>{len(similar_df)}</b>")
-    lines.append(f"📏 میانگین فاصله اقلیدسی: <b>{similar_df['distance'].mean():.4f}</b>")
-    lines.append(f"📚 منبع داده: <b>Binance (از ۲۰۱۹)</b>")
+    lines.append(f"📏 میانگین فاصله: <b>{similar_df['distance'].mean():.4f}</b>")
     lines.append("")
 
-    lines.append("🕯️ <b>۱۰ کندل مشابه اول:</b>")
-    for _, row in similar_df.head(10).iterrows():
-        date_str = row["date"].strftime("%Y-%m-%d")
-        lines.append(
-            f"  • {date_str} | فاصله: {row['distance']:.3f} | بسته: ${row['close']:,.0f}"
-        )
-    lines.append("")
-
-    lines.append("📈 <b>نتایج آماری بر اساس کندل‌های مشابه:</b>")
+    lines.append("🕯️ <b>۵ کندل مشابه اول:</b>")
+    for _, r in similar_df.head(5).iterrows():
+        lines.append(f"  • {r['date'].strftime('%Y-%m-%d')} | فاصله: {r['distance']:.3f} | بسته: ${r['close']:,.2f}")
     lines.append("")
 
     for _, row in prob_df.iterrows():
-        horizon = int(row["horizon"])
-        total = int(row["total_cases"])
-        avg_dd = row["avg_max_drawdown"] * 100
-        avg_up = row["avg_max_runup"] * 100
-
-        lines.append(f"⏳ <b>{horizon} روز آینده</b> (نمونه: {total})")
-        lines.append(f"  📉 میانگین حداکثر افت: {avg_dd:.1f}%")
-        lines.append(f"  📈 میانگین حداکثر رشد: {avg_up:.1f}%")
-        for scenario in SCENARIOS:
-            prob = row.get(f"prob_{scenario['name']}", 0)
-            lines.append(f"  ▪️ {scenario['name']}: <b>{prob:.1f}%</b>")
+        h = int(row["horizon"])
+        lines.append(f"⏳ <b>{h} روز آینده</b> (نمونه: {int(row['total'])})")
+        lines.append(f"  📉 میانگین حداکثر افت: {row['avg_dd']*100:.1f}%")
+        lines.append(f"  📈 میانگین حداکثر رشد: {row['avg_up']*100:.1f}%")
+        for s in SCENARIOS:
+            p = row.get(f"p_{s['name']}", 0)
+            lines.append(f"  ▪️ {s['name']}: <b>{p:.1f}%</b>")
         lines.append("")
-
-    lines.append("⚠️ <i>این تحلیل صرفاً جنبه آماری دارد و توصیه سرمایه‌گذاری نیست.</i>")
     return "\n".join(lines)
 
 
 # ================== اجرای اصلی ==================
 def main():
-    print("شروع تحلیل...")
+    print("🚀 شروع تحلیل...")
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("خطا: TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID باید تنظیم شوند.")
+        print("❌ توکن یا chat_id تنظیم نشده.")
         return
 
-    end_date = (datetime.strptime(TARGET_DATE, "%Y-%m-%d") + timedelta(days=120)).strftime("%Y-%m-%d")
-    today = datetime.now().strftime("%Y-%m-%d")
-    if end_date > today:
-        end_date = today
-
-    df = fetch_data(SYMBOL, DATA_START_DATE, end_date)
-
-    df = df[df["date"] >= pd.Timestamp(DATA_START_DATE)].reset_index(drop=True)
-    print(f"داده‌های فیلترشده: {len(df)} کندل")
-
-    similar_df, target_price = find_similar_candles(
-        df, TARGET_DATE, top_n=TOP_N_SIMILAR, min_gap_days=MIN_GAP_DAYS
+    all_messages = []
+    header = (
+        f"📊 <b>تحلیل شباهت کندل ۱۰ ارز برتر</b>\n"
+        f"📅 تاریخ مرجع: <b>{TARGET_DATE}</b>\n"
+        f"📚 منبع: <b>Yahoo Finance (2019-2024)</b>\n"
+        f"{'─' * 30}\n"
     )
 
-    prob_df = calculate_outcomes(df, similar_df)
+    for coin in COINS:
+        print(f"\n🔍 تحلیل {coin['name']} ({coin['symbol']})...")
+        df = fetch_data(coin["symbol"], DATA_START_DATE, DATA_END_DATE)
 
-    message = format_results(similar_df, target_price, prob_df)
+        if df is None or len(df) < 200:
+            print(f"  ⚠️ داده کافی برای {coin['name']} نیست. رد شد.")
+            continue
+
+        similar_df, target_price = find_similar_candles(
+            df, TARGET_DATE, top_n=TOP_N_SIMILAR, min_gap_days=MIN_GAP_DAYS
+        )
+
+        if similar_df is None or similar_df.empty:
+            print(f"  ⚠️ کندل مشابهی برای {coin['name']} پیدا نشد.")
+            continue
+
+        prob_df = calculate_outcomes(df, similar_df)
+        if prob_df.empty:
+            continue
+
+        msg = format_coin_result(coin["name"], coin["symbol"],
+                                 similar_df, target_price, prob_df)
+        all_messages.append(msg)
+        time.sleep(0.5)
+
+    if not all_messages:
+        print("❌ هیچ نتیجه‌ای برای ارسال نیست.")
+        return
+
+    full_msg = header + "\n\n".join(all_messages)
+    full_msg += "\n\n⚠️ <i>این تحلیل صرفاً آماری است و توصیه سرمایه‌گذاری نیست.</i>"
+
     print("\n" + "=" * 50)
-    print(message)
+    print(full_msg[:2000] + "...\n(متن کامل ارسال شد)")
     print("=" * 50)
 
-    send_long_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, message)
+    send_long(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, full_msg)
+    print("✅ ارسال به تلگرام انجام شد.")
 
 
 if __name__ == "__main__":
