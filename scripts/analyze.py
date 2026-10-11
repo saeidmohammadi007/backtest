@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ۱۰ ارز برتر (به ترتیب حجم بازار)
+# ۱۰ ارز برتر
 COINS = [
     {"symbol": "BTC-USD",  "name": "Bitcoin"},
     {"symbol": "ETH-USD",  "name": "Ethereum"},
@@ -21,11 +21,11 @@ COINS = [
     {"symbol": "DOGE-USD", "name": "Dogecoin"},
     {"symbol": "TRX-USD",  "name": "TRON"},
     {"symbol": "DOT-USD",  "name": "Polkadot"},
-    {"symbol": "MATIC-USD","name": "Polygon"},
+    {"symbol": "MATIC-USD", "name": "Polygon"},
 ]
 
 DATA_START_DATE = "2019-01-01"
-DATA_END_DATE   = "2024-12-31"   # ✅ فقط تا ۲۰۲۴
+DATA_END_DATE   = "2024-12-31"
 TARGET_DATE     = "2024-11-05"
 MIN_GAP_DAYS    = 30
 TOP_N_SIMILAR   = 15
@@ -56,11 +56,22 @@ def fetch_data(symbol, start_date, end_date):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    df.columns = [c.lower() for c in df.columns]
+    # lowercase کردن ستون‌ها (قبل از reset_index)
+    df.columns = [str(c).lower() for c in df.columns]
+
+    # reset_index و سپس lowercase کردن دوباره (چون index قبلاً Date بوده)
+    df = df.reset_index()
+    df.columns = [str(c).lower() for c in df.columns]
+
+    # حذف adj close اگر هست
     if "adj close" in df.columns:
         df = df.drop(columns=["adj close"])
 
-    df = df.reset_index()
+    # بررسی وجود ستون date
+    if "date" not in df.columns:
+        print(f"  ❌ ستون date پیدا نشد. ستون‌ها: {list(df.columns)}")
+        return None
+
     df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
     df = df.sort_values("date").reset_index(drop=True)
 
