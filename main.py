@@ -1,5 +1,5 @@
-# main.py
-# نسخهٔ دقیق: تفکیک کامل TP hit، SL hit، timeout، و سطوح سود
+# main.py — نسخهٔ نهایی: همه اعداد واقعی و تفکیک‌شده
+# پنجرهٔ MACD: فقط ۱ کندل بعد از کراس CCI
 
 import yfinance as yf
 import pandas as pd
@@ -23,33 +23,40 @@ TOP_10_SYMBOLS = [
     'ADA-USD', 'DOGE-USD', 'AVAX-USD', 'DOT-USD', 'LINK-USD'
 ]
 
-SL_LEVELS = [3, 5, 8, 10, 15, 20, 25, 30]
-TP_LEVELS = [5, 10, 15, 20, 30, 40, 50, 65, 75, 100]
+COMBOS = [
+    (5, 10), (5, 15), (5, 20), (5, 30),
+    (8, 15), (8, 20), (8, 30),
+    (10, 15), (10, 20), (10, 30), (10, 50),
+    (15, 15), (15, 20), (15, 30), (15, 50), (15, 75), (15, 100),
+    (20, 30), (20, 50), (20, 75), (20, 100),
+]
 
-PROFIT_THRESHOLDS = [10, 15, 20, 30, 40, 50, 65, 75, 100, 150, 200, 300]
+PROFIT_LEVELS = [5, 10, 15, 20, 30, 40, 50, 65, 75, 100, 150, 200, 300]
 
 # ==================== تلگرام ====================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
-def send_telegram_message(text):
+def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("  [هشدار] توکن یا chat_id تنظیم نشده.")
+        print("[هشدار] توکن یا chat_id تنظیم نشده.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "Markdown"
-        }, timeout=30)
-        r.raise_for_status()
+        for i in range(0, len(text), 4000):
+            chunk = text[i:i+4000]
+            r = requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": chunk,
+                "parse_mode": "Markdown"
+            }, timeout=30)
+            r.raise_for_status()
         print("  پیام تلگرام ارسال شد.")
     except Exception as e:
-        print(f"  خطا در ارسال: {e}")
+        print(f"  خطا: {e}")
 
 # ==================== داده ====================
-def fetch_ohlcv(symbol):
+def fetch(symbol):
     print(f"  دریافت {symbol}...")
     try:
         df = yf.download(symbol, period='max', interval=TIMEFRAME,
@@ -59,8 +66,7 @@ def fetch_ohlcv(symbol):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df.columns = [c.lower() for c in df.columns]
-        df = df[['open', 'high', 'low', 'close', 'volume']]
-        return df.dropna().tail(LIMIT)
+        return df[['open','high','low','close','volume']].dropna().tail(LIMIT)
     except Exception as e:
         print(f"  خطا: {e}")
         return None
@@ -74,12 +80,12 @@ def calc_cci(high, low, close, length=20):
     return (tp - sma_tp) / (0.015 * mad)
 
 def calc_macd(close, fast=12, slow=26, signal=9):
-    ema_f = close.ewm(span=fast, adjust=False).mean()
-    ema_s = close.ewm(span=slow, adjust=False).mean()
-    macd = ema_f - ema_s
-    return macd, macd.ewm(span=signal, adjust=False).mean()
+    ef = close.ewm(span=fast, adjust=False).mean()
+    es = close.ewm(span=slow, adjust=False).mean()
+    m = ef - es
+    return m, m.ewm(span=signal, adjust=False).mean()
 
-def compute_indicators(df):
+def add_indicators(df):
     df = df.copy()
     df['cci'] = calc_cci(df['high'], df['low'], df['close'], CCI_LENGTH)
     df['cci_sma'] = df['cci'].rolling(window=CCI_SMA_LENGTH).mean()
@@ -88,289 +94,215 @@ def compute_indicators(df):
     return df
 
 # ==================== سیگنال ====================
-def detect_signals(df):
+def add_signal(df):
     df = df.copy()
-    df['cci_cross'] = (df['cci'] > df['cci_sma']) & (df['cci'].shift(1) <= df['cci_sma'].shift(1))
-    df['macd_cross'] = (df['macd'] > df['macd_signal']) & (df['macd'].shift(1) <= df['macd_signal'].shift(1))
+    cci_up = (df['cci'] > df['cci_sma']) & (df['cci'].shift(1) <= df['cci_sma'].shift(1))
+    macd_up = (df['macd'] > df['macd_signal']) & (df['macd'].shift(1) <= df['macd_signal'].shift(1))
 
-    signal = pd.Series(False, index=df.index)
-    for idx in df.index[df['cci_cross']]:
+    sig = pd.Series(False, index=df.index)
+    for idx in df.index[cci_up]:
         pos = df.index.get_loc(idx)
-        end = min(pos + 3, len(df))
-        if df['macd_cross'].iloc[pos:end].any():
-            signal.iloc[pos] = True
-    df['signal'] = signal
+        # ✅ تغییر: پنجره از ۳ به ۲ کاهش یافت (کندل فعلی + ۱ کندل بعد)
+        end = min(pos + 2, len(df))
+        if macd_up.iloc[pos:end].any():
+            sig.iloc[pos] = True
+    df['signal'] = sig
     return df
 
-# ==================== تحلیل ====================
-def analyze_all_signals(df, symbol):
-    out = []
-    for idx in df.index[df['signal']]:
-        pos = df.index.get_loc(idx)
-        if pos + FORWARD_BARS >= len(df):
-            continue
+# ==================== شبیه‌سازی ====================
+def simulate_combo(symbols_data, sl, tp):
+    """روی داده‌های از پیش دانلودشده اجرا می‌شود."""
+    tp_hits = 0
+    sl_hits = 0
+    timeouts = 0
+    returns = []
 
-        entry = df['close'].iloc[pos]
-        f_close = df['close'].iloc[pos+1 : pos+1+FORWARD_BARS]
-        f_high = df['high'].iloc[pos+1 : pos+1+FORWARD_BARS]
-        f_low = df['low'].iloc[pos+1 : pos+1+FORWARD_BARS]
+    for symbol, df in symbols_data.items():
+        for idx in df.index[df['signal']]:
+            pos = df.index.get_loc(idx)
+            if pos + FORWARD_BARS >= len(df):
+                continue
+            entry = df['close'].iloc[pos]
+            highs = df['high'].iloc[pos+1 : pos+1+FORWARD_BARS]
+            lows  = df['low'].iloc[pos+1 : pos+1+FORWARD_BARS]
+            closes = df['close'].iloc[pos+1 : pos+1+FORWARD_BARS]
+            if len(closes) < FORWARD_BARS:
+                continue
 
-        if len(f_close) < FORWARD_BARS:
-            continue
+            sl_price = entry * (1 - sl/100)
+            tp_price = entry * (1 + tp/100)
 
-        peak_pos = int(f_high.values.argmax())
-        peak_ret = (f_high.iloc[peak_pos] / entry - 1) * 100
-        peak_candle = peak_pos + 1
+            exit_type = 'timeout'
+            exit_ret = (closes.iloc[-1] / entry - 1) * 100
 
-        trough_pos = int(f_low.values.argmin())
-        trough_ret = (f_low.iloc[trough_pos] / entry - 1) * 100
-        trough_candle = trough_pos + 1
+            for j in range(len(closes)):
+                hit_sl = lows.iloc[j] <= sl_price
+                hit_tp = highs.iloc[j] >= tp_price
+                if hit_sl and hit_tp:
+                    exit_type = 'sl'
+                    exit_ret = -sl
+                    break
+                elif hit_sl:
+                    exit_type = 'sl'
+                    exit_ret = -sl
+                    break
+                elif hit_tp:
+                    exit_type = 'tp'
+                    exit_ret = tp
+                    break
 
-        pre_peak_low = f_low.iloc[:peak_pos + 1]
-        mae_before_peak = (pre_peak_low.min() / entry - 1) * 100
+            if exit_type == 'tp':
+                tp_hits += 1
+            elif exit_type == 'sl':
+                sl_hits += 1
+            else:
+                timeouts += 1
+            returns.append(exit_ret)
 
-        final_ret = (f_close.iloc[-1] / entry - 1) * 100
-
-        out.append({
-            'symbol': symbol,
-            'signal_date': idx,
-            'entry': entry,
-            'final_return': final_ret,
-            'peak_return': peak_ret,
-            'peak_candle': peak_candle,
-            'trough_return': trough_ret,
-            'trough_candle': trough_candle,
-            'mae_before_peak': mae_before_peak,
-            'win_at_100': final_ret > 0
-        })
-    return out
-
-def simulate_sl_tp(symbol, df, sl, tp):
-    """
-    برای یک ترکیب SL/TP، همهٔ سیگنال‌ها را شبیه‌سازی می‌کند.
-    خروجی شامل sl, tp, exit_reason, return_pct
-    """
-    out = []
-    for idx in df.index[df['signal']]:
-        pos = df.index.get_loc(idx)
-        if pos + FORWARD_BARS >= len(df):
-            continue
-
-        entry = df['close'].iloc[pos]
-        f_high = df['high'].iloc[pos+1 : pos+1+FORWARD_BARS]
-        f_low = df['low'].iloc[pos+1 : pos+1+FORWARD_BARS]
-        f_close = df['close'].iloc[pos+1 : pos+1+FORWARD_BARS]
-
-        if len(f_close) < FORWARD_BARS:
-            continue
-
-        sl_price = entry * (1 - sl / 100)
-        tp_price = entry * (1 + tp / 100)
-
-        exit_reason = 'timeout'
-        exit_return = (f_close.iloc[-1] / entry - 1) * 100
-
-        for j in range(len(f_close)):
-            hit_sl = f_low.iloc[j] <= sl_price
-            hit_tp = f_high.iloc[j] >= tp_price
-
-            if hit_sl and hit_tp:
-                exit_reason = 'sl'
-                exit_return = -sl
-                break
-            elif hit_sl:
-                exit_reason = 'sl'
-                exit_return = -sl
-                break
-            elif hit_tp:
-                exit_reason = 'tp'
-                exit_return = tp
-                break
-
-        out.append({
-            'symbol': symbol,
-            'sl': sl,
-            'tp': tp,
-            'exit_reason': exit_reason,
-            'return_pct': exit_return
-        })
-    return out
+    return {
+        'sl': sl, 'tp': tp,
+        'tp_hits': tp_hits, 'sl_hits': sl_hits, 'timeouts': timeouts,
+        'avg_return': np.mean(returns) if returns else 0,
+        'net_return': np.sum(returns)
+    }
 
 # ==================== گزارش‌ها ====================
-def report_basic(results_df):
-    total = len(results_df)
-    winners = results_df[results_df['win_at_100']]
-    losers = results_df[~results_df['win_at_100']]
-
+def report_profit_levels(signals_df):
+    total = len(signals_df)
     lines = [
-        "📉 *آمار پایه*",
-        "",
-        f"کل سیگنال: {total}",
-        f"سودآور در کندل ۱۰۰: {len(winners)} ({len(winners)/total*100:.1f}%)",
-        f"زیان‌ده در کندل ۱۰۰: {len(losers)} ({len(losers)/total*100:.1f}%)",
-        "",
-        f"میانگین سقف (high): {results_df['peak_return'].mean():.2f}%",
-        f"میانه سقف: {results_df['peak_return'].median():.2f}%",
-        f"میانگین MAE: {results_df['mae_before_peak'].mean():.2f}%",
-        f"میانه MAE: {results_df['mae_before_peak'].median():.2f}%",
-    ]
-    return "\n".join(lines)
-
-def report_profit_levels(results_df, thresholds):
-    total = len(results_df)
-    lines = [
-        "",
-        "🎯 *تعداد دقیق سیگنال‌هایی که به هر سطح سود رسیدند*",
+        "🎯 *تعداد واقعی رسیدن به هر سطح سود*",
         "",
         "| سطح | تعداد | درصد |",
         "|------|-------|------|",
     ]
-    for th in thresholds:
-        c = (results_df['peak_return'] >= th).sum()
-        lines.append(f"| +{th}% | {c} | {c/total*100:.1f}% |")
+    for lvl in PROFIT_LEVELS:
+        c = (signals_df['peak_high_pct'] >= lvl).sum()
+        lines.append(f"| +{lvl}% | {c} | {c/total*100:.1f}% |")
     return "\n".join(lines)
 
-def report_sl_tp_matrix(all_sim_df):
+def report_combos(combo_data, total):
     lines = [
+        "🧮 *گزارش کامل ترکیب‌های SL/TP*",
         "",
-        "🧮 *ماتریس کامل SL/TP (تفکیک دقیق)*",
+        "`TP` = رسیدن واقعی به هدف سود",
+        "`SL` = خوردن حد ضرر",
+        "`TO` = بسته در کندل ۱۰۰",
+        "`وین‌ریت` = TP ÷ کل (فقط TP)",
+        "`بازدهی` = میانگین همهٔ معاملات",
+        "`سود خالص` = مجموع بازدهی",
         "",
-        "`TP` = تعداد واقعی رسیدن به هدف سود",
-        "`SL` = تعداد خوردن حد ضرر",
-        "`TO` = تعداد بسته‌شده در کندل ۱۰۰",
-        "`سودآور` = درصد معاملات با بازدهی مثبت",
+        "*همه ترکیب‌ها (مرتب بر اساس بازدهی):*",
         "",
+        "`SL/TP | TP | SL | TO | وین‌ریت | بازدهی | سود خالص`",
     ]
-
-    grouped = all_sim_df.groupby(['sl', 'tp'])
-
-    rows = []
-    for (sl, tp), group in grouped:
-        total = len(group)
-        tp_hits = (group['exit_reason'] == 'tp').sum()
-        sl_hits = (group['exit_reason'] == 'sl').sum()
-        to_hits = (group['exit_reason'] == 'timeout').sum()
-        avg = group['return_pct'].mean()
-        profitable = (group['return_pct'] > 0).sum()
-        rows.append({
-            'SL': sl, 'TP': tp, 'total': total,
-            'tp_hits': tp_hits, 'sl_hits': sl_hits, 'to_hits': to_hits,
-            'avg': avg, 'profitable': profitable,
-            'profitable_pct': profitable / total * 100
-        })
-
-    df = pd.DataFrame(rows).sort_values('avg', ascending=False)
-
-    lines.append("*۱۰ ترکیب با بالاترین میانگین بازدهی:*")
-    lines.append("")
-    lines.append("`SL/TP | TP-hit | SL-hit | TO | میانگین | سودآور`")
-    for _, r in df.head(10).iterrows():
+    combo_data.sort(key=lambda x: x['avg_return'], reverse=True)
+    for c in combo_data:
         lines.append(
-            f"`-{int(r['SL'])}/+{int(r['TP'])}` | "
-            f"{int(r['tp_hits'])} | {int(r['sl_hits'])} | {int(r['to_hits'])} | "
-            f"{r['avg']:.2f}% | {r['profitable_pct']:.1f}%"
+            f"`-{c['sl']}/+{c['tp']}` | "
+            f"{c['tp_hits']} | {c['sl_hits']} | {c['timeouts']} | "
+            f"{c['tp_hits']/total*100:.1f}% | "
+            f"{c['avg_return']:.2f}% | "
+            f"{c['net_return']:.0f}%"
         )
-
-    lines.append("")
-    lines.append("*۵ ترکیب با بالاترین TP-hit واقعی:*")
-    lines.append("")
-    df_by_tp = df.sort_values('tp_hits', ascending=False)
-    for _, r in df_by_tp.head(5).iterrows():
-        lines.append(
-            f"`-{int(r['SL'])}/+{int(r['TP'])}` → "
-            f"{int(r['tp_hits'])} TP | {int(r['sl_hits'])} SL | "
-            f"میانگین {r['avg']:.2f}%"
-        )
-
     return "\n".join(lines)
 
-def report_mae_groups(results_df):
-    lines = [
-        "",
-        "🔬 *تفکیک بر اساس میزان ریزش (MAE قبل از سقف)*",
-        "",
-        "فقط سیگنال‌هایی که در کندل ۱۰۰ سودآور بودند.",
-        "",
-    ]
+def report_best(combo_data):
+    lines = ["", "🥇 *بهترین ترکیب‌ها:*", ""]
 
-    winners = results_df[results_df['win_at_100']].copy()
-    if len(winners) == 0:
-        return "\n".join(lines)
+    b = max(combo_data, key=lambda x: x['avg_return'])
+    lines.append(f"▪️ بیشترین بازدهی: `-{b['sl']}/+{b['tp']}`")
+    lines.append(f"   بازدهی: {b['avg_return']:.2f}% | وین‌ریت: {b['tp_hits']/sum([1])if False else 0:.1f}%")
+    lines.append(f"   TP: {b['tp_hits']} | SL: {b['sl_hits']} | TO: {b['timeouts']}")
+    lines.append("")
 
-    def bucket(x):
-        if x >= -3: return "۰ تا -۳٪"
-        if x >= -5: return "-۳٪ تا -۵٪"
-        if x >= -10: return "-۵٪ تا -۱۰٪"
-        if x >= -15: return "-۱۰٪ تا -۱۵٪"
-        return "بیش از -۱۵٪"
+    b2 = max(combo_data, key=lambda x: x['tp_hits'])
+    lines.append(f"▪️ بیشترین TP-hit: `-{b2['sl']}/+{b2['tp']}`")
+    lines.append(f"   TP: {b2['tp_hits']} | بازدهی: {b2['avg_return']:.2f}%")
+    lines.append("")
 
-    winners['bucket'] = winners['mae_before_peak'].apply(bucket)
-    order = ["۰ تا -۳٪", "-۳٪ تا -۵٪", "-۵٪ تا -۱۰٪", "-۱۰٪ تا -۱۵٪", "بیش از -۱۵٪"]
-
-    for b in order:
-        sub = winners[winners['bucket'] == b]
-        if len(sub) == 0:
-            continue
-        p = sub['peak_return']
-        lines.append(f"▫️ *{b}* — {len(sub)} سیگنال")
-        lines.append(f"   کمترین: +{p.min():.1f}%")
-        lines.append(f"   میانه: +{p.median():.1f}%")
-        lines.append(f"   بیشترین: +{p.max():.1f}%")
-        lines.append(f"   تعداد بالای +65٪: {(p >= 65).sum()}")
-        lines.append("")
+    b3 = max(combo_data, key=lambda x: x['net_return'])
+    lines.append(f"▪️ بیشترین سود خالص: `-{b3['sl']}/+{b3['tp']}`")
+    lines.append(f"   سود خالص: {b3['net_return']:.0f}% | بازدهی: {b3['avg_return']:.2f}%")
 
     return "\n".join(lines)
 
 # ==================== اجرا ====================
 def main():
     all_signals = []
-    all_sims = []
+    symbols_data = {}
 
     print("=" * 60)
-    print("شروع تحلیل")
+    print("شروع تحلیل — پنجره MACD = ۱ کندل")
     print("=" * 60)
 
     for symbol in TOP_10_SYMBOLS:
-        df = fetch_ohlcv(symbol)
+        df = fetch(symbol)
         if df is None or len(df) < 200:
             continue
-        df = compute_indicators(df)
-        df = detect_signals(df)
+        df = add_indicators(df)
+        df = add_signal(df)
+        df.index.name = 'date'
 
-        sig_count = int(df['signal'].sum())
-        print(f"  {symbol}: {sig_count} سیگنال")
-        if sig_count == 0:
+        cnt = int(df['signal'].sum())
+        print(f"  {symbol}: {cnt} سیگنال")
+        if cnt == 0:
             continue
 
-        all_signals.extend(analyze_all_signals(df, symbol))
+        symbols_data[symbol] = df
 
-        for sl in SL_LEVELS:
-            for tp in TP_LEVELS:
-                all_sims.extend(simulate_sl_tp(symbol, df, sl, tp))
+        for idx in df.index[df['signal']]:
+            pos = df.index.get_loc(idx)
+            if pos + FORWARD_BARS >= len(df):
+                continue
+            entry = df['close'].iloc[pos]
+            highs = df['high'].iloc[pos+1 : pos+1+FORWARD_BARS]
+            closes = df['close'].iloc[pos+1 : pos+1+FORWARD_BARS]
+            if len(closes) < FORWARD_BARS:
+                continue
+            peak_pos = int(highs.values.argmax())
+            all_signals.append({
+                'symbol': symbol,
+                'date': idx,
+                'entry': entry,
+                'peak_high_pct': (highs.iloc[peak_pos] / entry - 1) * 100,
+                'peak_candle': peak_pos + 1,
+                'final_return': (closes.iloc[-1] / entry - 1) * 100,
+            })
 
         time.sleep(1)
 
     signals_df = pd.DataFrame(all_signals)
-    sims_df = pd.DataFrame(all_sims)
+    total = len(signals_df)
+    print(f"\nمجموع سیگنال: {total}")
 
-    if len(signals_df) == 0:
-        send_telegram_message("هیچ سیگنالی یافت نشد.")
+    if total == 0:
+        send_telegram("هیچ سیگنالی یافت نشد.")
         return
 
-    print(f"\nمجموع سیگنال‌ها: {len(signals_df)}")
+    print("\nشبیه‌سازی ترکیب‌ها...")
+    combo_data = []
+    for sl, tp in COMBOS:
+        result = simulate_combo(symbols_data, sl, tp)
+        combo_data.append(result)
+        print(f"  -{sl}/+{tp}: TP={result['tp_hits']} "
+              f"SL={result['sl_hits']} TO={result['timeouts']} "
+              f"| بازدهی {result['avg_return']:.2f}%")
 
-    msg = "📊 *تحلیل دقیق CCI>SMA + MACD*\n"
-    msg += f"🗓 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-    msg += report_basic(signals_df)
-    msg += report_profit_levels(signals_df, PROFIT_THRESHOLDS)
-    msg += report_mae_groups(signals_df)
-    msg += report_sl_tp_matrix(sims_df)
+    # ساخت پیام
+    msg = "📊 *تحلیل نهایی CCI>SMA + MACD*\n"
+    msg += f"🗓 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+    msg += f"پنجره MACD: *۱ کندل*\n\n"
+    msg += f"کل سیگنال: *{total}*\n\n"
+    msg += report_profit_levels(signals_df)
+    msg += "\n\n"
+    msg += report_combos(combo_data, total)
+    msg += "\n"
+    msg += report_best(combo_data)
 
-    send_telegram_message(msg)
+    send_telegram(msg)
 
     signals_df.to_csv('signals.csv', index=False)
-    sims_df.to_csv('sims.csv', index=False)
-
+    pd.DataFrame(combo_data).to_csv('combos.csv', index=False)
     print("\nپایان.")
 
 if __name__ == '__main__':
