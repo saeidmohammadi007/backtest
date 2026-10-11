@@ -104,12 +104,6 @@ def detect_signals(df):
 
 # ==================== تحلیل ====================
 def analyze_all_signals(df, symbol):
-    """
-    برای هر سیگنال سه چیز محاسبه می‌کند:
-    1. سقف سود (بر اساس high) و کندل آن
-    2. کف (بر اساس low) و کندل آن
-    3. MAE قبل از سقف (بر اساس low)
-    """
     out = []
     for idx in df.index[df['signal']]:
         pos = df.index.get_loc(idx)
@@ -124,21 +118,17 @@ def analyze_all_signals(df, symbol):
         if len(f_close) < FORWARD_BARS:
             continue
 
-        # سقف (بر اساس high)
         peak_pos = int(f_high.values.argmax())
         peak_ret = (f_high.iloc[peak_pos] / entry - 1) * 100
         peak_candle = peak_pos + 1
 
-        # کف کل (بر اساس low)
         trough_pos = int(f_low.values.argmin())
         trough_ret = (f_low.iloc[trough_pos] / entry - 1) * 100
         trough_candle = trough_pos + 1
 
-        # MAE قبل از سقف
         pre_peak_low = f_low.iloc[:peak_pos + 1]
         mae_before_peak = (pre_peak_low.min() / entry - 1) * 100
 
-        # بازدهی کندل ۱۰۰
         final_ret = (f_close.iloc[-1] / entry - 1) * 100
 
         out.append({
@@ -157,8 +147,8 @@ def analyze_all_signals(df, symbol):
 
 def simulate_sl_tp(symbol, df, sl, tp):
     """
-    برای یک ترکیب SL/TP خاص، همهٔ سیگنال‌ها را شبیه‌سازی می‌کند.
-    خروجی: لیستی از dict شامل exit_reason و return_pct
+    برای یک ترکیب SL/TP، همهٔ سیگنال‌ها را شبیه‌سازی می‌کند.
+    خروجی شامل sl, tp, exit_reason, return_pct
     """
     out = []
     for idx in df.index[df['signal']]:
@@ -185,7 +175,6 @@ def simulate_sl_tp(symbol, df, sl, tp):
             hit_tp = f_high.iloc[j] >= tp_price
 
             if hit_sl and hit_tp:
-                # محافظه‌کارانه: SL اول
                 exit_reason = 'sl'
                 exit_return = -sl
                 break
@@ -200,6 +189,8 @@ def simulate_sl_tp(symbol, df, sl, tp):
 
         out.append({
             'symbol': symbol,
+            'sl': sl,
+            'tp': tp,
             'exit_reason': exit_reason,
             'return_pct': exit_return
         })
@@ -226,10 +217,6 @@ def report_basic(results_df):
     return "\n".join(lines)
 
 def report_profit_levels(results_df, thresholds):
-    """
-    تعداد دقیق سیگنال‌هایی که سقفشان به هر سطح رسیده.
-    این عدد دقیق است — نه تخمین.
-    """
     total = len(results_df)
     lines = [
         "",
@@ -244,28 +231,19 @@ def report_profit_levels(results_df, thresholds):
     return "\n".join(lines)
 
 def report_sl_tp_matrix(all_sim_df):
-    """
-    ماتریس کامل SL/TP با تفکیک دقیق:
-    - tp_hits: تعداد واقعی رسیدن به TP
-    - sl_hits: تعداد خوردن SL
-    - timeout: تعداد رسیدن به پایان ۱۰۰ کندل
-    - avg: بازدهی میانگین
-    """
     lines = [
         "",
         "🧮 *ماتریس کامل SL/TP (تفکیک دقیق)*",
         "",
-        "برای هر ترکیب:",
-        "- `TP` = تعداد واقعی که به هدف سود رسید",
-        "- `SL` = تعداد که حد ضرر خورد",
-        "- `TO` = تعداد که در کندل ۱۰۰ بسته شد",
-        "- `میانگین` = بازدهی میانگین",
+        "`TP` = تعداد واقعی رسیدن به هدف سود",
+        "`SL` = تعداد خوردن حد ضرر",
+        "`TO` = تعداد بسته‌شده در کندل ۱۰۰",
+        "`سودآور` = درصد معاملات با بازدهی مثبت",
         "",
     ]
 
     grouped = all_sim_df.groupby(['sl', 'tp'])
 
-    # ساخت جدول
     rows = []
     for (sl, tp), group in grouped:
         total = len(group)
@@ -294,7 +272,7 @@ def report_sl_tp_matrix(all_sim_df):
         )
 
     lines.append("")
-    lines.append("*۵ ترکیب با بالاترین نرخ TP-hit واقعی:*")
+    lines.append("*۵ ترکیب با بالاترین TP-hit واقعی:*")
     lines.append("")
     df_by_tp = df.sort_values('tp_hits', ascending=False)
     for _, r in df_by_tp.head(5).iterrows():
@@ -364,10 +342,8 @@ def main():
         if sig_count == 0:
             continue
 
-        # تحلیل پایه
         all_signals.extend(analyze_all_signals(df, symbol))
 
-        # شبیه‌سازی همهٔ ترکیب‌های SL/TP
         for sl in SL_LEVELS:
             for tp in TP_LEVELS:
                 all_sims.extend(simulate_sl_tp(symbol, df, sl, tp))
@@ -383,7 +359,6 @@ def main():
 
     print(f"\nمجموع سیگنال‌ها: {len(signals_df)}")
 
-    # ==================== پیام تلگرام ====================
     msg = "📊 *تحلیل دقیق CCI>SMA + MACD*\n"
     msg += f"🗓 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
     msg += report_basic(signals_df)
@@ -393,7 +368,6 @@ def main():
 
     send_telegram_message(msg)
 
-    # ذخیره CSV
     signals_df.to_csv('signals.csv', index=False)
     sims_df.to_csv('sims.csv', index=False)
 
