@@ -1,9 +1,9 @@
 # main.py
 # تحلیل سیگنال CCI SMA 14 + MACD با دادهٔ یاهو فایننس و ارسال نتایج به تلگرام
+# محاسبهٔ اندیکاتورها به صورت دستی (بدون نیاز به pandas-ta)
 
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
 import time
 import os
@@ -52,19 +52,15 @@ def send_telegram_message(text):
 
 # ==================== دریافت داده از یاهو فایننس ====================
 def fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LIMIT):
-    """
-    دریافت داده OHLCV از یاهو فایننس با استفاده از yfinance.
-    ستون‌ها به صورت open, high, low, close, volume بازگردانده می‌شوند.
-    """
+    """دریافت داده OHLCV از یاهو فایننس"""
     print(f"  در حال دریافت داده {symbol} از یاهو فایننس...")
     try:
-        # دریافت دادهٔ روزانه
         df = yf.download(
             symbol,
-            period='max',          # تمام تاریخ موجود
-            interval=timeframe,    # '1d'
+            period='max',
+            interval=timeframe,
             progress=False,
-            auto_adjust=True,      # اصلاح خودکار قیمت‌ها
+            auto_adjust=True,
             threads=False
         )
 
@@ -72,21 +68,15 @@ def fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LIMIT):
             print(f"  دادهٔ خالی برای {symbol}")
             return None
 
-        # اطمینان از تک‌سطحی بودن ستون‌ها (yfinance ممکن است MultiIndex بدهد)
+        # یکسان‌سازی ستون‌ها (در صورت MultiIndex)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        # یکسان‌سازی نام ستون‌ها با حروف کوچک
         df.columns = [c.lower() for c in df.columns]
 
-        # حذف ستون‌های اضافی در صورت وجود
         cols_to_keep = ['open', 'high', 'low', 'close', 'volume']
         df = df[[c for c in cols_to_keep if c in df.columns]]
-
-        # حذف ردیف‌های NaN
         df = df.dropna()
-
-        # محدود کردن به آخرین limit کندل
         df = df.tail(limit)
 
         return df
@@ -95,21 +85,57 @@ def fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LIMIT):
         print(f"  دریافت {symbol} با خطا مواجه شد: {e}")
         return None
 
-# ==================== محاسبه اندیکاتورها ====================
+# ==================== محاسبهٔ دستی اندیکاتورها ====================
+def calculate_cci(high, low, close, length=20):
+    """
+    محاسبهٔ CCI استاندارد:
+    TP = (High + Low + Close) / 3
+    SMA_TP = SMA(TP, length)
+    Mean Deviation = میانگین قدرمطلق اختلاف TP از SMA_TP در بازهٔ length
+    CCI = (TP - SMA_TP) / (0.015 * Mean Deviation)
+    """
+    tp = (high + low + close) / 3
+    sma_tp = tp.rolling(window=length).mean()
+
+    # محاسبهٔ انحراف میانگین به صورت غلتان
+    def mean_deviation(x):
+        return np.mean(np.abs(x - x.mean()))
+
+    mad = tp.rolling(window=length).apply(mean_deviation, raw=True)
+
+    cci = (tp - sma_tp) / (0.015 * mad)
+    return cci
+
+def calculate_macd(close, fast=12, slow=26, signal=9):
+    """
+    محاسبهٔ MACD:
+    MACD line = EMA(fast) - EMA(slow)
+    Signal line = EMA(MACD, signal)
+    """
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line, signal_line
+
 def compute_indicators(df):
-    """محاسبه CCI(20)، SMA(14) روی CCI و MACD"""
+    """محاسبه CCI(20)، SMA(14) روی CCI و MACD به صورت دستی"""
     df = df.copy()
 
     # CCI(20)
-    df['cci'] = ta.cci(df['high'], df['low'], df['close'], length=CCI_LENGTH)
+    df['cci'] = calculate_cci(
+        df['high'], df['low'], df['close'], length=CCI_LENGTH
+    )
 
     # SMA(14) روی CCI
     df['cci_sma'] = df['cci'].rolling(window=CCI_SMA_LENGTH).mean()
 
     # MACD
-    macd_df = ta.macd(df['close'], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
-    df['macd'] = macd_df[f'MACD_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}']
-    df['macd_signal'] = macd_df[f'MACDs_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}']
+    macd_line, signal_line = calculate_macd(
+        df['close'], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL
+    )
+    df['macd'] = macd_line
+    df['macd_signal'] = signal_line
 
     return df
 
@@ -122,19 +148,16 @@ def detect_crossovers(df):
     """
     df = df.copy()
 
-    # کراس رو به بالای SMA(14) از روی CCI(20)
     df['cci_sma_cross_up'] = (
         (df['cci_sma'] > df['cci']) &
         (df['cci_sma'].shift(1) <= df['cci'].shift(1))
     )
 
-    # کراس رو به بالای MACD (طلایی)
     df['macd_cross_up'] = (
         (df['macd'] > df['macd_signal']) &
         (df['macd'].shift(1) <= df['macd_signal'].shift(1))
     )
 
-    # ترکیب شرط
     signal = pd.Series(False, index=df.index)
     cci_cross_indices = df.index[df['cci_sma_cross_up']]
 
@@ -185,7 +208,7 @@ def analyze_forward_returns(df, symbol):
 def format_telegram_message(summary_df, results_df):
     """ساخت پیام متنی برای تلگرام"""
     lines = []
-    lines.append("📊 *نتایج تحلیل CCI SMA 14 + MACD (دادهٔ یاهو فایننس)*")
+    lines.append("📊 *نتایج تحلیل CCI SMA 14 + MACD (یاهو فایننس)*")
     lines.append(f"🗓 تاریخ اجرا: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     lines.append("")
 
@@ -243,7 +266,7 @@ def main():
         df = compute_indicators(df)
         df = detect_crossovers(df)
 
-        signal_count = df['signal'].sum()
+        signal_count = int(df['signal'].sum())
         print(f"  تعداد سیگنال‌ها: {signal_count}")
 
         if signal_count == 0:
@@ -269,7 +292,7 @@ def main():
                 'win_rate': np.mean(wins) * 100
             })
 
-        time.sleep(1)  # جلوگیری از محدودیت نرخ یاهو فایننس
+        time.sleep(1)
 
     # ==================== نمایش در لاگ ====================
     summary_df = pd.DataFrame(summary)
