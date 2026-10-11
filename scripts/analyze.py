@@ -24,12 +24,12 @@ COINS = [
     {"symbol": "MATIC-USD", "name": "Polygon"},
 ]
 
-DATA_START_DATE = "2019-01-01"
-DATA_END_DATE   = "2024-12-31"
-TARGET_DATE     = "2024-11-05"
+DATA_START_DATE = "2020-01-01"
+DATA_END_DATE   = "2025-04-25"
+TARGET_DATE     = "2025-04-20"
 MIN_GAP_DAYS    = 30
 TOP_N_SIMILAR   = 15
-FUTURE_HORIZONS = [1, 3, 7, 14, 30, 60, 90]
+FUTURE_HORIZONS = [1, 3, 7, 14, 30]
 
 SCENARIOS = [
     {"name": "ریزش زیر ۱٪ و رشد بالای ۱۰٪", "drawdown": -0.01, "up_side": 0.10},
@@ -75,7 +75,7 @@ def fetch_data(symbol, start_date, end_date):
     df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
     df = df.sort_values("date").reset_index(drop=True)
 
-    # فقط ۲۰۱۹ تا ۲۰۲۴
+    # فقط بازه مورد نظر
     df = df[(df["date"] >= pd.Timestamp(start_date)) &
             (df["date"] <= pd.Timestamp(end_date))].reset_index(drop=True)
 
@@ -244,7 +244,7 @@ def main():
     header = (
         f"📊 <b>تحلیل شباهت کندل ۱۰ ارز برتر</b>\n"
         f"📅 تاریخ مرجع: <b>{TARGET_DATE}</b>\n"
-        f"📚 منبع: <b>Yahoo Finance (2019-2024)</b>\n"
+        f"📚 منبع: <b>Yahoo Finance ({DATA_START_DATE} تا {DATA_END_DATE})</b>\n"
         f"{'─' * 30}\n"
     )
 
