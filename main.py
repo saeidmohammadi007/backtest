@@ -1,6 +1,4 @@
-# main.py — نسخهٔ نهایی: همه اعداد واقعی و تفکیک‌شده
-# پنجرهٔ MACD: فقط ۱ کندل بعد از کراس CCI
-
+# main.py — نسخهٔ نهایی: پنجره MACD = ۲ کندل، همه اعداد واقعی
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -44,10 +42,9 @@ def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         for i in range(0, len(text), 4000):
-            chunk = text[i:i+4000]
             r = requests.post(url, json={
                 "chat_id": TELEGRAM_CHAT_ID,
-                "text": chunk,
+                "text": text[i:i+4000],
                 "parse_mode": "Markdown"
             }, timeout=30)
             r.raise_for_status()
@@ -102,8 +99,8 @@ def add_signal(df):
     sig = pd.Series(False, index=df.index)
     for idx in df.index[cci_up]:
         pos = df.index.get_loc(idx)
-        # ✅ تغییر: پنجره از ۳ به ۲ کاهش یافت (کندل فعلی + ۱ کندل بعد)
-        end = min(pos + 2, len(df))
+        # پنجره ۲ کندل: کندل فعلی + ۲ کندل بعد
+        end = min(pos + 3, len(df))
         if macd_up.iloc[pos:end].any():
             sig.iloc[pos] = True
     df['signal'] = sig
@@ -111,7 +108,6 @@ def add_signal(df):
 
 # ==================== شبیه‌سازی ====================
 def simulate_combo(symbols_data, sl, tp):
-    """روی داده‌های از پیش دانلودشده اجرا می‌شود."""
     tp_hits = 0
     sl_hits = 0
     timeouts = 0
@@ -131,7 +127,6 @@ def simulate_combo(symbols_data, sl, tp):
 
             sl_price = entry * (1 - sl/100)
             tp_price = entry * (1 + tp/100)
-
             exit_type = 'timeout'
             exit_ret = (closes.iloc[-1] / entry - 1) * 100
 
@@ -139,36 +134,27 @@ def simulate_combo(symbols_data, sl, tp):
                 hit_sl = lows.iloc[j] <= sl_price
                 hit_tp = highs.iloc[j] >= tp_price
                 if hit_sl and hit_tp:
-                    exit_type = 'sl'
-                    exit_ret = -sl
-                    break
+                    exit_type = 'sl'; exit_ret = -sl; break
                 elif hit_sl:
-                    exit_type = 'sl'
-                    exit_ret = -sl
-                    break
+                    exit_type = 'sl'; exit_ret = -sl; break
                 elif hit_tp:
-                    exit_type = 'tp'
-                    exit_ret = tp
-                    break
+                    exit_type = 'tp'; exit_ret = tp; break
 
-            if exit_type == 'tp':
-                tp_hits += 1
-            elif exit_type == 'sl':
-                sl_hits += 1
-            else:
-                timeouts += 1
+            if exit_type == 'tp': tp_hits += 1
+            elif exit_type == 'sl': sl_hits += 1
+            else: timeouts += 1
             returns.append(exit_ret)
 
     return {
         'sl': sl, 'tp': tp,
         'tp_hits': tp_hits, 'sl_hits': sl_hits, 'timeouts': timeouts,
         'avg_return': np.mean(returns) if returns else 0,
-        'net_return': np.sum(returns)
+        'net_return': np.sum(returns),
+        'total': len(returns)
     }
 
 # ==================== گزارش‌ها ====================
-def report_profit_levels(signals_df):
-    total = len(signals_df)
+def report_profit_levels(signals_df, total):
     lines = [
         "🎯 *تعداد واقعی رسیدن به هر سطح سود*",
         "",
@@ -180,14 +166,14 @@ def report_profit_levels(signals_df):
         lines.append(f"| +{lvl}% | {c} | {c/total*100:.1f}% |")
     return "\n".join(lines)
 
-def report_combos(combo_data, total):
+def report_combos(combo_data):
     lines = [
         "🧮 *گزارش کامل ترکیب‌های SL/TP*",
         "",
         "`TP` = رسیدن واقعی به هدف سود",
         "`SL` = خوردن حد ضرر",
         "`TO` = بسته در کندل ۱۰۰",
-        "`وین‌ریت` = TP ÷ کل (فقط TP)",
+        "`وین‌ریت` = TP ÷ کل سیگنال‌ها",
         "`بازدهی` = میانگین همهٔ معاملات",
         "`سود خالص` = مجموع بازدهی",
         "",
@@ -197,10 +183,11 @@ def report_combos(combo_data, total):
     ]
     combo_data.sort(key=lambda x: x['avg_return'], reverse=True)
     for c in combo_data:
+        wr = c['tp_hits'] / c['total'] * 100 if c['total'] else 0
         lines.append(
             f"`-{c['sl']}/+{c['tp']}` | "
             f"{c['tp_hits']} | {c['sl_hits']} | {c['timeouts']} | "
-            f"{c['tp_hits']/total*100:.1f}% | "
+            f"{wr:.1f}% | "
             f"{c['avg_return']:.2f}% | "
             f"{c['net_return']:.0f}%"
         )
@@ -210,19 +197,24 @@ def report_best(combo_data):
     lines = ["", "🥇 *بهترین ترکیب‌ها:*", ""]
 
     b = max(combo_data, key=lambda x: x['avg_return'])
+    wr = b['tp_hits'] / b['total'] * 100 if b['total'] else 0
     lines.append(f"▪️ بیشترین بازدهی: `-{b['sl']}/+{b['tp']}`")
-    lines.append(f"   بازدهی: {b['avg_return']:.2f}% | وین‌ریت: {b['tp_hits']/sum([1])if False else 0:.1f}%")
+    lines.append(f"   بازدهی: {b['avg_return']:.2f}% | وین‌ریت: {wr:.1f}%")
     lines.append(f"   TP: {b['tp_hits']} | SL: {b['sl_hits']} | TO: {b['timeouts']}")
     lines.append("")
 
-    b2 = max(combo_data, key=lambda x: x['tp_hits'])
-    lines.append(f"▪️ بیشترین TP-hit: `-{b2['sl']}/+{b2['tp']}`")
-    lines.append(f"   TP: {b2['tp_hits']} | بازدهی: {b2['avg_return']:.2f}%")
+    b2 = max(combo_data, key=lambda x: x['tp_hits'] / x['total'] if x['total'] else 0)
+    wr2 = b2['tp_hits'] / b2['total'] * 100 if b2['total'] else 0
+    lines.append(f"▪️ بالاترین وین‌ریت: `-{b2['sl']}/+{b2['tp']}`")
+    lines.append(f"   وین‌ریت: {wr2:.1f}% | بازدهی: {b2['avg_return']:.2f}%")
+    lines.append(f"   TP: {b2['tp_hits']} | SL: {b2['sl_hits']} | TO: {b2['timeouts']}")
     lines.append("")
 
     b3 = max(combo_data, key=lambda x: x['net_return'])
+    wr3 = b3['tp_hits'] / b3['total'] * 100 if b3['total'] else 0
     lines.append(f"▪️ بیشترین سود خالص: `-{b3['sl']}/+{b3['tp']}`")
     lines.append(f"   سود خالص: {b3['net_return']:.0f}% | بازدهی: {b3['avg_return']:.2f}%")
+    lines.append(f"   وین‌ریت: {wr3:.1f}%")
 
     return "\n".join(lines)
 
@@ -232,7 +224,7 @@ def main():
     symbols_data = {}
 
     print("=" * 60)
-    print("شروع تحلیل — پنجره MACD = ۱ کندل")
+    print("شروع تحلیل — پنجره MACD = ۲ کندل")
     print("=" * 60)
 
     for symbol in TOP_10_SYMBOLS:
@@ -282,20 +274,18 @@ def main():
     print("\nشبیه‌سازی ترکیب‌ها...")
     combo_data = []
     for sl, tp in COMBOS:
-        result = simulate_combo(symbols_data, sl, tp)
-        combo_data.append(result)
-        print(f"  -{sl}/+{tp}: TP={result['tp_hits']} "
-              f"SL={result['sl_hits']} TO={result['timeouts']} "
-              f"| بازدهی {result['avg_return']:.2f}%")
+        r = simulate_combo(symbols_data, sl, tp)
+        combo_data.append(r)
+        print(f"  -{sl}/+{tp}: TP={r['tp_hits']} SL={r['sl_hits']} "
+              f"TO={r['timeouts']} | بازدهی {r['avg_return']:.2f}%")
 
-    # ساخت پیام
     msg = "📊 *تحلیل نهایی CCI>SMA + MACD*\n"
     msg += f"🗓 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-    msg += f"پنجره MACD: *۱ کندل*\n\n"
+    msg += f"پنجره MACD: *۲ کندل*\n\n"
     msg += f"کل سیگنال: *{total}*\n\n"
-    msg += report_profit_levels(signals_df)
+    msg += report_profit_levels(signals_df, total)
     msg += "\n\n"
-    msg += report_combos(combo_data, total)
+    msg += report_combos(combo_data)
     msg += "\n"
     msg += report_best(combo_data)
 
