@@ -79,14 +79,13 @@ def main():
     print("=" * 60)
 
     # ---- ۱. دریافت کندل هدف واقعی + ۳ کندل قبلش از Yahoo ----
-    # کمی قبل‌تر از TARGET_DATE شروع می‌کنیم تا هم کندل هدف رو بگیریم هم lookback رو
-    btc_recent = fetch_ohlc(BTC_TICKER, "2026-08-01", "2026-08-20")
-    btc_recent = btc_recent.reset_index(drop=True)
+    btc_recent = fetch_ohlc(BTC_TICKER, "2026-08-01", "2026-08-20").reset_index(drop=True)
 
     target_rows = btc_recent[btc_recent["date"] == pd.Timestamp(TARGET_DATE)]
     if target_rows.empty:
-        print(f"❌ کندل {TARGET_DATE} در Yahoo پیدا نشد. داده‌های موجود:")
-        print(btc_recent.tail(10))
+        print(f"❌ کندل {TARGET_DATE} در Yahoo پیدا نشد.")
+        print("داده‌های موجود در بازه:")
+        print(btc_recent[["date", "open", "high", "low", "close"]].to_string())
         return
 
     idx = target_rows.index[0]
@@ -96,16 +95,16 @@ def main():
 
     target_window = btc_recent.iloc[idx - LOOKBACK:idx].copy()
     target_candle = btc_recent.iloc[idx]
-
     entry = float(target_candle["close"])
+
     print(f"\n🎯 کندل هدف واقعی:")
     print(f"   تاریخ: {target_candle['date'].date()}")
-    print(f"   O={float(target_candle['open']):.0f} "
-          f"H={float(target_candle['high']):.0f} "
-          f"L={float(target_candle['low']):.0f} "
-          f"C={entry:.0f}")
-    print(f"   سطح ریزش {DROP_TH}%: {entry*(1-DROP_TH/100):.0f}")
-    print(f"   سطح هدف  {TARGET_TH}%: {entry*(1+TARGET_TH/100):.0f}")
+    print(f"   O={float(target_candle['open']):.2f}  "
+          f"H={float(target_candle['high']):.2f}  "
+          f"L={float(target_candle['low']):.2f}  "
+          f"C={entry:.2f}")
+    print(f"   سطح ریزش {DROP_TH}%: {entry*(1-DROP_TH/100):.2f}")
+    print(f"   سطح هدف  {TARGET_TH}%: {entry*(1+TARGET_TH/100):.2f}")
 
     tn = normalize(target_window)
 
@@ -148,7 +147,7 @@ def main():
     print("=" * 60)
 
     if not matches:
-        print(f"No matches (DIST_TH={DIST_TH}). Increase DIST_TH.")
+        print(f"No matches (DIST_TH={DIST_TH}). Increase DIST_TH and rerun.")
         return
 
     m = pd.DataFrame(matches).sort_values("distance").reset_index(drop=True)
@@ -160,6 +159,7 @@ def main():
     print(f"drop <{DROP_TH}%   : {drop_n} ({drop_n/total*100:.1f}%)")
     print(f"hit  {TARGET_TH}%   : {profit_n} ({profit_n/total*100:.1f}%)")
     print()
+    print("max_drop / max_profit stats:")
     print(m[["max_drop", "max_profit"]].describe().round(2))
     print("\ntop 10 closest:")
     for _, r in m.head(10).iterrows():
