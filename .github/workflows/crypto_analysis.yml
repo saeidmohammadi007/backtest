@@ -1,28 +1,36 @@
-name: تحلیل CCI و MACD کریپتو
+name: BTC Similar Patterns Analysis
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 6 * * *'   # هر روز 06:00 UTC
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-      - name: دریافت کد
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: نصب Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: نصب وابستگی‌ها
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Install deps
+        run: pip install requests pandas numpy
 
-      - name: اجرای تحلیل
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python main.py
+      - name: Run analysis
+        run: python btc_analysis.py
+
+      - name: Upload CSV result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btc-similar-patterns
+          path: btc_similar_patterns.csv
+          if-no-files-found: warn
