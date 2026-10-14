@@ -5,7 +5,7 @@ on:
   push:
     branches: [ main ]
   schedule:
-    - cron: '0 6 * * *'   # هر روز 06:00 UTC
+    - cron: '0 6 * * *'
 
 jobs:
   analyze:
@@ -22,7 +22,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install deps
-        run: pip install requests pandas numpy
+        run: pip install yfinance pandas numpy
 
       - name: Run analysis
         run: python btc_analysis.py
