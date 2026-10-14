@@ -11,7 +11,7 @@ TOP_COINS = [
     "DOGE-USD", "TRX-USD", "DOT-USD", "AVAX-USD", "LINK-USD",
 ]
 START_DATE, END_DATE = "2020-01-01", "2025-12-31"
-LOOKBACK, DIST_TH = 3, 0.5
+LOOKBACK, DIST_TH = 3, 0.08
 DROP_TH, TARGET_TH, FUTURE = 4.5, 8.4, 30
 MAX_RETRIES, BASE_BACKOFF = 3, 5.0
 
@@ -76,6 +76,7 @@ def outcome(entry, future_df):
 def main():
     print("=" * 60)
     print(f"BTC target candle: {TARGET_DATE}  (source: Yahoo Finance)")
+    print(f"DIST_TH = {DIST_TH}  |  DROP_TH = {DROP_TH}%  |  TARGET_TH = {TARGET_TH}%")
     print("=" * 60)
 
     # ---- ۱. دریافت کندل هدف واقعی + ۳ کندل قبلش از Yahoo ----
