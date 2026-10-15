@@ -5,35 +5,20 @@ import yfinance as yf
 import requests
 
 # ---------------- تنظیمات ----------------
-REF_SYMBOL = os.getenv("REF_SYMBOL", "ETH-USD")
-REF_DATE = os.getenv("REF_DATE", "2024-11-05")
-
-# توجه: با تغییر به فضای 5 بُعدی، آستانه باید بازکالیبره شود.
-# حداکثر فاصله ممکن ≈ 0.47 است. آستانه 0.15 یعنی ~32٪ از حداکثر.
-THRESHOLD = float(os.getenv("THRESHOLD", "0.15"))
-SIZE_TOL = float(os.getenv("SIZE_TOL", "2"))
-HORIZON = int(os.getenv("HORIZON", "60"))
-MIN_SAMPLES = int(os.getenv("MIN_SAMPLES", "10"))
-MIN_RANGE_PCT = float(os.getenv("MIN_RANGE_PCT", "0.001"))  # حداقل رنج نسبت به open
-
-# وزن ویژگی‌ها (جمعشان = 1.0)
-WEIGHTS = np.array([
-    float(os.getenv("W_OPEN",   "0.25")),   # موقعیت open
-    float(os.getenv("W_CLOSE",  "0.30")),   # موقعیت close (مهم‌تر)
-    float(os.getenv("W_UPWICK", "0.15")),   # سایه بالایی
-    float(os.getenv("W_LOWICK", "0.15")),   # سایه پایینی
-    float(os.getenv("W_DIR",    "0.15")),   # جهت بدنه (صعودی/نزولی)
-])
-
 COINS = [
     "BTC-USD", "ETH-USD", "XRP-USD", "BNB-USD", "SOL-USD",
     "DOGE-USD", "TRX-USD", "ADA-USD", "AVAX-USD", "LINK-USD",
 ]
-TARGETS = [5, 10, 20, 30, 50, 100]
-DDS = [2, 3, 4]
+
+HORIZON     = int(os.getenv("HORIZON", "60"))      # افق بررسی (60 کندل 4h = 10 روز)
+TARGETS     = [5, 10, 20, 30]                       # اهداف سود (درصد)
+DDS         = [2, 3, 4]                             # حداکثر ریزش مجاز (درصد)
+N_BINS      = int(os.getenv("N_BINS", "10"))        # تعداد سطل برای o_pos و c_pos
+MIN_SAMPLES = int(os.getenv("MIN_SAMPLES", "50"))   # حداقل نمونه برای معتبر بودن یک سطل
+MIN_RANGE   = float(os.getenv("MIN_RANGE", "0.002"))# حداقل رنج نسبت به open (فیلتر نویز)
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID")
+TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
 
 
 def flatten(df):
@@ -42,119 +27,71 @@ def flatten(df):
     return df
 
 
-def features(o, h, l, c):
-    """
-    ویژگی‌های یک کندل (همه بین 0 و 1):
-      [0] موقعیت open در رنج
-      [1] موقعیت close در رنج
-      [2] سایه بالایی
-      [3] سایه پایینی
-      [4] جهت بدنه (1=صعودی، 0=نزولی)
-    """
-    r = h - l
-    if r <= 0:
-        return None
-    o_pos = (o - l) / r
-    c_pos = (c - l) / r
-    up_wick = (h - max(o, c)) / r
-    lo_wick = (min(o, c) - l) / r
-    direction = 1.0 if c >= o else 0.0
-    return np.array([o_pos, c_pos, up_wick, lo_wick, direction], dtype=float)
-
-
-def batch_features(o, h, l, c):
-    """نسخه برداری‌شده features برای آرایه‌های numpy"""
-    rng = h - l
-    valid = rng > 0
-    safe = np.where(valid, rng, 1.0)
-    o_pos = (o - l) / safe
-    c_pos = (c - l) / safe
-    up_wick = (h - np.maximum(o, c)) / safe
-    lo_wick = (np.minimum(o, c) - l) / safe
-    direction = (c >= o).astype(float)
-    feats = np.column_stack([o_pos, c_pos, up_wick, lo_wick, direction])
-    feats[~valid] = np.nan
-    return feats
-
-
-def get_reference():
-    d = pd.Timestamp(REF_DATE)
-    df = yf.download(REF_SYMBOL, start=d, end=d + pd.Timedelta(days=1),
-                     interval="1d", progress=False, auto_adjust=False)
-    df = flatten(df)
-    if df.empty:
-        raise RuntimeError("کندل مرجع از یاهو دریافت نشد")
-    r = df.iloc[0]
-    o, h, l, c = float(r["Open"]), float(r["High"]), float(r["Low"]), float(r["Close"])
-    ref_feat = features(o, h, l, c)
-    if ref_feat is None:
-        raise RuntimeError("کندل مرجع رنج صفر دارد")
-    return ref_feat, (o, h, l, c)
-
-
 def get_4h(symbol):
-    # یاهو 4 ساعته ندارد؛ از 1 ساعته (حداکثر ~2 سال) ساخته می‌شود
+    """از داده 1h، 4h می‌سازه (یاهو 4h نداره)"""
     df = yf.download(symbol, period="729d", interval="1h",
                      progress=False, auto_adjust=False)
     df = flatten(df)
     if df.empty:
         return None
-    df = df.resample("4h").agg(
+    return df.resample("4h").agg(
         {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
     ).dropna()
-    return df
 
 
-def analyze(df, ref_feat, ref_rng_pct):
+def scan_coin(df):
+    """
+    برای هر کندل: سطل آن + نتیجه آینده‌اش را برمی‌گرداند.
+    خروجی: لیستی از (bucket_key, { (target,dd): 0/1 })
+    """
     o, h, l, c = (df[k].values.astype(float) for k in ["Open", "High", "Low", "Close"])
     n = len(df)
+    if n < HORIZON + 10:
+        return []
 
-    # حذف کندل‌های با رنج خیلی کوچک (نویز)
     rng = h - l
-    valid_range = (rng / np.where(o == 0, np.nan, o)) >= MIN_RANGE_PCT
-    valid_range &= rng > 0
+    valid = (rng > 0) & (rng / np.where(o == 0, np.nan, o) >= MIN_RANGE)
+    valid = np.nan_to_num(valid, nan=False)
 
-    feats = batch_features(o, h, l, c)
-    diff = feats - ref_feat                        # shape (n, 5)
-    weighted = diff * WEIGHTS                       # وزن‌دهی
-    dist = np.linalg.norm(weighted, axis=1)         # فاصله اقلیدسی وزن‌دار
-    dist = np.nan_to_num(dist, nan=9.0)
+    safe = np.where(rng > 0, rng, 1.0)
+    o_pos = (o - l) / safe
+    c_pos = (c - l) / safe
+    direction = (c >= o).astype(int)
 
-    mask = (dist <= THRESHOLD) & valid_range
-
-    if SIZE_TOL > 0:
-        rp = rng / np.where(o == 0, np.nan, o)
-        mask &= (rp >= ref_rng_pct / SIZE_TOL) & (rp <= ref_rng_pct * SIZE_TOL)
-
-    mask = np.nan_to_num(mask, nan=False).astype(bool)
-    idx = np.where(mask)[0]
-
-    found = len(idx)   # همه کندل‌های مشابه
-    total = 0          # فقط آن‌هایی که افق کامل دارند
-    succ = {(t, d): 0 for t in TARGETS for d in DDS}
-
-    for i in idx:
-        if i + HORIZON >= n:
+    out = []
+    for i in range(0, n - HORIZON):
+        if not valid[i]:
             continue
-        total += 1
         entry = c[i]
         fh = h[i + 1:i + 1 + HORIZON]
         fl = l[i + 1:i + 1 + HORIZON]
         runmin = np.minimum.accumulate(fl)
+
+        ob = min(int(o_pos[i] * N_BINS), N_BINS - 1)
+        cb = min(int(c_pos[i] * N_BINS), N_BINS - 1)
+        bucket = (ob, cb, int(direction[i]))
+
+        result = {}
         for t in TARGETS:
             hits = np.where(fh >= entry * (1 + t / 100))[0]
             if len(hits) == 0:
+                for d in DDS:
+                    result[(t, d)] = 0
                 continue
             worst = runmin[hits[0]]
             for d in DDS:
-                if worst > entry * (1 - d / 100):
-                    succ[(t, d)] += 1
+                result[(t, d)] = 1 if worst > entry * (1 - d / 100) else 0
 
-    return found, total, succ
+        out.append((bucket, result))
+    return out
 
 
-def pct(a, b):
-    return 0.0 if b == 0 else 100.0 * a / b
+def bucket_label(bucket):
+    ob, cb, dirn = bucket
+    o_lo, o_hi = ob / N_BINS, (ob + 1) / N_BINS
+    c_lo, c_hi = cb / N_BINS, (cb + 1) / N_BINS
+    dir_s = "صعودی" if dirn == 1 else "نزولی"
+    return f"open∈[{o_lo:.1f},{o_hi:.1f}) close∈[{c_lo:.1f},{c_hi:.1f}) {dir_s}"
 
 
 def send_telegram(text):
@@ -176,79 +113,103 @@ def send_telegram(text):
 
 
 def main():
-    ref_feat, (ro, rh, rl, rc) = get_reference()
-    ref_rng_pct = (rh - rl) / ro
-
-    grand_found = 0
-    grand_total = 0
-    grand = {(t, d): 0 for t in TARGETS for d in DDS}
-    per_coin = {}
-
+    # 1) اسکن همه ارزها
+    all_rows = []
     for sym in COINS:
         try:
             df = get_4h(sym)
-            if df is None or len(df) < HORIZON + 10:
-                print(f"{sym}: داده کافی نیست")
+            if df is None:
+                print(f"{sym}: داده نیامد")
                 continue
-            found, total, succ = analyze(df, ref_feat, ref_rng_pct)
-            per_coin[sym] = (found, total, succ)
-            grand_found += found
-            grand_total += total
-            for k, v in succ.items():
-                grand[k] += v
+            rows = scan_coin(df)
+            print(f"{sym}: {len(rows)} کندل اسکن شد")
+            for b, r in rows:
+                all_rows.append((b, r, sym))
         except Exception as e:
             print(f"{sym}: خطا {e}")
 
-    lines = [
-        f"کندل مرجع: {REF_SYMBOL} {REF_DATE} (روزانه)",
-        f"O={ro:.2f} H={rh:.2f} L={rl:.2f} C={rc:.2f}",
-        f"رنج: {ref_rng_pct*100:.2f}%  |  جهت: {'صعودی' if rc>=ro else 'نزولی'}",
-        f"ویژگی مرجع (o_pos, c_pos, up_wick, lo_wick, dir): "
-        f"{ref_feat[0]:.2f}, {ref_feat[1]:.2f}, {ref_feat[2]:.2f}, "
-        f"{ref_feat[3]:.2f}, {ref_feat[4]:.0f}",
-        f"وزن‌ها: open={WEIGHTS[0]} close={WEIGHTS[1]} up_w={WEIGHTS[2]} "
-        f"lo_w={WEIGHTS[3]} dir={WEIGHTS[4]}",
-        f"آستانه فاصله وزن‌دار: {THRESHOLD} | فیلتر اندازه: x{SIZE_TOL} | "
-        f"افق: {HORIZON} کندل 4h | حداقل رنج: {MIN_RANGE_PCT*100:.2f}%",
-        "",
-        f"کندل مشابه پیدا شده: {grand_found}",
-        f"استفاده شده در محاسبه (افق کامل دارند): {grand_total}",
-        f"کنار گذاشته شده (افق ناقص): {grand_found - grand_total}",
-        "",
-        "تعداد پیدا شده در هر ارز:",
-    ]
-    for sym, (found, total, _) in per_coin.items():
-        lines.append(f"{sym:<9} پیدا شده={found:<4} محاسبه={total}")
-    lines.append("")
+    if not all_rows:
+        send_telegram("هیچ داده‌ای اسکن نشد.")
+        return
 
-    if grand_total == 0:
-        lines.append("نمونه‌ای برای محاسبه نبود. THRESHOLD یا SIZE_TOL را بزرگ‌تر کن.")
+    # 2) تجمیع در سطل‌ها
+    buckets = {}
+    for b, r, sym in all_rows:
+        if b not in buckets:
+            buckets[b] = {"n": 0, "succ": {(t, d): 0 for t in TARGETS for d in DDS},
+                          "coins": {}}
+        buckets[b]["n"] += 1
+        for k, v in r.items():
+            buckets[b]["succ"][k] += v
+        buckets[b]["coins"][sym] = buckets[b]["coins"].get(sym, 0) + 1
+
+    # 3) بازه پایه (baseline) روی کل داده
+    total_n = len(all_rows)
+    baseline = {(t, d): 0 for t in TARGETS for d in DDS}
+    for _, r, _ in all_rows:
+        for k, v in r.items():
+            baseline[k] += v
+
+    # 4) رتبه‌بندی سطل‌ها بر اساس هدف/ریزش مشخص (TARGET_RANK/DD_RANK)
+    T_RANK = float(os.getenv("TARGET_RANK", "5"))
+    DD_RANK = float(os.getenv("DD_RANK", "3"))
+    key = (T_RANK, DD_RANK)
+
+    ranked = []
+    for b, info in buckets.items():
+        if info["n"] < MIN_SAMPLES:
+            continue
+        wr = 100.0 * info["succ"][key] / info["n"]
+        base_wr = 100.0 * baseline[key] / total_n
+        ranked.append((wr, base_wr, b, info))
+
+    ranked.sort(reverse=True)
+
+    # 5) ساخت گزارش
+    lines = [
+        "🔍 اسکنر خودکار بهترین الگوی کندلی",
+        f"تعداد کل کندل اسکن‌شده: {total_n}",
+        f"افق: {HORIZON} کندل 4h | حداقل رنج: {MIN_RANGE*100:.2f}%",
+        f"سطل‌بندی: {N_BINS}×{N_BINS}×2 (open × close × جهت)",
+        f"معیار رتبه‌بندی: هدف {T_RANK:.0f}% / ریزش <{DD_RANK:.0f}%",
+        f"حداقل نمونه هر سطل: {MIN_SAMPLES}",
+        "",
+        f"📊 بازه پایه (کل داده): {100.0*baseline[key]/total_n:.1f}%",
+        "",
+    ]
+
+    if not ranked:
+        lines.append("⚠️ هیچ سطلی حداقل نمونه را نداشت. MIN_SAMPLES را کم کن.")
         send_telegram("\n".join(lines))
         return
 
-    lines.append("درصد رسیدن به هدف قبل از ریزش بیش از حد مجاز:")
+    lines.append("🏆 ۱۵ سطل برتر (فراتر از بازه پایه):")
+    lines.append("-" * 40)
+    for wr, base_wr, b, info in ranked[:15]:
+        edge = wr - base_wr
+        lines.append(f"{bucket_label(b)}")
+        lines.append(f"  n={info['n']:<5} موفقیت={wr:5.1f}%  (پایه={base_wr:4.1f}%، لبه={edge:+.1f}%)")
+        # ارزهایی که بیشترین سهم را داشتند
+        top_coins = sorted(info["coins"].items(), key=lambda x: -x[1])[:3]
+        lines.append("  بیشتر در: " + ", ".join(f"{s}({c})" for s, c in top_coins))
+        lines.append("")
+
+    lines.append("📋 عملکرد کامل بهترین سطل:")
+    best_b = ranked[0][2]
+    best_info = ranked[0][3]
+    lines.append(f"الگو: {bucket_label(best_b)}")
     lines.append("هدف |  ریزش<2%  ریزش<3%  ریزش<4%")
     for t in TARGETS:
-        row = "  ".join(f"{pct(grand[(t, d)], grand_total):6.1f}%" for d in DDS)
+        row = "  ".join(
+            f"{100.0*best_info['succ'][(t,d)]/best_info['n']:6.1f}%" for d in DDS
+        )
         lines.append(f"{t:>3}% | {row}")
     lines.append("")
 
-    ranking = []
-    for sym, (found, total, succ) in per_coin.items():
-        if total < MIN_SAMPLES:
-            continue
-        avg = np.mean([pct(v, total) for v in succ.values()])
-        ranking.append((avg, sym, total, pct(succ[(5, 2)], total)))
-    ranking.sort(reverse=True)
-
-    if ranking:
-        lines.append("رتبه ارزها (میانگین موفقیت همه سناریوها):")
-        for avg, sym, total, r52 in ranking:
-            lines.append(f"{sym:<9} n={total:<4} میانگین={avg:5.1f}%  هدف5/ریزش2={r52:5.1f}%")
-        lines.append("")
-        lines.append(f"بهترین ارز: {ranking[0][1]}")
-    else:
-        lines.append(f"هیچ ارزی حداقل {MIN_SAMPLES} نمونه نداشت.")
+    lines.append("📉 بدترین سطل (برای مقایسه):")
+    worst = ranked[-1]
+    lines.append(f"الگو: {bucket_label(worst[2])}")
+    lines.append(f"  n={worst[3]['n']:<5} موفقیت={worst[0]:5.1f}%")
 
     send_telegram("\n".join(lines))
 
