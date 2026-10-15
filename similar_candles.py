@@ -72,11 +72,12 @@ def analyze(df, ref_feat, ref_rng_pct):
         mask &= (rp >= ref_rng_pct / SIZE_TOL) & (rp <= ref_rng_pct * SIZE_TOL)
     idx = np.where(mask)[0]
 
-    total = 0
+    found = len(idx)          # همه کندل‌های مشابه پیدا شده
+    total = 0                 # فقط آن‌هایی که افق کامل دارند
     succ = {(t, d): 0 for t in TARGETS for d in DDS}
 
     for i in idx:
-        if i + HORIZON >= n:       # افق کامل در دسترس نیست
+        if i + HORIZON >= n:  # افق کامل در دسترس نیست
             continue
         total += 1
         entry = c[i]
@@ -91,7 +92,7 @@ def analyze(df, ref_feat, ref_rng_pct):
             for d in DDS:
                 if worst > entry * (1 - d / 100):
                     succ[(t, d)] += 1
-    return total, succ
+    return found, total, succ
 
 
 def pct(a, b):
@@ -120,6 +121,7 @@ def main():
     ref_feat, (ro, rh, rl, rc) = get_reference()
     ref_rng_pct = (rh - rl) / ro
 
+    grand_found = 0
     grand_total = 0
     grand = {(t, d): 0 for t in TARGETS for d in DDS}
     per_coin = {}
@@ -130,8 +132,9 @@ def main():
             if df is None or len(df) < HORIZON + 10:
                 print(f"{sym}: داده کافی نیست")
                 continue
-            total, succ = analyze(df, ref_feat, ref_rng_pct)
-            per_coin[sym] = (total, succ)
+            found, total, succ = analyze(df, ref_feat, ref_rng_pct)
+            per_coin[sym] = (found, total, succ)
+            grand_found += found
             grand_total += total
             for k, v in succ.items():
                 grand[k] += v
@@ -143,12 +146,19 @@ def main():
         f"O={ro:.2f} H={rh:.2f} L={rl:.2f} C={rc:.2f}",
         f"موقعیت open/close در رنج: {ref_feat[0]:.2f} / {ref_feat[1]:.2f} | رنج: {ref_rng_pct*100:.2f}%",
         f"آستانه: {THRESHOLD} | فیلتر اندازه: x{SIZE_TOL} | افق: {HORIZON} کندل 4h",
-        f"تعداد کندل مشابه (کل ارزها): {grand_total}",
         "",
+        f"کندل مشابه پیدا شده: {grand_found}",
+        f"استفاده شده در محاسبه (افق کامل دارند): {grand_total}",
+        f"کنار گذاشته شده (افق ناقص): {grand_found - grand_total}",
+        "",
+        "تعداد پیدا شده در هر ارز:",
     ]
+    for sym, (found, total, _) in per_coin.items():
+        lines.append(f"{sym:<9} پیدا شده={found:<4} محاسبه={total}")
+    lines.append("")
 
     if grand_total == 0:
-        lines.append("کندل مشابهی پیدا نشد. THRESHOLD یا SIZE_TOL را بزرگ‌تر کن.")
+        lines.append("نمونه‌ای برای محاسبه نبود. THRESHOLD یا SIZE_TOL را بزرگ‌تر کن.")
         send_telegram("\n".join(lines))
         return
 
@@ -160,7 +170,7 @@ def main():
     lines.append("")
 
     ranking = []
-    for sym, (total, succ) in per_coin.items():
+    for sym, (found, total, succ) in per_coin.items():
         if total < MIN_SAMPLES:
             continue
         avg = np.mean([pct(v, total) for v in succ.values()])
