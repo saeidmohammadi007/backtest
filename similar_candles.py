@@ -1,29 +1,27 @@
 import os
-import sys
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import requests
 
 # ---------------- تنظیمات ----------------
-REF_SYMBOL = os.getenv("REF_SYMBOL", "BTC-USD")   # ارزی که کندل مرجع از آن گرفته می‌شود
+REF_SYMBOL = os.getenv("REF_SYMBOL", "BTC-USD")
 REF_DATE = os.getenv("REF_DATE", "2025-07-04")
-THRESHOLD = float(os.getenv("THRESHOLD", "0.08"))  # آستانه فاصله اقلیدسی
-HORIZON = int(os.getenv("HORIZON", "60"))          # تعداد کندل 4 ساعته بعد از ورود (60 = 10 روز)
-MIN_SAMPLES = int(os.getenv("MIN_SAMPLES", "10"))  # حداقل نمونه برای رتبه‌بندی ارز
+THRESHOLD = float(os.getenv("THRESHOLD", "0.08"))
+HORIZON = int(os.getenv("HORIZON", "60"))          # 60 کندل 4h = 10 روز
+MIN_SAMPLES = int(os.getenv("MIN_SAMPLES", "10"))
 
 COINS = [
     "BTC-USD", "ETH-USD", "XRP-USD", "BNB-USD", "SOL-USD",
     "DOGE-USD", "TRX-USD", "ADA-USD", "AVAX-USD", "LINK-USD",
 ]
-TARGETS = [5, 10, 20, 30, 50, 100]   # درصد هدف
-DDS = [2, 3, 4]                      # حداکثر ریزش مجاز (درصد)
+TARGETS = [5, 10, 20, 30, 50, 100]
+DDS = [2, 3, 4]
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID")
 
 
-# ---------------- توابع ----------------
 def flatten(df):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -31,7 +29,6 @@ def flatten(df):
 
 
 def features(o, h, l, c):
-    """شکل کندل نسبت به قیمت باز شدن: [high, low, close]"""
     return np.array([h / o - 1, l / o - 1, c / o - 1], dtype=float)
 
 
@@ -48,23 +45,18 @@ def get_reference():
 
 
 def get_4h(symbol):
-    # یاهو تایم‌فریم 4 ساعته ندارد؛ از 1 ساعته (حداکثر ~2 سال) ساخته می‌شود
     df = yf.download(symbol, period="729d", interval="1h",
                      progress=False, auto_adjust=False)
     df = flatten(df)
     if df.empty:
         return None
-    df = df.resample("4h").agg(
+    return df.resample("4h").agg(
         {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
     ).dropna()
-    return df
 
 
 def analyze(df, ref_feat):
-    o = df["Open"].values
-    h = df["High"].values
-    l = df["Low"].values
-    c = df["Close"].values
+    o, h, l, c = (df[k].values for k in ["Open", "High", "Low", "Close"])
     n = len(df)
     feats = np.column_stack([h / o - 1, l / o - 1, c / o - 1])
     dist = np.linalg.norm(feats - ref_feat, axis=1)
@@ -74,7 +66,7 @@ def analyze(df, ref_feat):
     succ = {(t, d): 0 for t in TARGETS for d in DDS}
 
     for i in idx:
-        if i + HORIZON >= n:   # افق کامل در دسترس نیست
+        if i + HORIZON >= n:
             continue
         total += 1
         entry = c[i]
@@ -85,9 +77,7 @@ def analyze(df, ref_feat):
             hits = np.where(fh >= entry * (1 + t / 100))[0]
             if len(hits) == 0:
                 continue
-            j = hits[0]
-            # محافظه‌کارانه: کف همان کندلِ رسیدن به هدف هم حساب می‌شود
-            worst = runmin[j]
+            worst = runmin[hits[0]]   # محافظه‌کارانه: کف همان کندل هم حساب می‌شود
             for d in DDS:
                 if worst > entry * (1 - d / 100):
                     succ[(t, d)] += 1
@@ -101,7 +91,6 @@ def pct(a, b):
 def send_telegram(text):
     if not TG_TOKEN or not TG_CHAT:
         print(text)
-        print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID تنظیم نشده؛ فقط چاپ شد.")
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     chunks, cur = [], ""
@@ -113,8 +102,8 @@ def send_telegram(text):
     if cur:
         chunks.append(cur)
     for ch in chunks:
-        r = requests.post(url, data={"chat_id": TG_CHAT, "text": ch}, timeout=30)
-        r.raise_for_status()
+        requests.post(url, data={"chat_id": TG_CHAT, "text": ch},
+                      timeout=30).raise_for_status()
 
 
 def main():
@@ -138,12 +127,13 @@ def main():
         except Exception as e:
             print(f"{sym}: خطا {e}")
 
-    lines = []
-    lines.append(f"کندل مرجع: {REF_SYMBOL} {REF_DATE} (روزانه)")
-    lines.append(f"O={ro:.2f} H={rh:.2f} L={rl:.2f} C={rc:.2f}")
-    lines.append(f"آستانه اقلیدسی: {THRESHOLD} | افق: {HORIZON} کندل 4h")
-    lines.append(f"تعداد کندل مشابه (کل ارزها): {grand_total}")
-    lines.append("")
+    lines = [
+        f"کندل مرجع: {REF_SYMBOL} {REF_DATE} (روزانه)",
+        f"O={ro:.2f} H={rh:.2f} L={rl:.2f} C={rc:.2f}",
+        f"آستانه اقلیدسی: {THRESHOLD} | افق: {HORIZON} کندل 4h",
+        f"تعداد کندل مشابه (کل ارزها): {grand_total}",
+        "",
+    ]
 
     if grand_total == 0:
         lines.append("کندل مشابهی پیدا نشد.")
@@ -157,7 +147,6 @@ def main():
         lines.append(f"{t:>3}% | {row}")
     lines.append("")
 
-    # رتبه‌بندی ارزها: میانگین نرخ موفقیت در همه ترکیب‌های هدف/ریزش
     ranking = []
     for sym, (total, succ) in per_coin.items():
         if total < MIN_SAMPLES:
