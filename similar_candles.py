@@ -5,7 +5,6 @@ import yfinance as yf
 import requests
 from concurrent.futures import ThreadPoolExecutor
 
-# ---------------- تنظیمات ----------------
 COINS = [
     "BTC-USD", "ETH-USD", "XRP-USD", "BNB-USD", "SOL-USD",
     "DOGE-USD", "TRX-USD", "ADA-USD", "AVAX-USD", "LINK-USD",
@@ -20,6 +19,7 @@ MIN_RANGE   = float(os.getenv("MIN_RANGE", "0.002"))
 T_RANK      = float(os.getenv("TARGET_RANK", "5"))
 DD_RANK     = float(os.getenv("DD_RANK", "3"))
 SHOW_FAILS  = os.getenv("SHOW_FAILS", "0") == "1"
+MIN_COIN_N  = int(os.getenv("MIN_COIN_N", "3"))
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
@@ -34,7 +34,6 @@ def flatten(df):
 
 
 def get_4h(symbol):
-    """دانلود داده 4h با کش pickle (بدون نیاز به pyarrow)"""
     path = os.path.join(CACHE_DIR, f"{symbol}.pkl")
     if os.path.exists(path):
         try:
@@ -43,7 +42,6 @@ def get_4h(symbol):
                 return df
         except Exception:
             pass
-
     df = yf.download(symbol, period="729d", interval="1h",
                      progress=False, auto_adjust=False)
     df = flatten(df)
@@ -52,7 +50,6 @@ def get_4h(symbol):
     df = df.resample("4h").agg(
         {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
     ).dropna()
-
     try:
         df.to_pickle(path)
     except Exception:
@@ -90,6 +87,9 @@ def scan_coin(df, symbol):
         bucket = (ob, cb, int(direction[i]))
 
         result = {}
+        # max_favorable: بیشترین سود بدون تجاوز از ریزش
+        # max_runup: بیشترین سود تا قبل از ریزش مجاز
+        runup_before_dd = {}
         for t in TARGETS:
             hits = np.where(fh >= entry * (1 + t / 100))[0]
             if len(hits) == 0:
@@ -100,7 +100,12 @@ def scan_coin(df, symbol):
             for d in DDS:
                 result[(t, d)] = 1 if worst > entry * (1 - d / 100) else 0
 
-        out.append((bucket, result, idx[i], symbol))
+        # محاسبه سود/ضرر نهایی (بدون هدف، فقط برای رتبه‌بندی رخداد)
+        future_max_pct = 100 * (np.max(fh) - entry) / entry
+        future_min_pct = 100 * (np.min(fl) - entry) / entry
+
+        out.append((bucket, result, idx[i], symbol,
+                    future_max_pct, future_min_pct, entry))
     return out
 
 
@@ -138,19 +143,16 @@ def main():
     all_rows = []
     for sym, df in zip(COINS, dfs):
         if df is None:
-            print(f"{sym}: داده نیامد")
             continue
-        rows = scan_coin(df, sym)
-        print(f"{sym}: {len(rows)} کندل اسکن شد")
-        all_rows.extend(rows)
+        all_rows.extend(scan_coin(df, sym))
 
     if not all_rows:
         send_telegram("داده‌ای نیامد.")
         return
 
-    # تجمیع در سطل‌ها
+    # تجمیع سطل‌ها
     buckets = {}
-    for b, r, dt, sym in all_rows:
+    for b, r, dt, sym, fmax, fmin, entry in all_rows:
         buckets.setdefault(b, {
             "n": 0,
             "succ": {(t, d): 0 for t in TARGETS for d in DDS},
@@ -159,14 +161,16 @@ def main():
         buckets[b]["n"] += 1
         for k, v in r.items():
             buckets[b]["succ"][k] += v
-        buckets[b]["events"].append((dt, sym, r[(T_RANK, DD_RANK)]))
+        buckets[b]["events"].append({
+            "date": dt, "symbol": sym,
+            "success": r[(T_RANK, DD_RANK)],
+            "fmax": fmax, "fmin": fmin, "entry": entry,
+        })
 
-    # بازه پایه
     total_n = len(all_rows)
-    baseline_cnt = sum(r[(T_RANK, DD_RANK)] for _, r, _, _ in all_rows)
+    baseline_cnt = sum(r[(T_RANK, DD_RANK)] for _, r, _, _, _, _, _ in all_rows)
     base_wr = 100.0 * baseline_cnt / total_n
 
-    # رتبه‌بندی سطل‌ها
     key = (T_RANK, DD_RANK)
     ranked = []
     for b, info in buckets.items():
@@ -181,45 +185,81 @@ def main():
         return
 
     best_wr, best_b, best_info = ranked[0]
-    evs = sorted(best_info["events"], key=lambda x: x[0])
-    succ = [(d, s) for d, s, ok in evs if ok == 1]
-    fail = [(d, s) for d, s, ok in evs if ok == 0]
+    evs = best_info["events"]
 
+    # ----------------- تحلیل per-coin -----------------
+    coin_stats = {}
+    for e in evs:
+        s = e["symbol"]
+        coin_stats.setdefault(s, {"n": 0, "succ": 0, "events": []})
+        coin_stats[s]["n"] += 1
+        coin_stats[s]["succ"] += e["success"]
+        coin_stats[s]["events"].append(e)
+
+    coin_rank = []
+    for s, st in coin_stats.items():
+        if st["n"] < MIN_COIN_N:
+            continue
+        wr = 100.0 * st["succ"] / st["n"]
+        coin_rank.append((wr, s, st))
+    coin_rank.sort(reverse=True)
+
+    # ----------------- بهترین رخداد تکی -----------------
+    # معیار: موفق + بیشترین سود محقق‌شده (fmax) + کمترین ضرر (fmin نزدیک به صفر)
+    succ_evs = [e for e in evs if e["success"] == 1]
+    succ_evs_sorted = sorted(succ_evs, key=lambda x: -x["fmax"])
+
+    # ----------------- گزارش -----------------
     lines = [
-        "🔍 بهترین الگو + لیست رخدادها",
+        "🎯 بهترین الگو + بهترین ارز + بهترین تاریخ",
         f"الگو: {bucket_label(best_b)}",
         f"n={best_info['n']} | موفقیت={best_wr:.1f}% | پایه={base_wr:.1f}% | لبه={best_wr-base_wr:+.1f}%",
         f"معیار: هدف {T_RANK:.0f}% / ریزش <{DD_RANK:.0f}%",
         "",
-        f"✅ رخدادهای موفق ({len(succ)} تا):",
-        "─────────────",
     ]
-    for d, s in succ:
-        lines.append(f"{d.strftime('%Y-%m-%d %H:%M')}  |  {s}")
+
+    # 🏆 بهترین ارز
+    if coin_rank:
+        lines.append("🏆 بهترین ارز برای این الگو:")
+        lines.append(f"{'ارز':<10} {'n':<5} {'موفق':<5} {'وین‌ریت'}")
+        lines.append("─" * 35)
+        for wr, s, st in coin_rank:
+            lines.append(f"{s:<10} {st['n']:<5} {st['succ']:<5} {wr:5.1f}%")
+        lines.append("")
+        lines.append(f"🥇 بهترین ارز: {coin_rank[0][1]} (وین‌ریت {coin_rank[0][0]:.1f}% با n={coin_rank[0][2]['n']})")
+        lines.append("")
+
+    # 🌟 بهترین رخداد تکی
+    if succ_evs_sorted:
+        lines.append("🌟 بهترین رخداد تکی (بیشترین سود محقق‌شده):")
+        lines.append(f"{'تاریخ':<18} {'ارز':<10} {'سود max':>8} {'ضرر min':>9}")
+        lines.append("─" * 50)
+        for e in succ_evs_sorted[:10]:
+            lines.append(
+                f"{e['date'].strftime('%Y-%m-%d %H:%M'):<18} "
+                f"{e['symbol']:<10} "
+                f"{e['fmax']:>7.2f}% "
+                f"{e['fmin']:>8.2f}%"
+            )
+        best = succ_evs_sorted[0]
+        lines.append("")
+        lines.append(f"🥇 بهترین رخداد: {best['date'].strftime('%Y-%m-%d %H:%M')} روی {best['symbol']}")
+        lines.append(f"   سود حداکثری: {best['fmax']:.2f}%  |  ضرر حداکثری: {best['fmin']:.2f}%")
+        lines.append("")
+
+    # 📋 لیست همه رخدادهای موفق (مثل قبل)
+    lines.append(f"📋 همه رخدادهای موفق ({len(succ_evs)} تا):")
+    lines.append("─────────────")
+    for e in sorted(succ_evs, key=lambda x: x["date"]):
+        lines.append(f"{e['date'].strftime('%Y-%m-%d %H:%M')}  |  {e['symbol']}")
 
     if SHOW_FAILS:
+        fails = [e for e in evs if e["success"] == 0]
         lines.append("")
-        lines.append(f"❌ رخدادهای ناموفق ({len(fail)} تا):")
+        lines.append(f"❌ رخدادهای ناموفق ({len(fails)} تا):")
         lines.append("─────────────")
-        for d, s in fail:
-            lines.append(f"{d.strftime('%Y-%m-%d %H:%M')}  |  {s}")
-
-    lines.append("")
-    lines.append("📊 سهم هر ارز در رخدادهای موفق:")
-    coin_count = {}
-    for _, s in succ:
-        coin_count[s] = coin_count.get(s, 0) + 1
-    for s, cnt in sorted(coin_count.items(), key=lambda x: -x[1]):
-        lines.append(f"  {s:<10} {cnt}")
-
-    lines.append("")
-    lines.append("📅 توزیع سالانه رخدادهای موفق:")
-    year_count = {}
-    for d, _ in succ:
-        year_count[d.year] = year_count.get(d.year, 0) + 1
-    for y in sorted(year_count):
-        bar = "█" * min(year_count[y], 40)
-        lines.append(f"  {y}  {year_count[y]:>3}  {bar}")
+        for e in sorted(fails, key=lambda x: x["date"]):
+            lines.append(f"{e['date'].strftime('%Y-%m-%d %H:%M')}  |  {e['symbol']}")
 
     send_telegram("\n".join(lines))
 
