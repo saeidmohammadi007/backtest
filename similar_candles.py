@@ -7,10 +7,23 @@ import requests
 # ---------------- تنظیمات ----------------
 REF_SYMBOL = os.getenv("REF_SYMBOL", "ETH-USD")
 REF_DATE = os.getenv("REF_DATE", "2024-11-05")
-THRESHOLD = float(os.getenv("THRESHOLD", "0.1"))    # فاصله اقلیدسی روی شکل کندل (بین 0 و 1.41)
-SIZE_TOL = float(os.getenv("SIZE_TOL", "2"))        # فیلتر اندازه رنج؛ 0 = بدون فیلتر
-HORIZON = int(os.getenv("HORIZON", "60"))           # 60 کندل 4h = 10 روز
+
+# توجه: با تغییر به فضای 5 بُعدی، آستانه باید بازکالیبره شود.
+# حداکثر فاصله ممکن ≈ 0.47 است. آستانه 0.15 یعنی ~32٪ از حداکثر.
+THRESHOLD = float(os.getenv("THRESHOLD", "0.15"))
+SIZE_TOL = float(os.getenv("SIZE_TOL", "2"))
+HORIZON = int(os.getenv("HORIZON", "60"))
 MIN_SAMPLES = int(os.getenv("MIN_SAMPLES", "10"))
+MIN_RANGE_PCT = float(os.getenv("MIN_RANGE_PCT", "0.001"))  # حداقل رنج نسبت به open
+
+# وزن ویژگی‌ها (جمعشان = 1.0)
+WEIGHTS = np.array([
+    float(os.getenv("W_OPEN",   "0.25")),   # موقعیت open
+    float(os.getenv("W_CLOSE",  "0.30")),   # موقعیت close (مهم‌تر)
+    float(os.getenv("W_UPWICK", "0.15")),   # سایه بالایی
+    float(os.getenv("W_LOWICK", "0.15")),   # سایه پایینی
+    float(os.getenv("W_DIR",    "0.15")),   # جهت بدنه (صعودی/نزولی)
+])
 
 COINS = [
     "BTC-USD", "ETH-USD", "XRP-USD", "BNB-USD", "SOL-USD",
@@ -30,9 +43,38 @@ def flatten(df):
 
 
 def features(o, h, l, c):
-    """جای open و close داخل رنج low..high (مستقل از اندازه کندل)"""
-    r = (h - l) or 1e-12
-    return np.array([(o - l) / r, (c - l) / r], dtype=float)
+    """
+    ویژگی‌های یک کندل (همه بین 0 و 1):
+      [0] موقعیت open در رنج
+      [1] موقعیت close در رنج
+      [2] سایه بالایی
+      [3] سایه پایینی
+      [4] جهت بدنه (1=صعودی، 0=نزولی)
+    """
+    r = h - l
+    if r <= 0:
+        return None
+    o_pos = (o - l) / r
+    c_pos = (c - l) / r
+    up_wick = (h - max(o, c)) / r
+    lo_wick = (min(o, c) - l) / r
+    direction = 1.0 if c >= o else 0.0
+    return np.array([o_pos, c_pos, up_wick, lo_wick, direction], dtype=float)
+
+
+def batch_features(o, h, l, c):
+    """نسخه برداری‌شده features برای آرایه‌های numpy"""
+    rng = h - l
+    valid = rng > 0
+    safe = np.where(valid, rng, 1.0)
+    o_pos = (o - l) / safe
+    c_pos = (c - l) / safe
+    up_wick = (h - np.maximum(o, c)) / safe
+    lo_wick = (np.minimum(o, c) - l) / safe
+    direction = (c >= o).astype(float)
+    feats = np.column_stack([o_pos, c_pos, up_wick, lo_wick, direction])
+    feats[~valid] = np.nan
+    return feats
 
 
 def get_reference():
@@ -44,7 +86,10 @@ def get_reference():
         raise RuntimeError("کندل مرجع از یاهو دریافت نشد")
     r = df.iloc[0]
     o, h, l, c = float(r["Open"]), float(r["High"]), float(r["Low"]), float(r["Close"])
-    return features(o, h, l, c), (o, h, l, c)
+    ref_feat = features(o, h, l, c)
+    if ref_feat is None:
+        raise RuntimeError("کندل مرجع رنج صفر دارد")
+    return ref_feat, (o, h, l, c)
 
 
 def get_4h(symbol):
@@ -54,30 +99,42 @@ def get_4h(symbol):
     df = flatten(df)
     if df.empty:
         return None
-    return df.resample("4h").agg(
+    df = df.resample("4h").agg(
         {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
     ).dropna()
+    return df
 
 
 def analyze(df, ref_feat, ref_rng_pct):
-    o, h, l, c = (df[k].values for k in ["Open", "High", "Low", "Close"])
+    o, h, l, c = (df[k].values.astype(float) for k in ["Open", "High", "Low", "Close"])
     n = len(df)
+
+    # حذف کندل‌های با رنج خیلی کوچک (نویز)
     rng = h - l
-    safe = np.where(rng == 0, np.nan, rng)
-    feats = np.column_stack([(o - l) / safe, (c - l) / safe])
-    dist = np.nan_to_num(np.linalg.norm(feats - ref_feat, axis=1), nan=9.0)
-    mask = dist <= THRESHOLD
+    valid_range = (rng / np.where(o == 0, np.nan, o)) >= MIN_RANGE_PCT
+    valid_range &= rng > 0
+
+    feats = batch_features(o, h, l, c)
+    diff = feats - ref_feat                        # shape (n, 5)
+    weighted = diff * WEIGHTS                       # وزن‌دهی
+    dist = np.linalg.norm(weighted, axis=1)         # فاصله اقلیدسی وزن‌دار
+    dist = np.nan_to_num(dist, nan=9.0)
+
+    mask = (dist <= THRESHOLD) & valid_range
+
     if SIZE_TOL > 0:
-        rp = rng / o
+        rp = rng / np.where(o == 0, np.nan, o)
         mask &= (rp >= ref_rng_pct / SIZE_TOL) & (rp <= ref_rng_pct * SIZE_TOL)
+
+    mask = np.nan_to_num(mask, nan=False).astype(bool)
     idx = np.where(mask)[0]
 
-    found = len(idx)          # همه کندل‌های مشابه پیدا شده
-    total = 0                 # فقط آن‌هایی که افق کامل دارند
+    found = len(idx)   # همه کندل‌های مشابه
+    total = 0          # فقط آن‌هایی که افق کامل دارند
     succ = {(t, d): 0 for t in TARGETS for d in DDS}
 
     for i in idx:
-        if i + HORIZON >= n:  # افق کامل در دسترس نیست
+        if i + HORIZON >= n:
             continue
         total += 1
         entry = c[i]
@@ -88,10 +145,11 @@ def analyze(df, ref_feat, ref_rng_pct):
             hits = np.where(fh >= entry * (1 + t / 100))[0]
             if len(hits) == 0:
                 continue
-            worst = runmin[hits[0]]   # محافظه‌کارانه: کف همان کندل هم حساب می‌شود
+            worst = runmin[hits[0]]
             for d in DDS:
                 if worst > entry * (1 - d / 100):
                     succ[(t, d)] += 1
+
     return found, total, succ
 
 
@@ -144,8 +202,14 @@ def main():
     lines = [
         f"کندل مرجع: {REF_SYMBOL} {REF_DATE} (روزانه)",
         f"O={ro:.2f} H={rh:.2f} L={rl:.2f} C={rc:.2f}",
-        f"موقعیت open/close در رنج: {ref_feat[0]:.2f} / {ref_feat[1]:.2f} | رنج: {ref_rng_pct*100:.2f}%",
-        f"آستانه: {THRESHOLD} | فیلتر اندازه: x{SIZE_TOL} | افق: {HORIZON} کندل 4h",
+        f"رنج: {ref_rng_pct*100:.2f}%  |  جهت: {'صعودی' if rc>=ro else 'نزولی'}",
+        f"ویژگی مرجع (o_pos, c_pos, up_wick, lo_wick, dir): "
+        f"{ref_feat[0]:.2f}, {ref_feat[1]:.2f}, {ref_feat[2]:.2f}, "
+        f"{ref_feat[3]:.2f}, {ref_feat[4]:.0f}",
+        f"وزن‌ها: open={WEIGHTS[0]} close={WEIGHTS[1]} up_w={WEIGHTS[2]} "
+        f"lo_w={WEIGHTS[3]} dir={WEIGHTS[4]}",
+        f"آستانه فاصله وزن‌دار: {THRESHOLD} | فیلتر اندازه: x{SIZE_TOL} | "
+        f"افق: {HORIZON} کندل 4h | حداقل رنج: {MIN_RANGE_PCT*100:.2f}%",
         "",
         f"کندل مشابه پیدا شده: {grand_found}",
         f"استفاده شده در محاسبه (افق کامل دارند): {grand_total}",
