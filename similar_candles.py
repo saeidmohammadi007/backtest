@@ -6,7 +6,7 @@ import requests
 
 # ---------------- تنظیمات ----------------
 REF_SYMBOL = os.getenv("REF_SYMBOL", "ETH-USD")
-REF_DATE = os.getenv("REF_DATE", "2026-08-17")
+REF_DATE = os.getenv("REF_DATE", "2024-11-05")
 THRESHOLD = float(os.getenv("THRESHOLD", "0.1"))    # فاصله اقلیدسی روی شکل کندل (بین 0 و 1.41)
 SIZE_TOL = float(os.getenv("SIZE_TOL", "2"))        # فیلتر اندازه رنج؛ 0 = بدون فیلتر
 HORIZON = int(os.getenv("HORIZON", "60"))           # 60 کندل 4h = 10 روز
