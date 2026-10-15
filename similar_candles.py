@@ -7,8 +7,9 @@ import requests
 # ---------------- تنظیمات ----------------
 REF_SYMBOL = os.getenv("REF_SYMBOL", "ETH-USD")
 REF_DATE = os.getenv("REF_DATE", "2026-08-17")
-THRESHOLD = float(os.getenv("THRESHOLD", "0.08"))
-HORIZON = int(os.getenv("HORIZON", "60"))          # 60 کندل 4h = 10 روز
+THRESHOLD = float(os.getenv("THRESHOLD", "0.1"))    # فاصله اقلیدسی روی شکل کندل (بین 0 و 1.41)
+SIZE_TOL = float(os.getenv("SIZE_TOL", "2"))        # فیلتر اندازه رنج؛ 0 = بدون فیلتر
+HORIZON = int(os.getenv("HORIZON", "60"))           # 60 کندل 4h = 10 روز
 MIN_SAMPLES = int(os.getenv("MIN_SAMPLES", "10"))
 
 COINS = [
@@ -29,7 +30,9 @@ def flatten(df):
 
 
 def features(o, h, l, c):
-    return np.array([h / o - 1, l / o - 1, c / o - 1], dtype=float)
+    """جای open و close داخل رنج low..high (مستقل از اندازه کندل)"""
+    r = (h - l) or 1e-12
+    return np.array([(o - l) / r, (c - l) / r], dtype=float)
 
 
 def get_reference():
@@ -45,6 +48,7 @@ def get_reference():
 
 
 def get_4h(symbol):
+    # یاهو 4 ساعته ندارد؛ از 1 ساعته (حداکثر ~2 سال) ساخته می‌شود
     df = yf.download(symbol, period="729d", interval="1h",
                      progress=False, auto_adjust=False)
     df = flatten(df)
@@ -55,18 +59,24 @@ def get_4h(symbol):
     ).dropna()
 
 
-def analyze(df, ref_feat):
+def analyze(df, ref_feat, ref_rng_pct):
     o, h, l, c = (df[k].values for k in ["Open", "High", "Low", "Close"])
     n = len(df)
-    feats = np.column_stack([h / o - 1, l / o - 1, c / o - 1])
-    dist = np.linalg.norm(feats - ref_feat, axis=1)
-    idx = np.where(dist <= THRESHOLD)[0]
+    rng = h - l
+    safe = np.where(rng == 0, np.nan, rng)
+    feats = np.column_stack([(o - l) / safe, (c - l) / safe])
+    dist = np.nan_to_num(np.linalg.norm(feats - ref_feat, axis=1), nan=9.0)
+    mask = dist <= THRESHOLD
+    if SIZE_TOL > 0:
+        rp = rng / o
+        mask &= (rp >= ref_rng_pct / SIZE_TOL) & (rp <= ref_rng_pct * SIZE_TOL)
+    idx = np.where(mask)[0]
 
     total = 0
     succ = {(t, d): 0 for t in TARGETS for d in DDS}
 
     for i in idx:
-        if i + HORIZON >= n:
+        if i + HORIZON >= n:       # افق کامل در دسترس نیست
             continue
         total += 1
         entry = c[i]
@@ -92,7 +102,7 @@ def send_telegram(text):
     if not TG_TOKEN or not TG_CHAT:
         print(text)
         return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TG_TOKEN.strip()}/sendMessage"
     chunks, cur = [], ""
     for line in text.split("\n"):
         if len(cur) + len(line) + 1 > 3800:
@@ -102,12 +112,13 @@ def send_telegram(text):
     if cur:
         chunks.append(cur)
     for ch in chunks:
-        requests.post(url, data={"chat_id": TG_CHAT, "text": ch},
-                      timeout=30).raise_for_status()
+        r = requests.post(url, data={"chat_id": TG_CHAT.strip(), "text": ch}, timeout=30)
+        r.raise_for_status()
 
 
 def main():
     ref_feat, (ro, rh, rl, rc) = get_reference()
+    ref_rng_pct = (rh - rl) / ro
 
     grand_total = 0
     grand = {(t, d): 0 for t in TARGETS for d in DDS}
@@ -119,7 +130,7 @@ def main():
             if df is None or len(df) < HORIZON + 10:
                 print(f"{sym}: داده کافی نیست")
                 continue
-            total, succ = analyze(df, ref_feat)
+            total, succ = analyze(df, ref_feat, ref_rng_pct)
             per_coin[sym] = (total, succ)
             grand_total += total
             for k, v in succ.items():
@@ -130,13 +141,14 @@ def main():
     lines = [
         f"کندل مرجع: {REF_SYMBOL} {REF_DATE} (روزانه)",
         f"O={ro:.2f} H={rh:.2f} L={rl:.2f} C={rc:.2f}",
-        f"آستانه اقلیدسی: {THRESHOLD} | افق: {HORIZON} کندل 4h",
+        f"موقعیت open/close در رنج: {ref_feat[0]:.2f} / {ref_feat[1]:.2f} | رنج: {ref_rng_pct*100:.2f}%",
+        f"آستانه: {THRESHOLD} | فیلتر اندازه: x{SIZE_TOL} | افق: {HORIZON} کندل 4h",
         f"تعداد کندل مشابه (کل ارزها): {grand_total}",
         "",
     ]
 
     if grand_total == 0:
-        lines.append("کندل مشابهی پیدا نشد.")
+        lines.append("کندل مشابهی پیدا نشد. THRESHOLD یا SIZE_TOL را بزرگ‌تر کن.")
         send_telegram("\n".join(lines))
         return
 
