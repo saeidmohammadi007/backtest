@@ -34,14 +34,16 @@ def flatten(df):
 
 
 def get_4h(symbol):
-    path = os.path.join(CACHE_DIR, f"{symbol}.parquet")
+    """دانلود داده 4h با کش pickle (بدون نیاز به pyarrow)"""
+    path = os.path.join(CACHE_DIR, f"{symbol}.pkl")
     if os.path.exists(path):
         try:
-            df = pd.read_parquet(path)
+            df = pd.read_pickle(path)
             if len(df) > 0:
                 return df
         except Exception:
             pass
+
     df = yf.download(symbol, period="729d", interval="1h",
                      progress=False, auto_adjust=False)
     df = flatten(df)
@@ -50,7 +52,11 @@ def get_4h(symbol):
     df = df.resample("4h").agg(
         {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
     ).dropna()
-    df.to_parquet(path)
+
+    try:
+        df.to_pickle(path)
+    except Exception:
+        pass
     return df
 
 
@@ -132,13 +138,17 @@ def main():
     all_rows = []
     for sym, df in zip(COINS, dfs):
         if df is None:
+            print(f"{sym}: داده نیامد")
             continue
-        all_rows.extend(scan_coin(df, sym))
+        rows = scan_coin(df, sym)
+        print(f"{sym}: {len(rows)} کندل اسکن شد")
+        all_rows.extend(rows)
 
     if not all_rows:
         send_telegram("داده‌ای نیامد.")
         return
 
+    # تجمیع در سطل‌ها
     buckets = {}
     for b, r, dt, sym in all_rows:
         buckets.setdefault(b, {
@@ -151,10 +161,12 @@ def main():
             buckets[b]["succ"][k] += v
         buckets[b]["events"].append((dt, sym, r[(T_RANK, DD_RANK)]))
 
+    # بازه پایه
     total_n = len(all_rows)
     baseline_cnt = sum(r[(T_RANK, DD_RANK)] for _, r, _, _ in all_rows)
     base_wr = 100.0 * baseline_cnt / total_n
 
+    # رتبه‌بندی سطل‌ها
     key = (T_RANK, DD_RANK)
     ranked = []
     for b, info in buckets.items():
