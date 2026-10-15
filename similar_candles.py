@@ -5,7 +5,7 @@ import yfinance as yf
 import requests
 
 # ---------------- تنظیمات ----------------
-REF_SYMBOL = os.getenv("REF_SYMBOL", "BTC-USD")
+REF_SYMBOL = os.getenv("REF_SYMBOL", "ETH-USD")
 REF_DATE = os.getenv("REF_DATE", "2025-07-04")
 THRESHOLD = float(os.getenv("THRESHOLD", "0.08"))
 HORIZON = int(os.getenv("HORIZON", "60"))          # 60 کندل 4h = 10 روز
