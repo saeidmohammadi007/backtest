@@ -6,7 +6,7 @@ import requests
 
 # ---------------- تنظیمات ----------------
 REF_SYMBOL = os.getenv("REF_SYMBOL", "ETH-USD")
-REF_DATE = os.getenv("REF_DATE", "2025-07-04")
+REF_DATE = os.getenv("REF_DATE", "2026-08-17")
 THRESHOLD = float(os.getenv("THRESHOLD", "0.08"))
 HORIZON = int(os.getenv("HORIZON", "60"))          # 60 کندل 4h = 10 روز
 MIN_SAMPLES = int(os.getenv("MIN_SAMPLES", "10"))
