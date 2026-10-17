@@ -1,21 +1,37 @@
+name: candle-finder
+
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "5 */4 * * *"   # هر ۴ ساعت، ۵ دقیقه بعد از بسته شدن کندل
+    inputs:
+      symbols:
+        description: "Symbols, comma separated"
+        default: "BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT,BNB/USDT,DOGE/USDT,ADA/USDT,LINK/USDT,AVAX/USDT,LTC/USDT"
+      horizon:
+        description: "Candles to look ahead"
+        default: "100"
+      k:
+        description: "Number of candle-shape groups"
+        default: "40"
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install ccxt pandas requests
-      - run: python similar_candles.py
+      - run: pip install ccxt pandas numpy scikit-learn requests
+      - name: Run
         env:
-          SYMBOL: "ETH/USDT"
-          HORIZON: "100"
-          THRESHOLD: "0.006"
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SYMBOLS: ${{ inputs.symbols }}
+          HORIZON: ${{ inputs.horizon }}
+          K: ${{ inputs.k }}
+        run: |
+          python candle_finder.py | tee result.txt
+          { echo '```'; cat result.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result
+          path: result.txt
