@@ -1,23 +1,24 @@
+import os
 import pandas as pd
 import numpy as np
 import ccxt
 from tqdm import tqdm
 import time
 
-# ============ Config ============
-TOP_N                = 20
-TIMEFRAME            = '4h'
-OHLCV_LIMIT          = 3000
-FORWARD_CANDLES      = 100
+# ============ Config (env-overridable) ============
+TOP_N                = int(os.environ.get('TOP_N', '20'))
+FORWARD_CANDLES      = int(os.environ.get('FORWARD_CANDLES', '100'))
+OHLCV_LIMIT          = int(os.environ.get('OHLCV_LIMIT', '3000'))
+SIMILARITY_THRESHOLD = float(os.environ.get('SIMILARITY_THRESHOLD', '0.5'))
 
+TIMEFRAME            = '4h'
 LEVEL_RANGE          = 20
 LEVEL_TREND          = 35
 DI_LENGTH            = 14
 ADX_SMOOTHING        = 14
 
-# --- کندل مرجع ETH 2026-07-02 ---
+# --- کندل مرجع ETH 2026-07-02 (روزانه) ---
 REF_O, REF_H, REF_L, REF_C = 1609.01, 1720.34, 1595.94, 1698.17
-SIMILARITY_THRESHOLD = 0.5
 
 DROP_THRESHOLDS = [2, 3, 4, 5]
 RISE_THRESHOLDS = [5, 10, 20, 40, 80]
@@ -27,11 +28,14 @@ def candle_vector(o, h, l, c):
     rng = float(h - l)
     if rng <= 0 or not np.isfinite(rng):
         return None
-    return np.array([(o-l)/rng, 1.0, 0.0, (c-l)/rng])
+    return np.array([(o - l) / rng, 1.0, 0.0, (c - l) / rng])
 
 REF_VEC = candle_vector(REF_O, REF_H, REF_L, REF_C)
-print(f"📐 بردار کندل ETH 2026-07-02: "
-      f"O={REF_VEC[0]:.4f} H={REF_VEC[1]:.4f} L={REF_VEC[2]:.4f} C={REF_VEC[3]:.4f}")
+print(f"📐 بردار کندل ETH 2026-07-02 (روزانه):")
+print(f"   O={REF_VEC[0]:.4f} H={REF_VEC[1]:.4f} "
+      f"L={REF_VEC[2]:.4f} C={REF_VEC[3]:.4f}")
+print(f"⚙️ پارامترها: TOP_N={TOP_N} | FORWARD={FORWARD_CANDLES} | "
+      f"LIMIT={OHLCV_LIMIT} | THRESHOLD={SIMILARITY_THRESHOLD}")
 
 # ============ Exchange ============
 def init_exchange():
@@ -86,7 +90,8 @@ def adx_di(df, n_di=DI_LENGTH, n_adx=ADX_SMOOTHING):
     up, dn = H.diff(), -L.diff()
     pdm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=df.index)
     mdm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=df.index)
-    tr = pd.concat([H-L, (H-C.shift()).abs(), (L-C.shift()).abs()], axis=1).max(axis=1)
+    tr = pd.concat([H - L, (H - C.shift()).abs(),
+                    (L - C.shift()).abs()], axis=1).max(axis=1)
     def rma(s, n): return s.ewm(alpha=1/n, adjust=False).mean()
     trr = rma(tr, n_di)
     pdi = 100 * rma(pdm, n_di) / trr
@@ -107,22 +112,23 @@ def state_machine(adx, pdi, mdi, hr=LEVEL_RANGE, ht=LEVEL_TREND):
         rising = a[i] > a[i-1]
         e_long_s = (not hp) and up_ and rising and (p[i] >= ht)
         e_shrt_s = (not hp) and dn_ and rising and (m[i] >  ht)
-        e_long = (not hp) and up_ and rising and (not up_p)
-        e_short = (not hp) and dn_ and rising and (not dn_p)
-        x_long = (cross and up_p) or (hp and not hp_p)
+        e_long   = (not hp) and up_ and rising and (not up_p)
+        e_short  = (not hp) and dn_ and rising and (not dn_p)
+        x_long  = (cross and up_p) or (hp and not hp_p)
         x_short = (cross and dn_p) or (hp and not hp_p)
         prev = cond[i-1]
         x_l_now = (prev > 0) and x_long
         x_s_now = (prev < 0) and x_short
         if x_l_now: ex[i] = 1
         elif x_s_now: ex[i] = -1
-        if prev != 1 and e_long_s: cond[i] = 1
-        elif prev != -1 and e_shrt_s: cond[i] = -1
-        elif prev != 0.5 and e_long: cond[i] = 0.5
-        elif prev != -0.5 and e_short: cond[i] = -0.5
-        elif x_l_now or x_s_now: cond[i] = 0
-        else: cond[i] = prev
-    return (pd.Series(cond, index=adx.index), pd.Series(ex, index=adx.index))
+        if   prev !=  1   and e_long_s:  cond[i] =  1
+        elif prev != -1   and e_shrt_s:  cond[i] = -1
+        elif prev !=  0.5 and e_long:    cond[i] =  0.5
+        elif prev != -0.5 and e_short:   cond[i] = -0.5
+        elif x_l_now or x_s_now:         cond[i] =  0
+        else:                            cond[i] = prev
+    return (pd.Series(cond, index=adx.index),
+            pd.Series(ex, index=adx.index))
 
 def analyze_forward(df, idx, forward=FORWARD_CANDLES):
     entry = df['close'].iloc[idx]
@@ -164,16 +170,15 @@ def main():
 
             n_sim = 0
             for idx in long_exits:
-                # ۱) فیلتر شباهت کندلی
                 row = df.iloc[idx]
-                v = candle_vector(row['open'], row['high'], row['low'], row['close'])
+                v = candle_vector(row['open'], row['high'],
+                                  row['low'], row['close'])
                 if v is None:
                     continue
                 dist = float(np.linalg.norm(REF_VEC - v))
                 if dist > SIMILARITY_THRESHOLD:
                     continue
 
-                # ۲) بررسی رفتار آینده
                 res = analyze_forward(df, idx, FORWARD_CANDLES)
                 if res is None:
                     continue
@@ -198,14 +203,15 @@ def main():
 
     if not records:
         print("\n❌ هیچ سیگنالی با شرایط «End Trend + کندل شبیه» یافت نشد")
+        pd.DataFrame().to_csv('end_trend_similar_backtest.csv', index=False)
         return
 
     df_r = pd.DataFrame(records)
     total = len(df_r)
 
-    print("\n" + "="*72)
+    print("\n" + "=" * 72)
     print("📊 بک‌تست — End Trend + کندل شبیه ETH 2026-07-02")
-    print("="*72)
+    print("=" * 72)
     print(f"کل End Trend یافت‌شده:           {total_end_trend}")
     print(f"سیگنال‌های شبیه کندل مرجع:        {total_similar}  "
           f"({total_similar/max(total_end_trend,1)*100:.1f}% کل)")
@@ -213,18 +219,19 @@ def main():
     print(f"تعداد ارز:                        {df_r['symbol'].nunique()}")
     print(f"افق آینده‌نگری:                   {FORWARD_CANDLES} کندل "
           f"({FORWARD_CANDLES*4/24:.1f} روز)")
-    print(f"بازه تاریخی:                      {df_r['time'].min()} → {df_r['time'].max()}")
+    print(f"بازه تاریخی:                      {df_r['time'].min()} → "
+          f"{df_r['time'].max()}")
     print(f"آستانه شباهت:                     dist ≤ {SIMILARITY_THRESHOLD}")
     print()
 
-    print("📉 آمار ریزش (چند درصد سیگنال‌ها حداقل X% ریزش دیدند):")
+    print("📉 آمار ریزش:")
     for t in DROP_THRESHOLDS:
         hit = int((df_r['max_drop_pct'] <= -t).sum())
         pct = hit / total * 100
         bar = "█" * int(pct / 2)
         print(f"   -{t:2d}%:  {hit:4d}/{total}  ({pct:5.1f}%)  {bar}")
 
-    print("\n📈 آمار رشد (چند درصد سیگنال‌ها حداقل X% رشد دیدند):")
+    print("\n📈 آمار رشد:")
     for t in RISE_THRESHOLDS:
         hit = int((df_r['max_rise_pct'] >= t).sum())
         pct = hit / total * 100
@@ -242,7 +249,7 @@ def main():
     for s, cnt in per_sym.items():
         print(f"   {s:10s}: {cnt:3d}")
 
-    print("\n🎯 ۱۰ سیگنال شبیه‌تر (کمترین dist):")
+    print("\n🎯 ۱۰ سیگنال شبیه‌تر:")
     cols = ['symbol', 'time', 'dist', 'max_rise_pct', 'max_drop_pct']
     print(df_r.nsmallest(10, 'dist')[cols].to_string(index=False))
 
