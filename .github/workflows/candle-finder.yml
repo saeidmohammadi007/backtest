@@ -1,37 +1,83 @@
-name: candle-finder
+name: End Trend Backtest (Manual)
 
 on:
   workflow_dispatch:
     inputs:
-      symbols:
-        description: "Symbols, comma separated"
-        default: "BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT,BNB/USDT,DOGE/USDT,ADA/USDT,LINK/USDT,AVAX/USDT,LTC/USDT"
-      horizon:
-        description: "Candles to look ahead"
-        default: "100"
-      k:
-        description: "Number of candle-shape groups"
-        default: "40"
+      similarity_threshold:
+        description: 'آستانه شباهت کندلی (dist) - پیشنهاد: 0.5 / 0.7 / 1.0'
+        required: false
+        default: '0.5'
+        type: string
+      top_n:
+        description: 'تعداد ارز برتر برای اسکن'
+        required: false
+        default: '20'
+        type: string
+      forward_candles:
+        description: 'افق آینده‌نگری (تعداد کندل 4h)'
+        required: false
+        default: '100'
+        type: string
+      ohlcv_limit:
+        description: 'تعداد کندل تاریخی برای هر ارز (3000 ≈ 500 روز)'
+        required: false
+        default: '3000'
+        type: string
 
 jobs:
-  run:
+  backtest:
+    name: Run Backtest
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - run: pip install ccxt pandas numpy scikit-learn requests
-      - name: Run
-        env:
-          SYMBOLS: ${{ inputs.symbols }}
-          HORIZON: ${{ inputs.horizon }}
-          K: ${{ inputs.k }}
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Install dependencies
         run: |
-          python candle_finder.py | tee result.txt
-          { echo '```'; cat result.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+          python -m pip install --upgrade pip
+          pip install pandas numpy ccxt tqdm
+
+      - name: 🚀 Run backtest
+        env:
+          SIMILARITY_THRESHOLD: ${{ inputs.similarity_threshold }}
+          TOP_N: ${{ inputs.top_n }}
+          FORWARD_CANDLES: ${{ inputs.forward_candles }}
+          OHLCV_LIMIT: ${{ inputs.ohlcv_limit }}
+        run: python end_trend_backtest.py
+
+      - name: 💾 Upload CSV results
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: result
-          path: result.txt
+          name: backtest-results-${{ github.run_number }}
+          path: |
+            end_trend_similar_backtest.csv
+            backtest_*.csv
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 📋 Job summary
+        if: always()
+        run: |
+          echo "## 📊 End Trend Backtest Result" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**پارامترها:**" >> $GITHUB_STEP_SUMMARY
+          echo "- آستانه شباهت: \`${{ inputs.similarity_threshold }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- تعداد ارز: \`${{ inputs.top_n }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- افق آینده: \`${{ inputs.forward_candles }}\` کندل" >> $GITHUB_STEP_SUMMARY
+          echo "- کندل تاریخی: \`${{ inputs.ohlcv_limit }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f end_trend_similar_backtest.csv ]; then
+            ROWS=$(($(wc -l < end_trend_similar_backtest.csv) - 1))
+            echo "✅ تعداد سیگنال یافت‌شده: **$ROWS**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ فایل خروجی یافت نشد" >> $GITHUB_STEP_SUMMARY
+          fi
