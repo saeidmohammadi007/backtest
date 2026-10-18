@@ -1,218 +1,253 @@
-"""
-candle_finder.py
-پیدا کردن خودکار «شکل کندل ۴ ساعته»ای که ۱۰۰ کندل بعدش
-کمترین ریزش اولیه، بالاترین ریسک‌به‌ریوارد و بالاترین وین‌ریت را داشته.
-
-- داده: LBank با ccxt
-- شکل کندل: بدنه + سایه بالا + سایه پایین، تقسیم بر ATR (قابل مقایسه بین کوین‌ها)
-- شباهت: فاصله اقلیدسی (KMeans)
-- آمار: وقوع‌های هم‌پوشان حذف می‌شوند (فاصله حداقل DEDUP_GAP کندل)
-- اعتبارسنجی: شکل‌ها روی ۷۰٪ اول تاریخ انتخاب و روی ۳۰٪ آخر تست می‌شوند
-"""
-import os
-import time
-import requests
-import ccxt
-import numpy as np
 import pandas as pd
-from datetime import timedelta
-from numpy.lib.stride_tricks import sliding_window_view
-from sklearn.cluster import KMeans
+import numpy as np
+import ccxt
+from tqdm import tqdm
+import time
 
-# ---------------- تنظیمات ----------------
-DEFAULT_SYMBOLS = "BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT,BNB/USDT,DOGE/USDT,ADA/USDT,LINK/USDT,AVAX/USDT,LTC/USDT"
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
-TIMEFRAME = "4h"
-HORIZON = int(os.getenv("HORIZON", "100"))          # کندل‌های بعد از هر مورد
-K = int(os.getenv("K", "40"))                       # تعداد گروه شکل کندل
-ATR_N = 14
-DEDUP_GAP = int(os.getenv("DEDUP_GAP", str(HORIZON)))  # حداقل فاصله بین دو وقوع شمارش‌شده
-MIN_TRAIN = int(os.getenv("MIN_TRAIN", "60"))       # حداقل وقوع در دوره انتخاب
-MIN_TEST = int(os.getenv("MIN_TEST", "20"))         # حداقل وقوع در دوره تست
-MIN_WIN_TEST = float(os.getenv("MIN_WIN_TEST", "55"))  # حداقل وین‌ریت تست برای تایید (٪)
-TOP_N = int(os.getenv("TOP_N", "3"))
-START_DATE = os.getenv("START_DATE", "2020-01-01")
-MIN_DD = 0.001                                      # کف ریزش برای محاسبه RR
-FEATS = ["body_a", "up_a", "lo_a"]
+# ============ Config ============
+TOP_N                = 20
+TIMEFRAME            = '4h'
+OHLCV_LIMIT          = 3000
+FORWARD_CANDLES      = 100
 
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+LEVEL_RANGE          = 20
+LEVEL_TREND          = 35
+DI_LENGTH            = 14
+ADX_SMOOTHING        = 14
 
+# --- کندل مرجع ETH 2026-07-02 ---
+REF_O, REF_H, REF_L, REF_C = 1609.01, 1720.34, 1595.94, 1698.17
+SIMILARITY_THRESHOLD = 0.5
 
-# ---------------- دریافت داده ----------------
-def fetch_all(ex, symbol):
-    since = ex.parse8601(START_DATE + "T00:00:00Z")
-    tf_ms = ex.parse_timeframe(TIMEFRAME) * 1000
-    rows = []
-    while True:
-        batch = ex.fetch_ohlcv(symbol, TIMEFRAME, since=since, limit=1000)
-        if not batch:
+DROP_THRESHOLDS = [2, 3, 4, 5]
+RISE_THRESHOLDS = [5, 10, 20, 40, 80]
+
+# ============ Candle Vector ============
+def candle_vector(o, h, l, c):
+    rng = float(h - l)
+    if rng <= 0 or not np.isfinite(rng):
+        return None
+    return np.array([(o-l)/rng, 1.0, 0.0, (c-l)/rng])
+
+REF_VEC = candle_vector(REF_O, REF_H, REF_L, REF_C)
+print(f"📐 بردار کندل ETH 2026-07-02: "
+      f"O={REF_VEC[0]:.4f} H={REF_VEC[1]:.4f} L={REF_VEC[2]:.4f} C={REF_VEC[3]:.4f}")
+
+# ============ Exchange ============
+def init_exchange():
+    ex = ccxt.lbank({'options': {'defaultType': 'future'}, 'enableRateLimit': True})
+    ex.load_markets()
+    return ex
+
+def get_top_symbols(ex, n=20):
+    try:
+        tickers = ex.fetch_tickers()
+    except Exception:
+        tickers = {}
+    candidates = []
+    for sym, m in ex.markets.items():
+        if not m.get('swap'):
+            continue
+        base = (m.get('base') or '').upper()
+        if not base or base.isdigit():
+            continue
+        vol = (tickers.get(sym, {}).get('quoteVolume') or 0)
+        candidates.append((base, sym, vol))
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    seen, result = set(), []
+    for base, sym, _ in candidates:
+        if base in seen:
+            continue
+        seen.add(base)
+        result.append((base, sym))
+        if len(result) >= n:
             break
-        rows += batch
-        last = batch[-1][0]
-        if last + tf_ms >= ex.milliseconds() or len(batch) < 2:
-            break
-        since = last + tf_ms
-        time.sleep(ex.rateLimit / 1000)
-    df = pd.DataFrame(rows, columns=["ts", "o", "h", "l", "c", "v"])
-    df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
-    df = df[df["ts"] + tf_ms <= ex.milliseconds()].reset_index(drop=True)  # فقط کندل‌های بسته
-    df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    return df
+    return result
 
+def fetch_4h(ex, symbol, limit=OHLCV_LIMIT):
+    try:
+        raw = ex.fetch_ohlcv(symbol, TIMEFRAME, limit=limit)
+        if not raw or len(raw) < 200:
+            return None
+        df = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+        df.set_index('ts', inplace=True)
+        df.index = df.index.tz_localize(None)
+        now = pd.Timestamp.utcnow().tz_localize(None)
+        if df.index[-1] + pd.Timedelta(hours=4) > now:
+            df = df.iloc[:-1]
+        return df[['open','high','low','close','volume']]
+    except Exception:
+        return None
 
-# ---------------- ویژگی‌ها و نتیجه‌ی ۱۰۰ کندل بعد ----------------
-def build(df, symbol):
-    df = df.copy()
-    n, H = len(df), HORIZON
-    prev_c = df["c"].shift(1)
-    tr = pd.concat([df["h"] - df["l"], (df["h"] - prev_c).abs(), (df["l"] - prev_c).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(ATR_N).mean() / df["c"]
+# ============ Indicators ============
+def adx_di(df, n_di=DI_LENGTH, n_adx=ADX_SMOOTHING):
+    H, L, C = df['high'], df['low'], df['close']
+    up, dn = H.diff(), -L.diff()
+    pdm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=df.index)
+    mdm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=df.index)
+    tr = pd.concat([H-L, (H-C.shift()).abs(), (L-C.shift()).abs()], axis=1).max(axis=1)
+    def rma(s, n): return s.ewm(alpha=1/n, adjust=False).mean()
+    trr = rma(tr, n_di)
+    pdi = 100 * rma(pdm, n_di) / trr
+    mdi = 100 * rma(mdm, n_di) / trr
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    return rma(dx.fillna(0), n_adx), pdi, mdi
 
-    top = df[["o", "c"]].max(axis=1)
-    bot = df[["o", "c"]].min(axis=1)
-    df["body_r"] = (df["c"] - df["o"]) / df["o"]
-    df["up_r"] = (df["h"] - top) / df["o"]
-    df["lo_r"] = (bot - df["l"]) / df["o"]
-    for f in ["body", "up", "lo"]:
-        df[f + "_a"] = (df[f + "_r"] / atr).clip(-6, 6)
+def state_machine(adx, pdi, mdi, hr=LEVEL_RANGE, ht=LEVEL_TREND):
+    a, p, m = adx.values, pdi.values, mdi.values
+    n = len(a)
+    cond = np.zeros(n)
+    ex = np.zeros(n, dtype=int)
+    for i in range(1, n):
+        hp, hp_p = a[i] <= hr, a[i-1] <= hr
+        up_, up_p = p[i] >= m[i], p[i-1] >= m[i-1]
+        dn_, dn_p = m[i] >  p[i], m[i-1] >  p[i-1]
+        cross = up_ != up_p
+        rising = a[i] > a[i-1]
+        e_long_s = (not hp) and up_ and rising and (p[i] >= ht)
+        e_shrt_s = (not hp) and dn_ and rising and (m[i] >  ht)
+        e_long = (not hp) and up_ and rising and (not up_p)
+        e_short = (not hp) and dn_ and rising and (not dn_p)
+        x_long = (cross and up_p) or (hp and not hp_p)
+        x_short = (cross and dn_p) or (hp and not hp_p)
+        prev = cond[i-1]
+        x_l_now = (prev > 0) and x_long
+        x_s_now = (prev < 0) and x_short
+        if x_l_now: ex[i] = 1
+        elif x_s_now: ex[i] = -1
+        if prev != 1 and e_long_s: cond[i] = 1
+        elif prev != -1 and e_shrt_s: cond[i] = -1
+        elif prev != 0.5 and e_long: cond[i] = 0.5
+        elif prev != -0.5 and e_short: cond[i] = -0.5
+        elif x_l_now or x_s_now: cond[i] = 0
+        else: cond[i] = prev
+    return (pd.Series(cond, index=adx.index), pd.Series(ex, index=adx.index))
 
-    mfe = np.full(n, np.nan)
-    idd = np.full(n, np.nan)    # ریزش اولیه: عمیق‌ترین افت قبل از رسیدن به سقف ۱۰۰ کندل
-    fret = np.full(n, np.nan)   # بازده بسته شدن کندل صدم
-    if n > H + 1:
-        h, l, c = df["h"].values, df["l"].values, df["c"].values
-        hw = sliding_window_view(h[1:], H)
-        lw = sliding_window_view(l[1:], H)
-        m = n - H
-        ci = c[:m]
-        peak = hw.argmax(axis=1)
-        cummin = np.minimum.accumulate(lw, axis=1)
-        dd_peak = cummin[np.arange(m), peak]
-        mfe[:m] = np.clip((hw.max(axis=1) - ci) / ci, 0, None)
-        idd[:m] = np.clip((ci - dd_peak) / ci, 0, None)
-        fret[:m] = (c[H:H + m] - ci) / ci
-    df["mfe"], df["idd"], df["fret"] = mfe, idd, fret
-    df["rr"] = df["mfe"] / np.maximum(df["idd"], MIN_DD)
-    df["win"] = df["fret"] > 0
-    df["symbol"] = symbol
-    df["idx"] = np.arange(n)
-    return df
+def analyze_forward(df, idx, forward=FORWARD_CANDLES):
+    entry = df['close'].iloc[idx]
+    future = df.iloc[idx+1:idx+1+forward]
+    if len(future) < forward:
+        return None
+    return {
+        'entry': float(entry),
+        'max_rise_pct': (future['high'].max() / entry - 1) * 100,
+        'max_drop_pct': (future['low'].min()  / entry - 1) * 100,
+    }
 
-
-# ---------------- آمار ----------------
-def dedup(d):
-    keep = []
-    for _, g in d.groupby(["symbol", "cl"], sort=False):
-        last = -10 ** 9
-        for i, ix in zip(g.index, g["idx"].values):
-            if ix - last >= DEDUP_GAP:
-                keep.append(i)
-                last = ix
-    return d.loc[keep]
-
-
-def agg(d):
-    return d.groupby("cl").agg(n=("win", "size"), win=("win", "mean"), ret=("fret", "mean"),
-                               idd=("idd", "median"), rr=("rr", "median"))
-
-
-def fmt(t):
-    th = t + timedelta(hours=3, minutes=30)
-    return f"{t:%Y-%m-%d %H:%M} UTC ({th:%m-%d %H:%M} تهران)"
-
-
-# ---------------- تحلیل اصلی ----------------
-def analyze(pool):
-    tf_ms = 4 * 3600 * 1000
-    pool = pool.dropna(subset=FEATS).reset_index(drop=True)
-    cutoff = pool["ts"].quantile(0.7)
-
-    # دوره انتخاب (با فاصله ایمنی تا دوره تست) و دوره تست
-    train_mask = pool["ts"] < cutoff - HORIZON * tf_ms
-    test_mask = pool["ts"] >= cutoff
-
-    km = KMeans(n_clusters=K, n_init=5, random_state=0).fit(pool.loc[train_mask, FEATS].values)
-    pool["cl"] = km.predict(pool[FEATS].values)
-
-    lab = pool.dropna(subset=["fret"])
-    tr = dedup(lab[train_mask.loc[lab.index]])
-    te = dedup(lab[test_mask.loc[lab.index]])
-    s = agg(tr).join(agg(te), lsuffix="_tr", rsuffix="_te", how="inner")
-    s = s[(s["n_tr"] >= MIN_TRAIN) & (s["n_te"] >= MIN_TEST)].copy()
-    if s.empty:
-        return ["شکلی با تعداد وقوع کافی پیدا نشد (K یا MIN_TRAIN / MIN_TEST را کمتر کنید)."]
-
-    s["score"] = (s["win_tr"].rank(ascending=False)
-                  + s["idd_tr"].rank(ascending=True)
-                  + s["rr_tr"].rank(ascending=False))
-    s["ok"] = (s["win_te"] * 100 >= MIN_WIN_TEST) & (s["ret_te"] > 0)
-    s = s.sort_values("score")
-
-    allev = dedup(lab)
-    shown = list(s.head(TOP_N).index)
-    out = [f"🔎 {len(SYMBOLS)} کوین | {TIMEFRAME} | افق {HORIZON} کندل | {len(lab):,} کندل بررسی‌شده",
-           f"انتخاب شکل: تا {fmt(pd.to_datetime(cutoff, unit='ms', utc=True))} | تست: بعد از آن", ""]
-
-    for rank, cl in enumerate(shown, 1):
-        r = s.loc[cl]
-        g = allev[allev["cl"] == cl]
-        b, u, lo = g["body_r"].mean() * 100, g["up_r"].mean() * 100, g["lo_r"].mean() * 100
-        flag = "✅ در تست هم تایید شد" if r["ok"] else "⚠️ در تست تایید نشد"
-        out += [
-            f"#{rank} کندل {'سبز' if b > 0 else 'قرمز'} | بدنه {b:+.2f}% | سایه بالا {u:.2f}% | سایه پایین {lo:.2f}%",
-            f"{flag}",
-            f"انتخاب → وقوع {int(r.n_tr)} | وین‌ریت {r.win_tr*100:.1f}% | میانه ریزش اولیه {r.idd_tr*100:.2f}% | میانه RR {r.rr_tr:.2f}",
-            f"تست → وقوع {int(r.n_te)} | وین‌ریت {r.win_te*100:.1f}% | میانه ریزش اولیه {r.idd_te*100:.2f}% | میانه RR {r.rr_te:.2f} | میانگین بازده {r.ret_te*100:+.1f}%",
-            "بهترین موارد (برنده با کمترین ریزش اولیه):",
-        ]
-        for _, x in g[g["win"]].sort_values("idd").head(3).iterrows():
-            out.append(f"  {x.symbol} | {fmt(x.time)} | DD {x.idd*100:.2f}% | RR {x.rr:.1f}")
-        x = g.sort_values("ts").iloc[-1]
-        out += [f"آخرین وقوع: {x.symbol} | {fmt(x.time)}", ""]
-
-    # سیگنال زنده: آخرین کندل بسته‌شده‌ی هر کوین
-    out.append("📡 آخرین کندل بسته‌شده:")
-    last_rows = pool.sort_values("idx").groupby("symbol").tail(1)
-    hit = False
-    good = [c for c in shown if s.loc[c, "ok"]]
-    for _, x in last_rows.iterrows():
-        if x["cl"] in good:
-            hit = True
-            out.append(f"🚨 {x.symbol} | {fmt(x.time)} → شکل تاییدشده #{shown.index(x['cl']) + 1}")
-    if not hit:
-        out.append("هیچ‌کدام جزو شکل‌های تاییدشده نیست.")
-    out += ["", "تعریف‌ها: ریزش اولیه = عمیق‌ترین افت قبل از رسیدن به سقف ۱۰۰ کندل؛ RR = بیشترین سود ÷ ریزش اولیه؛ برد = بسته شدن کندل صدم بالاتر از ورود (close کندل شکل)."]
-    return out
-
-
-def send(text):
-    print(text)
-    if not (TG_TOKEN and TG_CHAT):
-        return
-    for i in range(0, len(text), 4000):
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      data={"chat_id": TG_CHAT, "text": text[i:i + 4000]}, timeout=30)
-
-
+# ============ Main ============
 def main():
-    ex = ccxt.lbank({"enableRateLimit": True})
-    frames = []
-    for sym in SYMBOLS:
-        try:
-            d = fetch_all(ex, sym)
-            if len(d) < HORIZON + 200:
-                print(f"{sym}: داده کم، رد شد")
-                continue
-            frames.append(build(d, sym))
-            print(f"{sym}: {len(d)} candles")
-        except Exception as e:
-            print(f"{sym}: خطا — {e}")
-    if not frames:
-        send("هیچ داده‌ای دریافت نشد. (ممکن است LBank آی‌پی گیت‌هاب را بلاک کرده باشد)")
-        return
-    send("\n".join(analyze(pd.concat(frames, ignore_index=True))))
+    print("\n🔌 اتصال به LBank...")
+    ex = init_exchange()
+    print(f"✅ {len(ex.markets)} بازار")
 
+    print(f"\n📊 انتخاب {TOP_N} ارز برتر...")
+    top = get_top_symbols(ex, TOP_N)
+    for i, (b, s) in enumerate(top, 1):
+        print(f"  {i:2d}. {b}")
+
+    records = []
+    total_end_trend = 0
+    total_similar   = 0
+
+    for base, sym in tqdm(top, desc="اسکن"):
+        try:
+            df = fetch_4h(ex, sym)
+            if df is None:
+                continue
+            adx, pdi, mdi = adx_di(df)
+            if adx.isna().all():
+                continue
+            cond, exs = state_machine(adx, pdi, mdi)
+            long_exits = np.where(exs.values == 1)[0]
+            total_end_trend += len(long_exits)
+
+            n_sim = 0
+            for idx in long_exits:
+                # ۱) فیلتر شباهت کندلی
+                row = df.iloc[idx]
+                v = candle_vector(row['open'], row['high'], row['low'], row['close'])
+                if v is None:
+                    continue
+                dist = float(np.linalg.norm(REF_VEC - v))
+                if dist > SIMILARITY_THRESHOLD:
+                    continue
+
+                # ۲) بررسی رفتار آینده
+                res = analyze_forward(df, idx, FORWARD_CANDLES)
+                if res is None:
+                    continue
+
+                records.append({
+                    'symbol':       base,
+                    'time':         df.index[idx],
+                    'entry_price':  res['entry'],
+                    'dist':         dist,
+                    'max_rise_pct': res['max_rise_pct'],
+                    'max_drop_pct': res['max_drop_pct'],
+                })
+                n_sim += 1
+            total_similar += n_sim
+
+            print(f"\n🔍 {base}: {len(long_exits)} End Trend | "
+                  f"{n_sim} شبیه کندل مرجع")
+            time.sleep(0.4)
+        except Exception as e:
+            print(f"\n❌ {base}: {e}")
+            continue
+
+    if not records:
+        print("\n❌ هیچ سیگنالی با شرایط «End Trend + کندل شبیه» یافت نشد")
+        return
+
+    df_r = pd.DataFrame(records)
+    total = len(df_r)
+
+    print("\n" + "="*72)
+    print("📊 بک‌تست — End Trend + کندل شبیه ETH 2026-07-02")
+    print("="*72)
+    print(f"کل End Trend یافت‌شده:           {total_end_trend}")
+    print(f"سیگنال‌های شبیه کندل مرجع:        {total_similar}  "
+          f"({total_similar/max(total_end_trend,1)*100:.1f}% کل)")
+    print(f"از این تعداد، تحلیل آینده کامل:   {total}")
+    print(f"تعداد ارز:                        {df_r['symbol'].nunique()}")
+    print(f"افق آینده‌نگری:                   {FORWARD_CANDLES} کندل "
+          f"({FORWARD_CANDLES*4/24:.1f} روز)")
+    print(f"بازه تاریخی:                      {df_r['time'].min()} → {df_r['time'].max()}")
+    print(f"آستانه شباهت:                     dist ≤ {SIMILARITY_THRESHOLD}")
+    print()
+
+    print("📉 آمار ریزش (چند درصد سیگنال‌ها حداقل X% ریزش دیدند):")
+    for t in DROP_THRESHOLDS:
+        hit = int((df_r['max_drop_pct'] <= -t).sum())
+        pct = hit / total * 100
+        bar = "█" * int(pct / 2)
+        print(f"   -{t:2d}%:  {hit:4d}/{total}  ({pct:5.1f}%)  {bar}")
+
+    print("\n📈 آمار رشد (چند درصد سیگنال‌ها حداقل X% رشد دیدند):")
+    for t in RISE_THRESHOLDS:
+        hit = int((df_r['max_rise_pct'] >= t).sum())
+        pct = hit / total * 100
+        bar = "█" * int(pct / 2)
+        print(f"   +{t:2d}%:  {hit:4d}/{total}  ({pct:5.1f}%)  {bar}")
+
+    print("\n📊 توزیع آماری:")
+    print(f"   میانگین حداکثر رشد:   {df_r['max_rise_pct'].mean():+7.2f}%")
+    print(f"   میانه  حداکثر رشد:    {df_r['max_rise_pct'].median():+7.2f}%")
+    print(f"   میانگین حداکثر ریزش:  {df_r['max_drop_pct'].mean():+7.2f}%")
+    print(f"   میانه  حداکثر ریزش:   {df_r['max_drop_pct'].median():+7.2f}%")
+
+    print("\n📋 تعداد سیگنال به تفکیک ارز:")
+    per_sym = df_r.groupby('symbol').size().sort_values(ascending=False)
+    for s, cnt in per_sym.items():
+        print(f"   {s:10s}: {cnt:3d}")
+
+    print("\n🎯 ۱۰ سیگنال شبیه‌تر (کمترین dist):")
+    cols = ['symbol', 'time', 'dist', 'max_rise_pct', 'max_drop_pct']
+    print(df_r.nsmallest(10, 'dist')[cols].to_string(index=False))
+
+    df_r.to_csv('end_trend_similar_backtest.csv', index=False)
+    print(f"\n💾 ذخیره شد: end_trend_similar_backtest.csv ({total} ردیف)")
 
 if __name__ == "__main__":
     main()
