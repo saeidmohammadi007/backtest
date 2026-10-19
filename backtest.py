@@ -1,13 +1,14 @@
 """
-Backtest: MACD cross-up + ADX red triangle (1-15 candles BEFORE cross)
+Backtest: MACD cross-up + ADX End-Trend within [i-3, i+3]
 on top-20 coins, 4h timeframe.
 
 Signal rule:
   1. MACD cross-up on candle i
-  2. ADX red triangle (shortE) in candles [i-15, i-1]
-     -> 1 to 15 candles BEFORE the cross
-     -> NOT including the cross candle itself
-     -> NOT after the cross
+  2. ADX End-Trend (longX or shortX — orange ✕ in "ADX Di+ Di- [Gu5]")
+     in candles [i-3, i+3]
+     -> 3 candles BEFORE cross
+     -> OR the cross candle itself
+     -> OR 3 candles AFTER cross
   3. At least LOOKAHEAD=100 candles exist AFTER candle i
      (signals too close to end of data are dropped)
 
@@ -32,10 +33,11 @@ TOP_COINS = [
 
 SL_LEVELS = [2, 3, 4, 5]
 TP_LEVELS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
-LOOKAHEAD  = 100                    # تعداد کندل بعدی که باید موجود باشد
-TRI_BEFORE = 15                     # مثلث: ۱ تا ۱۵ کندل قبل از کراس
+LOOKAHEAD  = 100
+TRI_BEFORE = 3      # چند کندل قبل از کراس
+TRI_AFTER  = 3      # چند کندل بعد از کراس
 RANGE_DAYS = int(os.getenv("RANGE_DAYS", "700"))
-WARMUP     = 100                    # warmup برای ADX/MACD
+WARMUP     = 100
 MIN_CANDLES = 200
 
 MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
@@ -115,12 +117,19 @@ def rma(x: pd.Series, n: int) -> pd.Series:
     return pd.Series(out, index=x.index)
 
 
-def adx_short_triangle(df: pd.DataFrame) -> pd.Series:
+def adx_end_trend(df: pd.DataFrame) -> pd.Series:
+    """
+    معادل longX or shortX در اسکریپت Pine 'ADX Di+ Di- [Gu5]'.
+    End Trend = خروج از هر روندی (0.5, 1, -0.5, -1) به 0
+               = علامت ✕ نارنجی در Pine
+    """
     h, l, c = df["h"], df["l"], df["c"]
     up = h.diff()
     down = -l.diff()
-    plus_dm  = np.where(up.isna(),   np.nan, np.where((up > down) & (up > 0), up, 0.0))
-    minus_dm = np.where(down.isna(), np.nan, np.where((down > up) & (down > 0), down, 0.0))
+    plus_dm  = np.where(up.isna(),   np.nan,
+                        np.where((up > down) & (up > 0), up, 0.0))
+    minus_dm = np.where(down.isna(), np.nan,
+                        np.where((down > up) & (down > 0), down, 0.0))
     pc = c.shift(1)
     tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()],
                    axis=1).max(axis=1, skipna=False)
@@ -132,39 +141,41 @@ def adx_short_triangle(df: pd.DataFrame) -> pd.Series:
 
     n = len(df)
     P, M, G = plus.to_numpy(), minus.to_numpy(), sig.to_numpy()
-    short_e = np.zeros(n, dtype=bool)
+    end_trend = np.zeros(n, dtype=bool)
     cond = 0.0
     for i in range(1, n):
-        if np.isnan(G[i]) or np.isnan(G[i - 1]) or np.isnan(P[i]) or np.isnan(M[i]):
+        if np.isnan(G[i]) or np.isnan(G[i-1]) or np.isnan(P[i]) or np.isnan(M[i]):
             continue
-        hl       = G[i]     <= LVL_RANGE
-        hl_prev  = G[i - 1] <= LVL_RANGE
-        di_up    = P[i] >= M[i]
-        di_dn    = M[i] >  P[i]
-        di_dn_prev = (M[i - 1] >  P[i - 1]) if not np.isnan(M[i - 1]) else False
-        di_up_prev = (P[i - 1] >= M[i - 1]) if not np.isnan(M[i - 1]) else False
-        sig_up = G[i] > G[i - 1]
-        cross = (P[i] > M[i] and P[i - 1] <= M[i - 1]) or \
-                (P[i] < M[i] and P[i - 1] >= M[i - 1])
+        hl         = G[i]     <= LVL_RANGE
+        hl_prev    = G[i-1]   <= LVL_RANGE
+        di_up      = P[i] >= M[i]
+        di_dn      = M[i] >  P[i]
+        di_up_prev = (P[i-1] >= M[i-1]) if not np.isnan(M[i-1]) else False
+        di_dn_prev = (M[i-1] >  P[i-1]) if not np.isnan(M[i-1]) else False
+        sig_up = G[i] > G[i-1]
+        cross  = (P[i] > M[i] and P[i-1] <= M[i-1]) or \
+                 (P[i] < M[i] and P[i-1] >= M[i-1])
 
-        entry_long  = (not hl and di_up and sig_up and not di_up_prev) or \
-                      (not hl and di_up and sig_up and G[i] > LVL_RANGE and hl_prev)
-        entry_short = (not hl and di_dn and sig_up and not di_dn_prev) or \
-                      (not hl and di_dn and sig_up and G[i] > LVL_RANGE and hl_prev)
-        entry_long_str = not hl and di_up and sig_up and P[i] >= LVL_TREND
-        entry_short_st = not hl and di_dn and sig_up and M[i] >  LVL_TREND
-        exit_long  = (cross and di_up_prev) or (hl and not hl_prev)
-        exit_short = (cross and di_dn_prev) or (hl and not hl_prev)
+        entryLong    = (not hl and di_up and sig_up and not di_up_prev) or \
+                       (not hl and di_up and sig_up and G[i] > LVL_RANGE and hl_prev)
+        entryShort   = (not hl and di_dn and sig_up and not di_dn_prev) or \
+                       (not hl and di_dn and sig_up and G[i] > LVL_RANGE and hl_prev)
+        entryLongStr = not hl and di_up and sig_up and P[i] >= LVL_TREND
+        entryShortSt = not hl and di_dn and sig_up and M[i] >  LVL_TREND
+        exitLong     = (cross and di_up_prev) or (hl and not hl_prev)
+        exitShort    = (cross and di_dn_prev) or (hl and not hl_prev)
 
         prev = cond
-        if   prev != 1    and entry_long_str:  cond = 1
-        elif prev != -1   and entry_short_st:  cond = -1
-        elif prev != 0.5  and entry_long:      cond = 0.5
-        elif prev != -0.5 and entry_short:     cond = -0.5
-        elif prev != 0    and exit_long:       cond = 0
-        elif prev != 0    and exit_short:      cond = 0
-        short_e[i] = (prev != -0.5 and cond == -0.5)
-    return pd.Series(short_e, index=df.index)
+        if   prev !=  1   and entryLongStr:  cond =  1
+        elif prev != -1   and entryShortSt:  cond = -1
+        elif prev !=  0.5 and entryLong:     cond =  0.5
+        elif prev != -0.5 and entryShort:    cond = -0.5
+        elif prev !=  0   and exitLong:      cond =  0
+        elif prev !=  0   and exitShort:     cond =  0
+
+        end_trend[i] = (prev != 0) and (cond == 0)
+
+    return pd.Series(end_trend, index=df.index)
 
 
 def macd_cross_up(df: pd.DataFrame) -> pd.Series:
@@ -178,25 +189,23 @@ def macd_cross_up(df: pd.DataFrame) -> pd.Series:
 # ============ SIGNAL DETECTION ============
 def detect_signals(df: pd.DataFrame):
     """
-    Return (signals, dropped_no_future).
-
     A signal at candle i requires:
       - MACD cross-up on candle i
-      - ADX red triangle in [i-TRI_BEFORE, i-1]
-        (1..TRI_BEFORE candles BEFORE cross, NOT the cross itself)
+      - ADX End-Trend in [i-TRI_BEFORE, i+TRI_AFTER]
+        (3 before + cross candle + 3 after)
       - At least LOOKAHEAD candles exist AFTER candle i
-        (otherwise dropped and counted in dropped_no_future)
     """
-    cross = macd_cross_up(df).to_numpy()
-    tri   = adx_short_triangle(df).to_numpy()
-    n     = len(df)
+    cross   = macd_cross_up(df).to_numpy()
+    end_tr  = adx_end_trend(df).to_numpy()
+    n       = len(df)
     signals = []
     dropped = 0
     for i in range(WARMUP, n):
         if not cross[i]:
             continue
         start = max(0, i - TRI_BEFORE)
-        if not tri[start:i].any():
+        end   = min(n, i + TRI_AFTER + 1)   # +1 چون slice انتها exclusive است
+        if not end_tr[start:end].any():
             continue
         if i + LOOKAHEAD >= n:
             dropped += 1
@@ -207,7 +216,6 @@ def detect_signals(df: pd.DataFrame):
 
 # ============ BACKTEST ============
 def backtest_coin(df: pd.DataFrame, signals):
-    """Signals already guaranteed to have LOOKAHEAD candles after them."""
     outcomes = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
 
     for i in signals:
@@ -229,7 +237,6 @@ def backtest_coin(df: pd.DataFrame, signals):
             tp_first = int(np.argmax(mask)) if mask.any() else None
             for sl in SL_LEVELS:
                 sl_idx = sl_first[sl]
-                # win only if TP hit strictly BEFORE SL (same-candle -> loss)
                 win = (tp_first is not None and
                        (sl_idx is None or tp_first < sl_idx))
                 outcomes[(sl, tp)].append(win)
@@ -257,8 +264,10 @@ def md_table(all_outcomes, total, total_dropped):
     lines.append("")
     lines.append(f"**Total signals analyzed:** {total}")
     lines.append(f"**Dropped (no {LOOKAHEAD} candles of future data):** {total_dropped}")
-    lines.append(f"**Triangle window:** `[i-{TRI_BEFORE}, i-1]` "
-                 f"(1..{TRI_BEFORE} candles BEFORE cross)")
+    lines.append(f"**End-Trend window:** `[i-{TRI_BEFORE}, i+{TRI_AFTER}]` "
+                 f"({TRI_BEFORE} before + cross candle + {TRI_AFTER} after)")
+    lines.append(f"**End-Trend meaning:** exit from any ADX trend "
+                 f"(weak/strong, long/short) -> 0 (orange ✕)")
     lines.append(f"**Forward window:** {LOOKAHEAD} candles")
     lines.append(f"**Tie rule:** same-candle TP&SL -> loss (conservative)")
     return "\n".join(lines)
@@ -276,7 +285,7 @@ def mono_table(all_outcomes, total, total_dropped):
             row += val.rjust(col_w)
         lines.append(row)
     lines.append(f"\nSignals: {total} | Dropped (no future): {total_dropped}")
-    lines.append(f"Triangle: 1..{TRI_BEFORE} bars before cross | Forward: {LOOKAHEAD} bars")
+    lines.append(f"End-Trend: [{TRI_BEFORE} before, +{TRI_AFTER} after] | Forward: {LOOKAHEAD} bars")
     return "\n".join(lines)
 
 
@@ -299,9 +308,11 @@ def telegram(text):
 # ============ MAIN ============
 def main():
     print(f"config: RANGE_DAYS={RANGE_DAYS} LOOKAHEAD={LOOKAHEAD} "
-          f"TRI_BEFORE={TRI_BEFORE} coins={len(TOP_COINS)}", flush=True)
-    print(f"rule: MACD cross-up on i AND red triangle in [i-{TRI_BEFORE}, i-1] "
-          f"AND >= {LOOKAHEAD} candles after i", flush=True)
+          f"TRI_BEFORE={TRI_BEFORE} TRI_AFTER={TRI_AFTER} "
+          f"coins={len(TOP_COINS)}", flush=True)
+    print(f"rule: MACD cross-up on i AND End-Trend in "
+          f"[i-{TRI_BEFORE}, i+{TRI_AFTER}] AND >= {LOOKAHEAD} candles after i",
+          flush=True)
 
     all_outcomes   = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
     total_signals  = 0
@@ -338,12 +349,13 @@ def main():
               f"dropped_no_future={dropped}", flush=True)
         time.sleep(0.5)
 
-    # ---- print markdown ----
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        "# Backtest — MACD cross-up + ADX red triangle (4h)",
-        f"**Rule:** triangle in `[i-{TRI_BEFORE}, i-1]` "
-        f"(1..{TRI_BEFORE} candles BEFORE cross, not cross, not after)",
+        "# Backtest — MACD cross-up + ADX End-Trend (4h)",
+        f"**Rule:** End-Trend in `[i-{TRI_BEFORE}, i+{TRI_AFTER}]` "
+        f"({TRI_BEFORE} candles before cross + cross candle + {TRI_AFTER} after)",
+        f"**End-Trend:** exit from any ADX trend (weak/strong, long/short) → 0 "
+        f"(orange ✕ in 'ADX Di+ Di- [Gu5]')",
         f"**Forward window:** {LOOKAHEAD} candles required after signal",
         f"**Tie rule:** same-candle TP&SL → loss (conservative)",
         f"Generated: {ts}",
@@ -365,7 +377,6 @@ def main():
     md = "\n".join(lines)
     print("\n" + md, flush=True)
 
-    # ---- save artifact ----
     os.makedirs(OUT_DIR, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     with open(f"{OUT_DIR}/backtest_{stamp}.md", "w", encoding="utf-8") as f:
@@ -373,10 +384,9 @@ def main():
     with open(f"{OUT_DIR}/latest.md", "w", encoding="utf-8") as f:
         f.write(md)
 
-    # ---- telegram ----
     tg_msg = (
-        f"📊 <b>Backtest</b> — MACD↑ + 🔺ADX (4h)\n"
-        f"Triangle: 1..{TRI_BEFORE} bars BEFORE cross\n"
+        f"📊 <b>Backtest</b> — MACD↑ + End-Trend ✕ (4h)\n"
+        f"Window: [{TRI_BEFORE} before, +{TRI_AFTER} after] cross\n"
         f"Forward: {LOOKAHEAD} bars required\n"
         f"Coins: {len(TOP_COINS)} | Signals: {total_signals} "
         f"| Dropped: {total_dropped}\n\n"
