@@ -2,14 +2,20 @@ name: Backtest Top-20 Coins
 
 on:
   workflow_dispatch:
+  # schedule:
+  #   - cron: '0 6 * * *'
 
 permissions:
   contents: write
 
+concurrency:
+  group: backtest-top20
+  cancel-in-progress: false
+
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -19,11 +25,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pandas requests
+          pip install "numpy==1.26.4" "pandas==2.2.2" "requests==2.32.3"
 
       - name: Run backtest
         env:
@@ -33,9 +40,10 @@ jobs:
         run: python backtest.py
 
       - name: Upload result artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-results
+          name: backtest-results-${{ github.run_number }}
           path: results/
           retention-days: 30
 
@@ -43,6 +51,8 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add results/latest.md || true
-          git diff --cached --quiet || git commit -m "update backtest [skip ci]"
-          git push || true
+          git add results/latest.md
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update backtest $(date -u +%Y-%m-%d) [skip ci]"
+            git push
+          fi
