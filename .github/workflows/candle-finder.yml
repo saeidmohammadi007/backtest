@@ -1,12 +1,12 @@
 name: Manual Crypto Backtest
 
 on:
-  workflow_dispatch:  # فقط اجرای دستی
+  workflow_dispatch:
 
 jobs:
   run-backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # حداکثر ۲ ساعت (پیش‌فرض ۶ ساعت است)
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
@@ -22,12 +22,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy requests
 
+      - name: Create results directory
+        run: mkdir -p results
+
       - name: Run backtest
         run: python backtest.py
         env:
-          RANGE_DAYS: 700  # می‌توانید اینجا تغییر دهید
+          RANGE_DAYS: 700
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       - name: Upload results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results
