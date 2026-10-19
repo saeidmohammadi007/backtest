@@ -1,19 +1,22 @@
 """
-Backtest: MACD cross-up + ADX End-Trend within [i-3, i+3]
+Backtest: MACD cross-up + ADX End-Trend in [i+1, i+3]
 on top-20 coins, 4h timeframe.
 
 Signal rule:
   1. MACD cross-up on candle i
   2. ADX End-Trend (longX or shortX — orange ✕ in "ADX Di+ Di- [Gu5]")
-     in candles [i-3, i+3]
-     -> 3 candles BEFORE cross
-     -> OR the cross candle itself
-     -> OR 3 candles AFTER cross
+     in candles [i+1, i+3]
+     -> 1 to 3 candles AFTER the cross
+     -> NOT including the cross candle itself
+     -> NOT before the cross
   3. At least LOOKAHEAD=100 candles exist AFTER candle i
      (signals too close to end of data are dropped)
 
 For each signal, tests next 100 candles for each (SL, TP) pair.
 Win = TP hit before SL (same-candle tie -> loss, conservative).
+
+⚠️ WARNING: End-Trend is AFTER the cross, so entry at candle i close
+   uses future information (look-ahead bias). Results are optimistic.
 """
 import os
 import time
@@ -34,8 +37,7 @@ TOP_COINS = [
 SL_LEVELS = [2, 3, 4, 5]
 TP_LEVELS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 LOOKAHEAD  = 100
-TRI_BEFORE = 3      # چند کندل قبل از کراس
-TRI_AFTER  = 3      # چند کندل بعد از کراس
+TRI_AFTER  = 3      # پنجره: ۱ تا ۳ کندل بعد از کراس
 RANGE_DAYS = int(os.getenv("RANGE_DAYS", "700"))
 WARMUP     = 100
 MIN_CANDLES = 200
@@ -191,8 +193,8 @@ def detect_signals(df: pd.DataFrame):
     """
     A signal at candle i requires:
       - MACD cross-up on candle i
-      - ADX End-Trend in [i-TRI_BEFORE, i+TRI_AFTER]
-        (3 before + cross candle + 3 after)
+      - ADX End-Trend in [i+1, i+TRI_AFTER]
+        (1..TRI_AFTER candles AFTER the cross, NOT the cross, NOT before)
       - At least LOOKAHEAD candles exist AFTER candle i
     """
     cross   = macd_cross_up(df).to_numpy()
@@ -203,8 +205,10 @@ def detect_signals(df: pd.DataFrame):
     for i in range(WARMUP, n):
         if not cross[i]:
             continue
-        start = max(0, i - TRI_BEFORE)
-        end   = min(n, i + TRI_AFTER + 1)   # +1 چون slice انتها exclusive است
+        start = i + 1                              # ← شروع: یک بعد از کراس
+        end   = min(n, i + TRI_AFTER + 1)          # ← پایان: تا i+3 (شامل)
+        if start >= end:
+            continue
         if not end_tr[start:end].any():
             continue
         if i + LOOKAHEAD >= n:
@@ -264,12 +268,14 @@ def md_table(all_outcomes, total, total_dropped):
     lines.append("")
     lines.append(f"**Total signals analyzed:** {total}")
     lines.append(f"**Dropped (no {LOOKAHEAD} candles of future data):** {total_dropped}")
-    lines.append(f"**End-Trend window:** `[i-{TRI_BEFORE}, i+{TRI_AFTER}]` "
-                 f"({TRI_BEFORE} before + cross candle + {TRI_AFTER} after)")
+    lines.append(f"**End-Trend window:** `[i+1, i+{TRI_AFTER}]` "
+                 f"(1..{TRI_AFTER} candles AFTER cross, not cross, not before)")
     lines.append(f"**End-Trend meaning:** exit from any ADX trend "
                  f"(weak/strong, long/short) -> 0 (orange ✕)")
     lines.append(f"**Forward window:** {LOOKAHEAD} candles")
     lines.append(f"**Tie rule:** same-candle TP&SL -> loss (conservative)")
+    lines.append(f"**⚠️ Warning:** look-ahead bias (entry at i, "
+                 f"End-Trend in i+1..i+{TRI_AFTER})")
     return "\n".join(lines)
 
 
@@ -285,7 +291,8 @@ def mono_table(all_outcomes, total, total_dropped):
             row += val.rjust(col_w)
         lines.append(row)
     lines.append(f"\nSignals: {total} | Dropped (no future): {total_dropped}")
-    lines.append(f"End-Trend: [{TRI_BEFORE} before, +{TRI_AFTER} after] | Forward: {LOOKAHEAD} bars")
+    lines.append(f"End-Trend: 1..{TRI_AFTER} bars AFTER cross | Forward: {LOOKAHEAD} bars")
+    lines.append(f"⚠️ look-ahead bias: entry at i, End-Trend in i+1..i+{TRI_AFTER}")
     return "\n".join(lines)
 
 
@@ -308,11 +315,11 @@ def telegram(text):
 # ============ MAIN ============
 def main():
     print(f"config: RANGE_DAYS={RANGE_DAYS} LOOKAHEAD={LOOKAHEAD} "
-          f"TRI_BEFORE={TRI_BEFORE} TRI_AFTER={TRI_AFTER} "
-          f"coins={len(TOP_COINS)}", flush=True)
-    print(f"rule: MACD cross-up on i AND End-Trend in "
-          f"[i-{TRI_BEFORE}, i+{TRI_AFTER}] AND >= {LOOKAHEAD} candles after i",
-          flush=True)
+          f"TRI_AFTER={TRI_AFTER} coins={len(TOP_COINS)}", flush=True)
+    print(f"rule: MACD cross-up on i AND End-Trend in [i+1, i+{TRI_AFTER}] "
+          f"AND >= {LOOKAHEAD} candles after i", flush=True)
+    print(f"⚠️ WARNING: look-ahead bias — entry at i, "
+          f"End-Trend in i+1..i+{TRI_AFTER}", flush=True)
 
     all_outcomes   = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
     total_signals  = 0
@@ -351,13 +358,15 @@ def main():
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        "# Backtest — MACD cross-up + ADX End-Trend (4h)",
-        f"**Rule:** End-Trend in `[i-{TRI_BEFORE}, i+{TRI_AFTER}]` "
-        f"({TRI_BEFORE} candles before cross + cross candle + {TRI_AFTER} after)",
+        "# Backtest — MACD cross-up + ADX End-Trend AFTER cross (4h)",
+        f"**Rule:** End-Trend in `[i+1, i+{TRI_AFTER}]` "
+        f"(1..{TRI_AFTER} candles AFTER cross, not cross, not before)",
         f"**End-Trend:** exit from any ADX trend (weak/strong, long/short) → 0 "
         f"(orange ✕ in 'ADX Di+ Di- [Gu5]')",
         f"**Forward window:** {LOOKAHEAD} candles required after signal",
         f"**Tie rule:** same-candle TP&SL → loss (conservative)",
+        f"**⚠️ Warning:** look-ahead bias — entry at `i`, "
+        f"End-Trend at `i+1..i+{TRI_AFTER}`",
         f"Generated: {ts}",
         f"Coins: {len(TOP_COINS)} | Signals analyzed: {total_signals} "
         f"| Dropped (no future data): {total_dropped}",
@@ -385,8 +394,9 @@ def main():
         f.write(md)
 
     tg_msg = (
-        f"📊 <b>Backtest</b> — MACD↑ + End-Trend ✕ (4h)\n"
-        f"Window: [{TRI_BEFORE} before, +{TRI_AFTER} after] cross\n"
+        f"📊 <b>Backtest</b> — MACD↑ + End-Trend ✕ AFTER cross (4h)\n"
+        f"End-Trend: 1..{TRI_AFTER} bars AFTER cross\n"
+        f"⚠️ look-ahead bias: entry at i, End-Trend i+1..i+{TRI_AFTER}\n"
         f"Forward: {LOOKAHEAD} bars required\n"
         f"Coins: {len(TOP_COINS)} | Signals: {total_signals} "
         f"| Dropped: {total_dropped}\n\n"
