@@ -1,41 +1,43 @@
-# Backtest — MACD cross-up + ADX red triangle (4h)
-**Rule:** triangle in `[i-15, i-1]` (1..15 candles BEFORE cross, not cross, not after)
+# Backtest — MACD cross-up + ADX End-Trend (4h)
+**Rule:** End-Trend in `[i-3, i+3]` (3 candles before cross + cross candle + 3 after)
+**End-Trend:** exit from any ADX trend (weak/strong, long/short) → 0 (orange ✕ in 'ADX Di+ Di- [Gu5]')
 **Forward window:** 100 candles required after signal
 **Tie rule:** same-candle TP&SL → loss (conservative)
-Generated: 2026-10-18 18:10 UTC
-Coins: 20 | Signals analyzed: 363 | Dropped (no future data): 8
+Generated: 2026-10-19 08:18 UTC
+Coins: 20 | Signals analyzed: 403 | Dropped (no future data): 8
 
 | SL\TP | 10% || 20% || 30% || 40% || 50% || 60% || 70% || 80% || 90% || 100% |
 |-------|-------||-------||-------||-------||-------||-------||-------||-------||-------||-------|
-| **2%** |  16.5 |   7.4 |   5.2 |   2.2 |   0.8 |   0.3 |   0.0 |   0.0 |   0.0 |   0.0 |
-| **3%** |  22.3 |  10.5 |   6.6 |   2.8 |   1.4 |   0.6 |   0.0 |   0.0 |   0.0 |   0.0 |
-| **4%** |  24.8 |  11.6 |   7.4 |   3.3 |   1.9 |   0.8 |   0.0 |   0.0 |   0.0 |   0.0 |
-| **5%** |  27.8 |  13.8 |   9.1 |   3.9 |   2.2 |   1.1 |   0.0 |   0.0 |   0.0 |   0.0 |
+| **2%** |  23.8 |   7.9 |   5.2 |   1.7 |   0.5 |   0.0 |   0.0 |   0.0 |   0.0 |   0.0 |
+| **3%** |  29.3 |   9.7 |   6.0 |   2.0 |   0.7 |   0.0 |   0.0 |   0.0 |   0.0 |   0.0 |
+| **4%** |  34.0 |  12.7 |   7.4 |   2.7 |   1.0 |   0.0 |   0.0 |   0.0 |   0.0 |   0.0 |
+| **5%** |  35.2 |  13.4 |   7.7 |   3.0 |   1.2 |   0.2 |   0.2 |   0.2 |   0.2 |   0.2 |
 
-**Total signals analyzed:** 363
+**Total signals analyzed:** 403
 **Dropped (no 100 candles of future data):** 8
-**Triangle window:** `[i-15, i-1]` (1..15 candles BEFORE cross)
+**End-Trend window:** `[i-3, i+3]` (3 before + cross candle + 3 after)
+**End-Trend meaning:** exit from any ADX trend (weak/strong, long/short) -> 0 (orange ✕)
 **Forward window:** 100 candles
 **Tie rule:** same-candle TP&SL -> loss (conservative)
 
 ## Per-coin signals
-- **BTC**: signals=30 · dropped=2 · candles=4186
-- **ETH**: signals=23 · dropped=0 · candles=4183
-- **BNB**: signals=21 · dropped=0 · candles=4186
-- **SOL**: signals=21 · dropped=0 · candles=4185
-- **XRP**: signals=28 · dropped=0 · candles=4186
-- **DOGE**: signals=21 · dropped=0 · candles=4184
-- **ADA**: signals=22 · dropped=1 · candles=4184
-- **AVAX**: signals=20 · dropped=0 · candles=4184
-- **TRX**: signals=6 · dropped=1 · candles=4186
-- **LINK**: signals=18 · dropped=2 · candles=4184
-- **DOT**: signals=24 · dropped=1 · candles=4185
+- **BTC**: signals=33 · dropped=1 · candles=4184
+- **ETH**: signals=22 · dropped=0 · candles=4181
+- **BNB**: signals=21 · dropped=0 · candles=4184
+- **SOL**: signals=21 · dropped=0 · candles=4183
+- **XRP**: signals=27 · dropped=0 · candles=4184
+- **DOGE**: signals=22 · dropped=0 · candles=4182
+- **ADA**: signals=21 · dropped=1 · candles=4182
+- **AVAX**: signals=25 · dropped=1 · candles=4182
+- **TRX**: signals=23 · dropped=2 · candles=4184
+- **LINK**: signals=20 · dropped=1 · candles=4182
+- **DOT**: signals=21 · dropped=1 · candles=4183
 - **MATIC**: _skipped (candles=0)_
-- **TON**: signals=5 · dropped=0 · candles=4146
-- **SHIB**: signals=25 · dropped=0 · candles=4186
-- **LTC**: signals=22 · dropped=1 · candles=4185
-- **BCH**: signals=22 · dropped=0 · candles=4186
+- **TON**: signals=22 · dropped=0 · candles=4144
+- **SHIB**: signals=25 · dropped=0 · candles=4184
+- **LTC**: signals=27 · dropped=0 · candles=4183
+- **BCH**: signals=24 · dropped=0 · candles=4184
 - **UNI**: _skipped (candles=0)_
-- **XLM**: signals=33 · dropped=0 · candles=4184
-- **NEAR**: signals=22 · dropped=0 · candles=4185
+- **XLM**: signals=27 · dropped=0 · candles=4182
+- **NEAR**: signals=22 · dropped=1 · candles=4183
 - **APT**: _skipped (candles=0)_
