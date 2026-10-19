@@ -1,211 +1,434 @@
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from dtw import dtw
-import requests
+"""
+Backtest: MACD cross-up + ADX End-Trend in [i+1, i+3]
+on top-100 coins, 4h timeframe.
+
+Signal rule:
+  1. MACD cross-up on candle i
+  2. ADX End-Trend (longX or shortX — orange ✕ in "ADX Di+ Di- [Gu5]")
+     in candles [i+1, i+3]
+     -> 1 to 3 candles AFTER the cross
+     -> NOT including the cross candle itself
+     -> NOT before the cross
+  3. At least LOOKAHEAD=100 candles exist AFTER candle i
+     (signals too close to end of data are dropped)
+
+For each signal, tests next 100 candles for each (SL, TP) pair.
+Win = TP hit before SL (same-candle tie -> loss, conservative).
+
+⚠️ WARNING: End-Trend is AFTER the cross, so entry at candle i close
+   uses future information (look-ahead bias). Results are optimistic.
+"""
+
+import os
 import time
-import warnings
-warnings.filterwarnings('ignore')
+from datetime import datetime, timezone
 
-# ---------- تنظیمات ----------
-REFERENCE_DATE = "2024-01-26"
-WINDOW_SIZE = 6
-FORWARD_BARS = 100
-MAX_INITIAL_DROP = 0.04
-TARGET_GAIN = 0.10
+import numpy as np
+import pandas as pd
+import requests
 
-TOP_20_YAHOO = [
-    "BTC-USD", "ETH-USD", "BNB-USD", "XRP-USD", "SOL-USD",
-    "DOGE-USD", "ADA-USD", "TRX-USD", "AVAX-USD", "LINK-USD",
-    "SHIB-USD", "DOT-USD", "BCH-USD", "LTC-USD", "NEAR-USD",
-    "UNI-USD", "ICP-USD", "ETC-USD", "XLM-USD", "SUI-USD"
+
+# ============ CONFIG ============
+TOP_COINS = [
+    # --- top 20 ---
+    "BTC", "ETH", "BNB", "SOL", "XRP",
+    "DOGE", "ADA", "AVAX", "TRX", "LINK",
+    "DOT", "MATIC", "TON", "SHIB", "LTC",
+    "BCH", "UNI", "XLM", "NEAR", "APT",
+    # --- 21..40 ---
+    "ICP", "FIL", "ARB", "OP", "HBAR",
+    "VET", "IMX", "INJ", "SUI", "GRT",
+    "MKR", "RNDR", "AAVE", "THETA", "ALGO",
+    "FTM", "EGLD", "SAND", "MANA", "AXS",
+    # --- 41..60 ---
+    "FLOW", "CHZ", "QNT", "KAVA", "GALA",
+    "XTZ", "EOS", "NEO", "CRV", "SNX",
+    "COMP", "ZEC", "DASH", "ENJ", "BAT",
+    "ZIL", "ONE", "IOTA", "RUNE", "SEI",
+    # --- 61..80 ---
+    "TIA", "JUP", "PYTH", "WLD", "STX",
+    "PEPE", "BONK", "WIF", "FLOKI", "LDO",
+    "FET", "AR", "BLUR", "DYDX", "GMX",
+    "SUSHI", "CAKE", "1INCH", "LPT", "MASK",
+    # --- 81..100 ---
+    "ENS", "ASTR", "KSM", "GLMR", "ATOM",
+    "OSMO", "ROSE", "MINA", "OCEAN", "TFUEL",
+    "ANKR", "CELO", "RPL", "ONDO", "ENA",
+    "STRK", "W", "JTO", "WOO", "RAY",
 ]
 
-TOP_20_NOBITEX = [
-    "BTCIRT", "ETHIRT", "BNBIRT", "XRPIRT", "SOLIRT",
-    "DOGEIRT", "ADAIRT", "TRXIRT", "AVAXIRT", "LINKIRT",
-    "SHIBIRT", "DOTIRT", "BCHIRT", "LTCIRT", "NEARIRT",
-    "UNIIRT", "ICPIRT", "ETCIRT", "XLMIRT", "SUIIRT"
-]
+SL_LEVELS = [2, 3, 4, 5]
+TP_LEVELS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+LOOKAHEAD  = 100
+TRI_AFTER  = 3      # پنجره: ۱ تا ۳ کندل بعد از کراس
+RANGE_DAYS = int(os.getenv("RANGE_DAYS", "700"))
+WARMUP     = 100
+MIN_CANDLES = 200
 
-NOBITEX_URL = "https://apiv2.nobitex.ir/market/udf/history"
+MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
+ADX_SIG_LEN, DI_LEN, LVL_RANGE, LVL_TREND = 14, 14, 20, 35
+TF_SECONDS = 4 * 3600
 
-def get_reference_candle_from_yahoo(symbol="BTC-USD", date="2024-01-26"):
-    """دریافت کندل روزانه از یاهو برای تاریخ مشخص"""
+FETCH_SLEEP = 1.0   # افزایش‌یافته برای ۱۰۰ ارز
+
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+
+YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart"
+S = requests.Session()
+S.headers["User-Agent"] = "Mozilla/5.0"
+
+OUT_DIR = "results"
+
+
+# ============ FETCH ============
+def get_json(url, params=None, tries=4):
+    for i in range(tries):
+        try:
+            r = S.get(url, params=params, timeout=30)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 404:
+                return None
+        except Exception:
+            pass
+        time.sleep(1 + i)
+    return None
+
+
+def to_4h(df: pd.DataFrame, now=None) -> pd.DataFrame:
+    now = now or time.time()
+    d = df.copy()
+    d["dt"] = pd.to_datetime(d["t"], unit="s", utc=True)
+    d = d.set_index("dt")
+    g = d.resample("4h", origin="epoch").agg(
+        {"o": "first", "h": "max", "l": "min", "c": "last", "t": "first"}
+    )
+    g["n"] = d["c"].resample("4h", origin="epoch").count()
+    g = g[g["n"] == 4].dropna()
+    g["t"] = ((g.index - pd.Timestamp("1970-01-01", tz="UTC"))
+              // pd.Timedelta(seconds=1)).astype(float)
+    g = g[g["t"] + TF_SECONDS <= now]
+    return g[["t", "o", "h", "l", "c"]].reset_index(drop=True)
+
+
+def fetch_klines(ticker):
+    j = get_json(f"{YAHOO}/{ticker}",
+                 {"interval": "1h", "range": f"{RANGE_DAYS}d"})
     try:
-        df = yf.download(
-            symbol,
-            start=date,
-            end=(pd.Timestamp(date) + pd.Timedelta(days=1)).strftime('%Y-%m-%d'),
-            interval="1d",
-            progress=False,
-            auto_adjust=True
-        )
-        if df.empty:
-            print(f"⚠️ کندل روزانه {date} برای {symbol} در یاهو موجود نیست.")
-            return None
-        # اگر ستون‌ها MultiIndex بودند، flatten کنیم
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df
-    except Exception as e:
-        print(f"❌ خطا در دریافت کندل مرجع از یاهو: {e}")
+        r = j["chart"]["result"][0]
+        q = r["indicators"]["quote"][0]
+        df = pd.DataFrame({
+            "t": r["timestamp"], "o": q["open"], "h": q["high"],
+            "l": q["low"], "c": q["close"],
+        }).dropna()
+        df = df.astype(float).drop_duplicates("t").sort_values("t")
+    except Exception:
         return None
-
-def download_4h_from_nobitex(symbol, start="2020-01-01", end=None):
-    """دریافت داده ۴ ساعته از نوبیتکس برای جستجوی الگو"""
-    if end is None:
-        end = pd.Timestamp.utcnow().strftime('%Y-%m-%d')
-    start_ts = int(pd.Timestamp(start, tz='UTC').timestamp())
-    end_ts = int(pd.Timestamp(end, tz='UTC').timestamp())
-    all_candles = []
-    page = 1
-    while True:
-        params = {
-            'symbol': symbol,
-            'resolution': '240',
-            'from': start_ts,
-            'to': end_ts,
-            'page': page
-        }
-        try:
-            r = requests.get(NOBITEX_URL, params=params, timeout=30)
-            if r.status_code != 200:
-                break
-            data = r.json()
-        except Exception:
-            break
-        if data.get('s') != 'ok':
-            break
-        t, o, h, l, c, v = (data.get(k, []) for k in ['t', 'o', 'h', 'l', 'c', 'v'])
-        if not t:
-            break
-        for i in range(len(t)):
-            all_candles.append({
-                'timestamp': t[i],
-                'Open': float(o[i]),
-                'High': float(h[i]),
-                'Low': float(l[i]),
-                'Close': float(c[i]),
-                'Volume': float(v[i])
-            })
-        if len(t) < 500:
-            break
-        page += 1
-        time.sleep(0.5)
-    if not all_candles:
+    if df.empty:
         return None
-    df = pd.DataFrame(all_candles)
-    df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
-    return df.set_index('datetime').sort_index()[['Open', 'High', 'Low', 'Close', 'Volume']]
+    return to_4h(df)
 
-def extract_reference_pattern(df_4h, ref_date, window_size):
-    """استخراج الگوی ۶ کندلی ۴ ساعته از داده ۴ ساعته (برای DTW)"""
-    ref_dt = pd.Timestamp(ref_date, tz='UTC')
-    idx = df_4h.index.get_indexer([ref_dt], method='nearest')[0]
-    window = df_4h.iloc[idx:idx + window_size]
-    if len(window) < window_size:
-        return None
-    return window
 
-def find_similar_windows(full_df, ref_window, window_size, top_k=5):
-    ref_series = ref_window['Close'].pct_change().dropna().values
-    if len(ref_series) < 2:
-        return []
-    results = []
-    closes = full_df['Close'].values
-    for i in range(window_size, len(closes) - FORWARD_BARS - 1):
-        seg = closes[i - window_size:i]
-        seg_series = pd.Series(seg).pct_change().dropna().values
-        if len(seg_series) < len(ref_series):
+# ============ INDICATORS ============
+def rma(x: pd.Series, n: int) -> pd.Series:
+    v = x.to_numpy(dtype=float)
+    out = np.full(len(v), np.nan)
+    valid = np.where(~np.isnan(v))[0]
+    if len(valid) < n:
+        return pd.Series(out, index=x.index)
+    s = valid[0] + n - 1
+    out[s] = np.nanmean(v[valid[0]:s + 1])
+    for i in range(s + 1, len(v)):
+        out[i] = (out[i - 1] * (n - 1) + v[i]) / n if not np.isnan(v[i]) else np.nan
+    return pd.Series(out, index=x.index)
+
+
+def adx_end_trend(df: pd.DataFrame) -> pd.Series:
+    """
+    معادل longX or shortX در اسکریپت Pine 'ADX Di+ Di- [Gu5]'.
+    End Trend = خروج از هر روندی (0.5, 1, -0.5, -1) به 0
+               = علامت ✕ نارنجی در Pine
+    """
+    h, l, c = df["h"], df["l"], df["c"]
+    up = h.diff()
+    down = -l.diff()
+    plus_dm  = np.where(up.isna(),   np.nan,
+                        np.where((up > down) & (up > 0), up, 0.0))
+    minus_dm = np.where(down.isna(), np.nan,
+                        np.where((down > up) & (down > 0), down, 0.0))
+    pc = c.shift(1)
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()],
+                   axis=1).max(axis=1, skipna=False)
+    tr_r = rma(tr, DI_LEN)
+    plus  = (100 * rma(pd.Series(plus_dm,  index=df.index), DI_LEN) / tr_r).ffill()
+    minus = (100 * rma(pd.Series(minus_dm, index=df.index), DI_LEN) / tr_r).ffill()
+    sm = plus + minus
+    sig = 100 * rma((plus - minus).abs() / sm.where(sm != 0, 1), ADX_SIG_LEN)
+
+    n = len(df)
+    P, M, G = plus.to_numpy(), minus.to_numpy(), sig.to_numpy()
+    end_trend = np.zeros(n, dtype=bool)
+    cond = 0.0
+    for i in range(1, n):
+        if np.isnan(G[i]) or np.isnan(G[i-1]) or np.isnan(P[i]) or np.isnan(M[i]):
             continue
-        try:
-            alignment = dtw(ref_series, seg_series, keep_internals=False)
-            dist = alignment.normalizedDistance
-        except Exception:
+        hl         = G[i]     <= LVL_RANGE
+        hl_prev    = G[i-1]   <= LVL_RANGE
+        di_up      = P[i] >= M[i]
+        di_dn      = M[i] >  P[i]
+        di_up_prev = (P[i-1] >= M[i-1]) if not np.isnan(M[i-1]) else False
+        di_dn_prev = (M[i-1] >  P[i-1]) if not np.isnan(M[i-1]) else False
+        sig_up = G[i] > G[i-1]
+        cross  = (P[i] > M[i] and P[i-1] <= M[i-1]) or \
+                 (P[i] < M[i] and P[i-1] >= M[i-1])
+
+        entryLong    = (not hl and di_up and sig_up and not di_up_prev) or \
+                       (not hl and di_up and sig_up and G[i] > LVL_RANGE and hl_prev)
+        entryShort   = (not hl and di_dn and sig_up and not di_dn_prev) or \
+                       (not hl and di_dn and sig_up and G[i] > LVL_RANGE and hl_prev)
+        entryLongStr = not hl and di_up and sig_up and P[i] >= LVL_TREND
+        entryShortSt = not hl and di_dn and sig_up and M[i] >  LVL_TREND
+        exitLong     = (cross and di_up_prev) or (hl and not hl_prev)
+        exitShort    = (cross and di_dn_prev) or (hl and not hl_prev)
+
+        prev = cond
+        if   prev !=  1   and entryLongStr:  cond =  1
+        elif prev != -1   and entryShortSt:  cond = -1
+        elif prev !=  0.5 and entryLong:     cond =  0.5
+        elif prev != -0.5 and entryShort:    cond = -0.5
+        elif prev !=  0   and exitLong:      cond =  0
+        elif prev !=  0   and exitShort:     cond =  0
+
+        end_trend[i] = (prev != 0) and (cond == 0)
+
+    return pd.Series(end_trend, index=df.index)
+
+
+def macd_cross_up(df: pd.DataFrame) -> pd.Series:
+    c = df["c"]
+    macd = c.ewm(span=MACD_FAST, adjust=False).mean() \
+         - c.ewm(span=MACD_SLOW, adjust=False).mean()
+    sgn = macd.ewm(span=MACD_SIG, adjust=False).mean()
+    return (macd.shift(1) <= sgn.shift(1)) & (macd > sgn)
+
+
+# ============ SIGNAL DETECTION ============
+def detect_signals(df: pd.DataFrame):
+    """
+    A signal at candle i requires:
+      - MACD cross-up on candle i
+      - ADX End-Trend in [i+1, i+TRI_AFTER]
+        (1..TRI_AFTER candles AFTER the cross, NOT the cross, NOT before)
+      - At least LOOKAHEAD candles exist AFTER candle i
+    """
+    cross   = macd_cross_up(df).to_numpy()
+    end_tr  = adx_end_trend(df).to_numpy()
+    n       = len(df)
+    signals = []
+    dropped = 0
+    for i in range(WARMUP, n):
+        if not cross[i]:
             continue
-        results.append({'start_idx': i - window_size, 'end_idx': i, 'distance': dist})
-    results.sort(key=lambda x: x['distance'])
-    return results[:top_k]
+        start = i + 1                              # ← شروع: یک بعد از کراس
+        end   = min(n, i + TRI_AFTER + 1)          # ← پایان: تا i+3 (شامل)
+        if start >= end:
+            continue
+        if not end_tr[start:end].any():
+            continue
+        if i + LOOKAHEAD >= n:
+            dropped += 1
+            continue
+        signals.append(i)
+    return signals, dropped
 
-def analyze_outcome(full_df, window_info):
-    end_idx = window_info['end_idx']
-    start_price = full_df['Close'].iloc[end_idx - 1]
-    future = full_df.iloc[end_idx:end_idx + FORWARD_BARS]
-    if future.empty:
-        return None
-    initial_drop = (start_price - future['Low'].min()) / start_price
-    max_gain = (future['High'].max() - start_price) / start_price
-    return {
-        'initial_drop_pct': round(initial_drop * 100, 2),
-        'max_gain_pct': round(max_gain * 100, 2),
-        'valid_drop': initial_drop < MAX_INITIAL_DROP,
-        'hit_target': max_gain >= TARGET_GAIN,
-        'success': (initial_drop < MAX_INITIAL_DROP) and (max_gain >= TARGET_GAIN)
-    }
 
+# ============ BACKTEST ============
+def backtest_coin(df: pd.DataFrame, signals):
+    outcomes = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
+
+    for i in signals:
+        entry = float(df["c"].iloc[i])
+        hi = df["h"].iloc[i + 1:i + 1 + LOOKAHEAD].to_numpy(dtype=float)
+        lo = df["l"].iloc[i + 1:i + 1 + LOOKAHEAD].to_numpy(dtype=float)
+        run_hi = np.maximum.accumulate(hi)
+        run_lo = np.minimum.accumulate(lo)
+
+        sl_first = {}
+        for sl in SL_LEVELS:
+            price = entry * (1 - sl / 100)
+            mask = run_lo <= price
+            sl_first[sl] = int(np.argmax(mask)) if mask.any() else None
+
+        for tp in TP_LEVELS:
+            price = entry * (1 + tp / 100)
+            mask = run_hi >= price
+            tp_first = int(np.argmax(mask)) if mask.any() else None
+            for sl in SL_LEVELS:
+                sl_idx = sl_first[sl]
+                win = (tp_first is not None and
+                       (sl_idx is None or tp_first < sl_idx))
+                outcomes[(sl, tp)].append(win)
+
+    return outcomes, len(signals)
+
+
+# ============ FORMAT ============
+def md_table(all_outcomes, total, total_dropped):
+    lines = []
+    header = "| SL\\TP |" + "|".join(f" {tp}% |" for tp in TP_LEVELS)
+    sep    = "|-------|" + "|".join("-------|" for _ in TP_LEVELS)
+    lines.append(header)
+    lines.append(sep)
+    for sl in SL_LEVELS:
+        row = f"| **{sl}%** |"
+        for tp in TP_LEVELS:
+            arr = all_outcomes[(sl, tp)]
+            if arr:
+                rate = sum(arr) / len(arr) * 100
+                row += f" {rate:5.1f} |"
+            else:
+                row += "   -   |"
+        lines.append(row)
+    lines.append("")
+    lines.append(f"**Total signals analyzed:** {total}")
+    lines.append(f"**Dropped (no {LOOKAHEAD} candles of future data):** {total_dropped}")
+    lines.append(f"**End-Trend window:** `[i+1, i+{TRI_AFTER}]` "
+                 f"(1..{TRI_AFTER} candles AFTER cross, not cross, not before)")
+    lines.append(f"**End-Trend meaning:** exit from any ADX trend "
+                 f"(weak/strong, long/short) -> 0 (orange ✕)")
+    lines.append(f"**Forward window:** {LOOKAHEAD} candles")
+    lines.append(f"**Tie rule:** same-candle TP&SL -> loss (conservative)")
+    lines.append(f"**⚠️ Warning:** look-ahead bias (entry at i, "
+                 f"End-Trend in i+1..i+{TRI_AFTER})")
+    return "\n".join(lines)
+
+
+def mono_table(all_outcomes, total, total_dropped):
+    col_w = 6
+    head = "SL\\TP".ljust(6) + "".join(f"{tp}%".rjust(col_w) for tp in TP_LEVELS)
+    lines = [head]
+    for sl in SL_LEVELS:
+        row = f"{sl}%".ljust(6)
+        for tp in TP_LEVELS:
+            arr = all_outcomes[(sl, tp)]
+            val = f"{sum(arr)/len(arr)*100:.1f}" if arr else "-"
+            row += val.rjust(col_w)
+        lines.append(row)
+    lines.append(f"\nSignals: {total} | Dropped (no future): {total_dropped}")
+    lines.append(f"End-Trend: 1..{TRI_AFTER} bars AFTER cross | Forward: {LOOKAHEAD} bars")
+    lines.append(f"⚠️ look-ahead bias: entry at i, End-Trend in i+1..i+{TRI_AFTER}")
+    return "\n".join(lines)
+
+
+def telegram(text):
+    if not TG_TOKEN or not TG_CHAT:
+        print("[telegram] not configured — skipping")
+        return
+    for i in range(0, len(text), 3800):
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                data={"chat_id": TG_CHAT, "text": text[i:i + 3800],
+                      "parse_mode": "HTML"},
+                timeout=20,
+            )
+        except Exception as e:
+            print(f"[telegram] error: {e}")
+
+
+# ============ MAIN ============
 def main():
-    print(f"🔍 اسکن الگوی مشابه تاریخ {REFERENCE_DATE} (تایم‌فریم ۴ ساعته)\n")
+    print(f"config: RANGE_DAYS={RANGE_DAYS} LOOKAHEAD={LOOKAHEAD} "
+          f"TRI_AFTER={TRI_AFTER} coins={len(TOP_COINS)}", flush=True)
+    print(f"rule: MACD cross-up on i AND End-Trend in [i+1, i+{TRI_AFTER}] "
+          f"AND >= {LOOKAHEAD} candles after i", flush=True)
+    print(f"⚠️ WARNING: look-ahead bias — entry at i, "
+          f"End-Trend in i+1..i+{TRI_AFTER}", flush=True)
 
-    # ۱. دریافت کندل روزانه مرجع مستقیماً از یاهو
-    print("📥 دریافت کندل روزانه مرجع از یاهو (BTC-USD)...")
-    ref_candle = get_reference_candle_from_yahoo("BTC-USD", REFERENCE_DATE)
-    if ref_candle is None:
-        print("❌ دریافت کندل مرجع از یاهو ناموفق بود.")
-        return
-    print(f"✅ کندل روزانه {REFERENCE_DATE} از یاهو دریافت شد:")
-    print(ref_candle[['Open', 'High', 'Low', 'Close']].to_string())
+    all_outcomes   = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
+    total_signals  = 0
+    total_dropped  = 0
+    per_coin       = {}
 
-    # ۲. دریافت داده ۴ ساعته برای استخراج الگو و جستجو
-    print("\n📥 دریافت داده ۴ ساعته BTCIRT از نوبیتکس برای استخراج الگو...")
-    btc_4h = download_4h_from_nobitex("BTCIRT")
-    if btc_4h is None:
-        print("❌ دریافت داده ۴ ساعته ناموفق بود.")
-        return
-
-    ref_window = extract_reference_pattern(btc_4h, REFERENCE_DATE, WINDOW_SIZE)
-    if ref_window is None:
-        print("❌ الگوی ۴ ساعته مرجع استخراج نشد.")
-        return
-    print(f"✅ الگوی ۴ ساعته مرجع: {len(ref_window)} کندل از {ref_window.index[0]}\n")
-
-    all_results = []
-    for i, symbol in enumerate(TOP_20_NOBITEX):
-        print(f"--- {symbol} ---")
-        df_4h = download_4h_from_nobitex(symbol)
-        if df_4h is None or len(df_4h) < WINDOW_SIZE + FORWARD_BARS + 10:
-            print("  ⚠️ داده کافی نیست.\n")
+    for idx, coin in enumerate(TOP_COINS, 1):
+        print(f"[{idx}/{len(TOP_COINS)}] [{coin}] fetching...", flush=True)
+        df = fetch_klines(f"{coin}-USD")
+        if df is None or len(df) < MIN_CANDLES:
+            n = 0 if df is None else len(df)
+            print(f"[{coin}] skipped (candles={n})", flush=True)
+            per_coin[coin] = {"signals": 0, "dropped": 0,
+                              "candles": n, "skipped": True}
+            time.sleep(FETCH_SLEEP)
             continue
-        similar = find_similar_windows(df_4h, ref_window, WINDOW_SIZE, top_k=5)
-        if not similar:
-            print("  ⚠️ پنجره مشابهی یافت نشد.\n")
-            continue
-        for win in similar:
-            outcome = analyze_outcome(df_4h, win)
-            if not outcome:
-                continue
-            outcome['symbol'] = symbol
-            outcome['window_start'] = df_4h.index[win['start_idx']].strftime('%Y-%m-%d %H:%M')
-            outcome['dtw_distance'] = round(win['distance'], 4)
-            all_results.append(outcome)
-            status = "✅" if outcome['success'] else "❌"
-            print(f"  {status} {outcome['window_start']} | DTW={outcome['dtw_distance']} | "
-                  f"ریزش={outcome['initial_drop_pct']}٪ | رشد={outcome['max_gain_pct']}٪")
-        print()
 
-    if all_results:
-        df = pd.DataFrame(all_results)
-        total = len(df)
-        valid = int(df['valid_drop'].sum())
-        success = int(df['success'].sum())
-        print("=" * 60)
-        print(f"کل موارد: {total} | ریزش مجاز: {valid} | موفق: {success}")
-        if valid > 0:
-            print(f"نرخ موفقیت در موارد با ریزش مجاز: {success/valid*100:.1f}٪")
-        df.to_csv("pattern_scan_results.csv", index=False)
-        print("💾 نتایج ذخیره شد.")
-    else:
-        print("❌ نتیجه‌ای یافت نشد.")
+        signals, dropped = detect_signals(df)
+        outcomes, n_valid = backtest_coin(df, signals)
+
+        per_coin[coin] = {
+            "signals": n_valid,
+            "dropped": dropped,
+            "candles": len(df),
+            "skipped": False,
+        }
+        total_signals += n_valid
+        total_dropped += dropped
+
+        for k, v in outcomes.items():
+            all_outcomes[k].extend(v)
+
+        print(f"[{coin}] candles={len(df)} signals={n_valid} "
+              f"dropped_no_future={dropped}", flush=True)
+        time.sleep(FETCH_SLEEP)
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        "# Backtest — MACD cross-up + ADX End-Trend AFTER cross (4h)",
+        f"**Rule:** End-Trend in `[i+1, i+{TRI_AFTER}]` "
+        f"(1..{TRI_AFTER} candles AFTER cross, not cross, not before)",
+        f"**End-Trend:** exit from any ADX trend (weak/strong, long/short) → 0 "
+        f"(orange ✕ in 'ADX Di+ Di- [Gu5]')",
+        f"**Forward window:** {LOOKAHEAD} candles required after signal",
+        f"**Tie rule:** same-candle TP&SL → loss (conservative)",
+        f"**⚠️ Warning:** look-ahead bias — entry at `i`, "
+        f"End-Trend at `i+1..i+{TRI_AFTER}`",
+        f"Generated: {ts}",
+        f"Coins: {len(TOP_COINS)} | Signals analyzed: {total_signals} "
+        f"| Dropped (no future data): {total_dropped}",
+        "",
+        md_table(all_outcomes, total_signals, total_dropped),
+        "",
+        "## Per-coin signals",
+    ]
+    for coin, info in per_coin.items():
+        if info["skipped"]:
+            lines.append(f"- **{coin}**: _skipped (candles={info['candles']})_")
+        else:
+            lines.append(
+                f"- **{coin}**: signals={info['signals']} "
+                f"· dropped={info['dropped']} · candles={info['candles']}"
+            )
+    md = "\n".join(lines)
+    print("\n" + md, flush=True)
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    with open(f"{OUT_DIR}/backtest_{stamp}.md", "w", encoding="utf-8") as f:
+        f.write(md)
+    with open(f"{OUT_DIR}/latest.md", "w", encoding="utf-8") as f:
+        f.write(md)
+
+    tg_msg = (
+        f"📊 <b>Backtest</b> — MACD↑ + End-Trend ✕ AFTER cross (4h)\n"
+        f"End-Trend: 1..{TRI_AFTER} bars AFTER cross\n"
+        f"⚠️ look-ahead bias: entry at i, End-Trend i+1..i+{TRI_AFTER}\n"
+        f"Forward: {LOOKAHEAD} bars required\n"
+        f"Coins: {len(TOP_COINS)} | Signals: {total_signals} "
+        f"| Dropped: {total_dropped}\n\n"
+        f"<pre>{mono_table(all_outcomes, total_signals, total_dropped)}</pre>"
+    )
+    telegram(tg_msg)
+
 
 if __name__ == "__main__":
     main()
