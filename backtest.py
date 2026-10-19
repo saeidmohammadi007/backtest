@@ -1,1 +1,437 @@
+"""
+Backtest: MACD cross-up + ADX End-Trend in [i+1, i+3]
+on top-20 coins, 4h timeframe — data from Binance Futures.
 
+Signal rule:
+  1. MACD cross-up on candle i
+  2. ADX End-Trend (longX or shortX — orange ✕ in "ADX Di+ Di- [Gu5]")
+     in candles [i+1, i+3]
+     -> 1 to 3 candles AFTER the cross
+     -> NOT including the cross candle itself
+     -> NOT before the cross
+  3. At least LOOKAHEAD=100 candles exist AFTER candle i
+     (signals too close to end of data are dropped)
+
+For each signal, tests next 100 candles for each (SL, TP) pair.
+Win = TP hit before SL (same-candle tie -> loss, conservative).
+
+⚠️ WARNING: End-Trend is AFTER the cross, so entry at candle i close
+   uses future information (look-ahead bias). Results are optimistic.
+"""
+
+import os
+import time
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+import requests
+
+
+# ============ CONFIG ============
+TOP_COINS = [
+    "BTC", "ETH", "BNB", "SOL", "XRP",
+    "DOGE", "ADA", "AVAX", "TRX", "LINK",
+    "DOT", "MATIC", "TON", "SHIB", "LTC",
+    "BCH", "UNI", "XLM", "NEAR", "APT",
+]
+
+SL_LEVELS = [2, 3, 4, 5]
+TP_LEVELS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+LOOKAHEAD  = 100
+TRI_AFTER  = 3
+RANGE_DAYS = int(os.getenv("RANGE_DAYS", "700"))
+WARMUP     = 100
+MIN_CANDLES = 200
+
+MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
+ADX_SIG_LEN, DI_LEN, LVL_RANGE, LVL_TREND = 14, 14, 20, 35
+TF_SECONDS = 4 * 3600
+
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+
+BINANCE_FAPI = "https://fapi.binance.com/fapi/v1/klines"
+S = requests.Session()
+S.headers["User-Agent"] = "Mozilla/5.0"
+
+OUT_DIR = "results"
+
+
+# ============ FETCH (Binance Futures) ============
+
+def get_json(url, params=None, tries=4):
+    for i in range(tries):
+        try:
+            r = S.get(url, params=params, timeout=30)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (400, 404):
+                # 400: نماد در Binance نیست — بیهوده retry نکن
+                return None
+        except Exception:
+            pass
+        time.sleep(1 + i)
+    return None
+
+
+def fetch_klines_binance(coin: str):
+    """
+    دریافت ۴ ساعته از Binance Futures با صفحه‌بندی.
+    خروجی: DataFrame با ستون‌های [t, o, h, l, c] و t به ثانیه.
+    اگر نماد در Binance Futures نبود، None برمی‌گرداند.
+    """
+    symbol = f"{coin}USDT"
+    target_count = int(RANGE_DAYS * 6)   # ۶ کندل ۴ ساعته در هر روز
+    all_rows = []
+    end_time = None
+
+    while len(all_rows) < target_count:
+        params = {
+            "symbol": symbol,
+            "interval": "4h",
+            "limit": 1500,          # حداکثر مجاز Binance
+        }
+        if end_time is not None:
+            params["endTime"] = end_time
+
+        rows = get_json(BINANCE_FAPI, params)
+        if not rows:
+            break
+
+        all_rows = rows + all_rows
+        oldest_open_ms = rows[0][0]
+        end_time = oldest_open_ms - 1
+
+        if len(rows) < 1500:
+            break                    # رسیدیم به ابتدای تاریخچه
+        time.sleep(0.2)
+
+    if not all_rows:
+        return None
+
+    df = pd.DataFrame(all_rows, columns=[
+        "t", "o", "h", "l", "c", "v",
+        "T", "qv", "n", "tbb", "tbq", "ig",
+    ])
+    df = df[["t", "o", "h", "l", "c"]].astype(float)
+    df = df.drop_duplicates("t").sort_values("t").reset_index(drop=True)
+    df["t"] = df["t"] / 1000        # ms -> s
+
+    now = time.time()
+    df = df[df["t"] + TF_SECONDS <= now].reset_index(drop=True)
+    return df
+
+
+# ============ INDICATORS ============
+
+def rma(x: pd.Series, n: int) -> pd.Series:
+    v = x.to_numpy(dtype=float)
+    out = np.full(len(v), np.nan)
+    valid = np.where(~np.isnan(v))[0]
+    if len(valid) < n:
+        return pd.Series(out, index=x.index)
+    s = valid[0] + n - 1
+    out[s] = np.nanmean(v[valid[0]:s + 1])
+    for i in range(s + 1, len(v)):
+        out[i] = (out[i - 1] * (n - 1) + v[i]) / n if not np.isnan(v[i]) else np.nan
+    return pd.Series(out, index=x.index)
+
+
+def adx_end_trend(df: pd.DataFrame) -> pd.Series:
+    h, l, c = df["h"], df["l"], df["c"]
+    up = h.diff()
+    down = -l.diff()
+
+    plus_dm  = np.where(up.isna(),   np.nan,
+                        np.where((up > down) & (up > 0), up, 0.0))
+    minus_dm = np.where(down.isna(), np.nan,
+                        np.where((down > up) & (down > 0), down, 0.0))
+
+    pc = c.shift(1)
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()],
+                   axis=1).max(axis=1, skipna=False)
+    tr_r = rma(tr, DI_LEN)
+
+    plus  = (100 * rma(pd.Series(plus_dm,  index=df.index), DI_LEN) / tr_r).ffill()
+    minus = (100 * rma(pd.Series(minus_dm, index=df.index), DI_LEN) / tr_r).ffill()
+
+    sm = plus + minus
+    sig = 100 * rma((plus - minus).abs() / sm.where(sm != 0, 1), ADX_SIG_LEN)
+
+    n = len(df)
+    P, M, G = plus.to_numpy(), minus.to_numpy(), sig.to_numpy()
+    end_trend = np.zeros(n, dtype=bool)
+    cond = 0.0
+
+    for i in range(1, n):
+        if np.isnan(G[i]) or np.isnan(G[i-1]) or np.isnan(P[i]) or np.isnan(M[i]):
+            continue
+
+        hl         = G[i]     <= LVL_RANGE
+        hl_prev    = G[i-1]   <= LVL_RANGE
+        di_up      = P[i] >= M[i]
+        di_dn      = M[i] >  P[i]
+        di_up_prev = (P[i-1] >= M[i-1]) if not np.isnan(M[i-1]) else False
+        di_dn_prev = (M[i-1] >  P[i-1]) if not np.isnan(M[i-1]) else False
+        sig_up = G[i] > G[i-1]
+        cross  = (P[i] > M[i] and P[i-1] <= M[i-1]) or \
+                 (P[i] < M[i] and P[i-1] >= M[i-1])
+
+        entryLong    = (not hl and di_up and sig_up and not di_up_prev) or \
+                       (not hl and di_up and sig_up and G[i] > LVL_RANGE and hl_prev)
+        entryShort   = (not hl and di_dn and sig_up and not di_dn_prev) or \
+                       (not hl and di_dn and sig_up and G[i] > LVL_RANGE and hl_prev)
+        entryLongStr = not hl and di_up and sig_up and P[i] >= LVL_TREND
+        entryShortSt = not hl and di_dn and sig_up and M[i] >  LVL_TREND
+        exitLong     = (cross and di_up_prev) or (hl and not hl_prev)
+        exitShort    = (cross and di_dn_prev) or (hl and not hl_prev)
+
+        prev = cond
+        if   prev !=  1   and entryLongStr:  cond =  1
+        elif prev != -1   and entryShortSt:  cond = -1
+        elif prev !=  0.5 and entryLong:     cond =  0.5
+        elif prev != -0.5 and entryShort:    cond = -0.5
+        elif prev !=  0   and exitLong:      cond =  0
+        elif prev !=  0   and exitShort:     cond =  0
+
+        end_trend[i] = (prev != 0) and (cond == 0)
+
+    return pd.Series(end_trend, index=df.index)
+
+
+def macd_cross_up(df: pd.DataFrame) -> pd.Series:
+    c = df["c"]
+    macd = c.ewm(span=MACD_FAST, adjust=False).mean() \
+         - c.ewm(span=MACD_SLOW, adjust=False).mean()
+    sgn = macd.ewm(span=MACD_SIG, adjust=False).mean()
+    return (macd.shift(1) <= sgn.shift(1)) & (macd > sgn)
+
+
+# ============ SIGNAL DETECTION ============
+
+def detect_signals(df: pd.DataFrame):
+    cross   = macd_cross_up(df).to_numpy()
+    end_tr  = adx_end_trend(df).to_numpy()
+    n       = len(df)
+
+    signals = []
+    dropped = 0
+
+    for i in range(WARMUP, n):
+        if not cross[i]:
+            continue
+
+        start = i + 1
+        end   = min(n, i + TRI_AFTER + 1)
+        if start >= end:
+            continue
+        if not end_tr[start:end].any():
+            continue
+        if i + LOOKAHEAD >= n:
+            dropped += 1
+            continue
+
+        signals.append(i)
+
+    return signals, dropped
+
+
+# ============ BACKTEST ============
+
+def backtest_coin(df: pd.DataFrame, signals):
+    outcomes = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
+
+    for i in signals:
+        entry = float(df["c"].iloc[i])
+        hi = df["h"].iloc[i + 1:i + 1 + LOOKAHEAD].to_numpy(dtype=float)
+        lo = df["l"].iloc[i + 1:i + 1 + LOOKAHEAD].to_numpy(dtype=float)
+
+        run_hi = np.maximum.accumulate(hi)
+        run_lo = np.minimum.accumulate(lo)
+
+        sl_first = {}
+        for sl in SL_LEVELS:
+            price = entry * (1 - sl / 100)
+            mask = run_lo <= price
+            sl_first[sl] = int(np.argmax(mask)) if mask.any() else None
+
+        for tp in TP_LEVELS:
+            price = entry * (1 + tp / 100)
+            mask = run_hi >= price
+            tp_first = int(np.argmax(mask)) if mask.any() else None
+            for sl in SL_LEVELS:
+                sl_idx = sl_first[sl]
+                win = (tp_first is not None and
+                       (sl_idx is None or tp_first < sl_idx))
+                outcomes[(sl, tp)].append(win)
+
+    return outcomes, len(signals)
+
+
+# ============ FORMAT ============
+
+def md_table(all_outcomes, total, total_dropped):
+    lines = []
+    header = "| SL\\TP |" + "|".join(f" {tp}% |" for tp in TP_LEVELS)
+    sep    = "|-------|" + "|".join("-------|" for _ in TP_LEVELS)
+    lines.append(header)
+    lines.append(sep)
+    for sl in SL_LEVELS:
+        row = f"| **{sl}%** |"
+        for tp in TP_LEVELS:
+            arr = all_outcomes[(sl, tp)]
+            if arr:
+                rate = sum(arr) / len(arr) * 100
+                row += f" {rate:5.1f} |"
+            else:
+                row += "   -   |"
+        lines.append(row)
+    lines.append("")
+    lines.append(f"**Total signals analyzed:** {total}")
+    lines.append(f"**Dropped (no {LOOKAHEAD} candles of future data):** {total_dropped}")
+    lines.append(f"**End-Trend window:** `[i+1, i+{TRI_AFTER}]` "
+                 f"(1..{TRI_AFTER} candles AFTER cross, not cross, not before)")
+    lines.append(f"**End-Trend meaning:** exit from any ADX trend "
+                 f"(weak/strong, long/short) -> 0 (orange ✕)")
+    lines.append(f"**Forward window:** {LOOKAHEAD} candles")
+    lines.append(f"**Tie rule:** same-candle TP&SL -> loss (conservative)")
+    lines.append(f"**⚠️ Warning:** look-ahead bias (entry at i, "
+                 f"End-Trend in i+1..i+{TRI_AFTER})")
+    return "\n".join(lines)
+
+
+def mono_table(all_outcomes, total, total_dropped):
+    col_w = 6
+    head = "SL\\TP".ljust(6) + "".join(f"{tp}%".rjust(col_w) for tp in TP_LEVELS)
+    lines = [head]
+    for sl in SL_LEVELS:
+        row = f"{sl}%".ljust(6)
+        for tp in TP_LEVELS:
+            arr = all_outcomes[(sl, tp)]
+            val = f"{sum(arr)/len(arr)*100:.1f}" if arr else "-"
+            row += val.rjust(col_w)
+        lines.append(row)
+    lines.append(f"\nSignals: {total} | Dropped (no future): {total_dropped}")
+    lines.append(f"End-Trend: 1..{TRI_AFTER} bars AFTER cross | Forward: {LOOKAHEAD} bars")
+    lines.append(f"⚠️ look-ahead bias: entry at i, End-Trend in i+1..i+{TRI_AFTER}")
+    return "\n".join(lines)
+
+
+def telegram(text):
+    if not TG_TOKEN or not TG_CHAT:
+        print("[telegram] not configured — skipping")
+        return
+    for i in range(0, len(text), 3800):
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                data={"chat_id": TG_CHAT, "text": text[i:i + 3800],
+                      "parse_mode": "HTML"},
+                timeout=20,
+            )
+        except Exception as e:
+            print(f"[telegram] error: {e}")
+
+
+# ============ MAIN ============
+
+def main():
+    print(f"config: RANGE_DAYS={RANGE_DAYS} LOOKAHEAD={LOOKAHEAD} "
+          f"TRI_AFTER={TRI_AFTER} coins={len(TOP_COINS)}", flush=True)
+    print(f"source: Binance Futures (fapi.binance.com)", flush=True)
+    print(f"rule: MACD cross-up on i AND End-Trend in [i+1, i+{TRI_AFTER}] "
+          f"AND >= {LOOKAHEAD} candles after i", flush=True)
+    print(f"⚠️ WARNING: look-ahead bias — entry at i, "
+          f"End-Trend in i+1..i+{TRI_AFTER}", flush=True)
+
+    all_outcomes  = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
+    total_signals = 0
+    total_dropped = 0
+    per_coin      = {}
+
+    for coin in TOP_COINS:
+        print(f"[{coin}] fetching from Binance Futures...", flush=True)
+        df = fetch_klines_binance(coin)
+
+        if df is None or len(df) < MIN_CANDLES:
+            n = 0 if df is None else len(df)
+            print(f"[{coin}] skipped (candles={n}, "
+                  f"reason={'not listed' if df is None else 'too few'})",
+                  flush=True)
+            per_coin[coin] = {"signals": 0, "dropped": 0,
+                              "candles": n, "skipped": True}
+            time.sleep(0.5)
+            continue
+
+        signals, dropped = detect_signals(df)
+        outcomes, n_valid = backtest_coin(df, signals)
+
+        per_coin[coin] = {
+            "signals": n_valid,
+            "dropped": dropped,
+            "candles": len(df),
+            "skipped": False,
+        }
+        total_signals += n_valid
+        total_dropped += dropped
+
+        for k, v in outcomes.items():
+            all_outcomes[k].extend(v)
+
+        print(f"[{coin}] candles={len(df)} signals={n_valid} "
+              f"dropped_no_future={dropped}", flush=True)
+        time.sleep(0.5)
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        "# Backtest — MACD cross-up + ADX End-Trend AFTER cross (4h, Binance Futures)",
+        f"**Data source:** Binance Futures `fapi.binance.com`",
+        f"**Rule:** End-Trend in `[i+1, i+{TRI_AFTER}]` "
+        f"(1..{TRI_AFTER} candles AFTER cross, not cross, not before)",
+        f"**End-Trend:** exit from any ADX trend (weak/strong, long/short) → 0 "
+        f"(orange ✕ in 'ADX Di+ Di- [Gu5]')",
+        f"**Forward window:** {LOOKAHEAD} candles required after signal",
+        f"**Tie rule:** same-candle TP&SL → loss (conservative)",
+        f"**⚠️ Warning:** look-ahead bias — entry at `i`, "
+        f"End-Trend at `i+1..i+{TRI_AFTER}`",
+        f"Generated: {ts}",
+        f"Coins: {len(TOP_COINS)} | Signals analyzed: {total_signals} "
+        f"| Dropped (no future data): {total_dropped}",
+        "",
+        md_table(all_outcomes, total_signals, total_dropped),
+        "",
+        "## Per-coin signals",
+    ]
+    for coin, info in per_coin.items():
+        if info["skipped"]:
+            lines.append(f"- **{coin}**: _skipped (candles={info['candles']})_")
+        else:
+            lines.append(
+                f"- **{coin}**: signals={info['signals']} "
+                f"· dropped={info['dropped']} · candles={info['candles']}"
+            )
+    md = "\n".join(lines)
+    print("\n" + md, flush=True)
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    with open(f"{OUT_DIR}/backtest_{stamp}.md", "w", encoding="utf-8") as f:
+        f.write(md)
+    with open(f"{OUT_DIR}/latest.md", "w", encoding="utf-8") as f:
+        f.write(md)
+
+    tg_msg = (
+        f"📊 <b>Backtest</b> — MACD↑ + End-Trend ✕ AFTER cross (4h, Binance)\n"
+        f"End-Trend: 1..{TRI_AFTER} bars AFTER cross\n"
+        f"⚠️ look-ahead bias: entry at i, End-Trend i+1..i+{TRI_AFTER}\n"
+        f"Forward: {LOOKAHEAD} bars required\n"
+        f"Coins: {len(TOP_COINS)} | Signals: {total_signals} "
+        f"| Dropped: {total_dropped}\n\n"
+        f"<pre>{mono_table(all_outcomes, total_signals, total_dropped)}</pre>"
+    )
+    telegram(tg_msg)
+
+
+if __name__ == "__main__":
+    main()
