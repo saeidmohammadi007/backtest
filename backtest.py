@@ -1,6 +1,6 @@
 """
 Backtest: MACD cross-up + ADX End-Trend in [i+1, i+3]
-on top-20 coins, 4h timeframe.
+on top-100 coins, 4h timeframe.
 
 Signal rule:
   1. MACD cross-up on candle i
@@ -28,10 +28,31 @@ import requests
 
 # ============ CONFIG ============
 TOP_COINS = [
+    # ── Top 20 (rank 1–20)
     "BTC", "ETH", "BNB", "SOL", "XRP",
     "DOGE", "ADA", "AVAX", "TRX", "LINK",
     "DOT", "MATIC", "TON", "SHIB", "LTC",
     "BCH", "UNI", "XLM", "NEAR", "APT",
+    # ── Rank 21–40
+    "ICP", "ATOM", "ETC", "FIL", "HBAR",
+    "ARB", "IMX", "CRO", "STX", "VET",
+    "MNT", "OP", "INJ", "RENDER", "GRT",
+    "FTM", "SUI", "THETA", "LDO", "AAVE",
+    # ── Rank 41–60
+    "JUP", "SEI", "RUNE", "TIA", "KAS",
+    "AR", "ALGO", "PEPE", "FLOW", "BONK",
+    "WIF", "EGLD", "GALA", "BSV", "QNT",
+    "JTO", "FLOKI", "PYTH", "SAND", "ENA",
+    # ── Rank 61–80
+    "AXS", "MANA", "WLD", "NEO", "CFX",
+    "FET", "RON", "AIOZ", "CHZ", "RAY",
+    "STRK", "AKT", "GNO", "ETHFI", "FLR",
+    "JASMY", "DYDX", "ASTR", "MINA", "RPL",
+    # ── Rank 81–100
+    "ENS", "ORDI", "LPT", "BTT", "OCEAN",
+    "CAKE", "ZIL", "SNX", "AXL", "THOR",
+    "CRV", "COMP", "MKR", "YFI", "1INCH",
+    "BAT", "ZEC", "DASH", "XMR", "ANKR",
 ]
 
 SL_LEVELS = [2, 3, 4, 5]
