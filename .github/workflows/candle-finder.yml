@@ -1,11 +1,13 @@
-name: Crypto Pattern Scanner
+name: Manual Crypto Backtest
 
 on:
-  workflow_dispatch:   # فقط اجرای دستی از تب Actions
+  workflow_dispatch:  # فقط اجرای دستی
 
 jobs:
-  scan:
+  run-backtest:
     runs-on: ubuntu-latest
+    timeout-minutes: 120  # حداکثر ۲ ساعت (پیش‌فرض ۶ ساعت است)
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -18,14 +20,15 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install yfinance pandas numpy dtw-python
+          pip install pandas numpy requests
 
-      - name: Run pattern scanner
-        run: python pattern_scanner.py
+      - name: Run backtest
+        run: python backtest.py
+        env:
+          RANGE_DAYS: 700  # می‌توانید اینجا تغییر دهید
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: pattern-scan-results
-          path: pattern_scan_results.csv
-          if-no-files-found: ignore
+          name: backtest-results
+          path: results/
