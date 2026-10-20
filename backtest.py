@@ -44,7 +44,7 @@ TOP_COINS = [
 SL_LEVELS = [2, 3, 4, 5]
 TP_LEVELS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 LOOKAHEAD = 100
-TRI_AFTER = 3
+TRI_AFTER = 1
 
 # شرط جدید: مثلث قرمز کوچک در [j-10, j-1]
 RED_TRI_BEFORE_MIN = 1
