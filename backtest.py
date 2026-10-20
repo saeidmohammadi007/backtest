@@ -1,17 +1,19 @@
 """
-Backtest: MACD cross-up (candle i) + ADX End-Trend X in [i+1, i+3]
+Backtest: MACD cross-up (candle i) + ADX End-Trend X in candle i+1
 on top-20 coins, 4h timeframe.
 
-Signal rule (unchanged):
+Signal rule:
   1. MACD cross-up on candle i
-  2. ADX End-Trend (orange X in "ADX Di+ Di- [Gu5]") in candles [i+1, i+3]
+  2. ADX End-Trend (orange X in "ADX Di+ Di- [Gu5]") in candles [i+1, i+TRI_AFTER]
+     (TRI_AFTER = 1 -> only the candle right after the cross)
 
-Entry: close of the FIRST candle j in [i+1, i+3] where the X appears
-       (no look-ahead: the X is known at that candle's close).
+Entry: close of the FIRST candle j where the X appears (no look-ahead).
 Forward: next LOOKAHEAD candles after j.
 Win = TP hit before SL (same-candle tie -> loss).
 Fees: FEE_PCT is added to the TP distance.
 Baseline: random entries with the same count per coin, same SL/TP.
+Output: win-rate tables + list of all found signals with dates (UTC)
+        (log, results/latest.md, results/signals.csv, Telegram).
 """
 import os
 import time
@@ -39,6 +41,7 @@ MIN_CANDLES = 200
 
 FEE_PCT = 0.1
 RANDOM_SEED = 42
+TG_LIST_MAX = 40     # max signals listed in the Telegram message (most recent)
 
 MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ADX_SIG_LEN, DI_LEN, LVL_RANGE, LVL_TREND = 14, 14, 20, 35
@@ -189,7 +192,7 @@ def macd_cross_up(df: pd.DataFrame) -> pd.Series:
 
 # ============ SIGNAL DETECTION ============
 def detect_signals(df: pd.DataFrame):
-    """Returns entry candle indices j (first X after the cross)."""
+    """Returns list of (i, j): i = cross candle, j = entry candle (first X)."""
     cross = macd_cross_up(df).to_numpy()
     end_tr = adx_end_trend(df).to_numpy()
     n = len(df)
@@ -205,14 +208,33 @@ def detect_signals(df: pd.DataFrame):
         if j + LOOKAHEAD >= n:
             dropped += 1
             continue
-        signals.append(j)
+        signals.append((i, j))
     return signals, dropped
 
 
+def fmt_ts(t):
+    return datetime.fromtimestamp(float(t), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def describe_signals(coin, df, signals):
+    """Rows with dates (UTC). entry_time = close time of the X candle."""
+    rows = []
+    for i, j in signals:
+        rows.append({
+            "coin": coin,
+            "cross_candle_open": fmt_ts(df["t"].iloc[i]),
+            "x_candle_open": fmt_ts(df["t"].iloc[j]),
+            "entry_time": fmt_ts(df["t"].iloc[j] + TF_SECONDS),
+            "entry_price": float(df["c"].iloc[j]),
+        })
+    return rows
+
+
 # ============ BACKTEST ============
-def backtest_coin(df: pd.DataFrame, signals):
+def backtest_coin(df: pd.DataFrame, entries):
+    """entries: list of entry candle indices j."""
     outcomes = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
-    for j in signals:
+    for j in entries:
         entry = float(df["c"].iloc[j])
         hi = df["h"].iloc[j + 1:j + 1 + LOOKAHEAD].to_numpy(dtype=float)
         lo = df["l"].iloc[j + 1:j + 1 + LOOKAHEAD].to_numpy(dtype=float)
@@ -232,7 +254,7 @@ def backtest_coin(df: pd.DataFrame, signals):
                 win = (tp_first is not None and
                        (sl_idx is None or tp_first < sl_idx))
                 outcomes[(sl, tp)].append(win)
-    return outcomes, len(signals)
+    return outcomes, len(entries)
 
 
 def random_baseline(df: pd.DataFrame, n_signals: int, rng):
@@ -274,6 +296,17 @@ def md_diff_table(sig, rnd):
     return "\n".join(lines)
 
 
+def md_signal_list(rows):
+    lines = ["## Signals found (UTC)",
+             "| # | Coin | Cross candle (open) | X candle (open) | Entry time | Entry price |",
+             "|---|------|---------------------|-----------------|------------|-------------|"]
+    for n, r in enumerate(rows, 1):
+        lines.append(f"| {n} | {r['coin']} | {r['cross_candle_open']} | "
+                     f"{r['x_candle_open']} | {r['entry_time']} | "
+                     f"{r['entry_price']:.6g} |")
+    return "\n".join(lines)
+
+
 def mono_table(outcomes, rnd=None):
     col_w = 7
     head = "SL\\TP".ljust(6) + "".join(f"{tp}%".rjust(col_w) for tp in TP_LEVELS)
@@ -289,6 +322,14 @@ def mono_table(outcomes, rnd=None):
                 row += f"{v:.1f}".rjust(col_w)
         lines.append(row)
     return "\n".join(lines)
+
+
+def mono_signal_list(rows, limit):
+    shown = rows[-limit:]
+    lines = [f"{'Coin':<6}{'Entry time (UTC)':<18}{'Price':>12}"]
+    for r in shown:
+        lines.append(f"{r['coin']:<6}{r['entry_time']:<18}{r['entry_price']:>12.6g}")
+    return "\n".join(lines), len(shown)
 
 
 def telegram(text):
@@ -320,6 +361,7 @@ def main():
     total_signals = 0
     total_dropped = 0
     per_coin = {}
+    found = []
 
     for coin in TOP_COINS:
         print(f"[{coin}] fetching...", flush=True)
@@ -333,8 +375,11 @@ def main():
             continue
 
         signals, dropped = detect_signals(df)
-        outcomes, n_valid = backtest_coin(df, signals)
+        entries = [j for _, j in signals]
+        outcomes, n_valid = backtest_coin(df, entries)
         rb = random_baseline(df, n_valid, rng)
+        rows = describe_signals(coin, df, signals)
+        found.extend(rows)
 
         per_coin[coin] = {"signals": n_valid, "dropped": dropped,
                           "candles": len(df), "skipped": False}
@@ -347,7 +392,13 @@ def main():
 
         print(f"[{coin}] candles={len(df)} signals={n_valid} "
               f"dropped_no_future={dropped}", flush=True)
+        for r in rows:
+            print(f"    {r['coin']}  cross={r['cross_candle_open']}  "
+                  f"entry={r['entry_time']}  price={r['entry_price']:.6g}",
+                  flush=True)
         time.sleep(0.5)
+
+    found.sort(key=lambda r: r["entry_time"])
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
@@ -364,6 +415,8 @@ def main():
         md_table(rand_outcomes, "Win rate % (random entries, same count)"),
         "",
         md_diff_table(all_outcomes, rand_outcomes),
+        "",
+        md_signal_list(found),
         "",
         "## Per-coin signals",
     ]
@@ -382,6 +435,7 @@ def main():
         f.write(md)
     with open(f"{OUT_DIR}/latest.md", "w", encoding="utf-8") as f:
         f.write(md)
+    pd.DataFrame(found).to_csv(f"{OUT_DIR}/signals.csv", index=False)
 
     tg_msg = (
         f"📊 <b>Backtest</b> — MACD↑ + End-Trend ✕ (entry at ✕, 4h)\n"
@@ -393,6 +447,11 @@ def main():
         f"<pre>{mono_table(all_outcomes, rand_outcomes)}</pre>"
     )
     telegram(tg_msg)
+
+    if found:
+        txt, shown = mono_signal_list(found, TG_LIST_MAX)
+        telegram(f"🗓 <b>Signals</b> (last {shown} of {len(found)}, UTC)\n"
+                 f"<pre>{txt}</pre>")
 
 
 if __name__ == "__main__":
