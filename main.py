@@ -2,6 +2,7 @@ import time
 import ccxt
 import pandas as pd
 import numpy as np
+import requests
 
 # ================== تنظیمات ==================
 TOP_N = 20
@@ -9,14 +10,13 @@ LOOKAHEAD = 100
 TARGETS_UP = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 DRAWDOWN_LEVELS = [2, 3, 4, 5, 6, 7, 8, 9, 10]
 
-# ================== تنظیم صرافی ==================
-# گزینه‌های پیشنهادی: 'bybit', 'okx', 'gate', 'bitget'
-EXCHANGE_ID = 'bybit'
+# ================== تنظیم صرافی (LBank) ==================
+EXCHANGE_ID = 'lbank'
 
 exchange = getattr(ccxt, EXCHANGE_ID)({
     'enableRateLimit': True,  # فعال‌سازی محدودیت نرخ خودکار [citation:5]
     'options': {
-        'defaultType': 'spot',  # استفاده از بازار اسپات
+        'defaultType': 'spot',
     }
 })
 
@@ -24,7 +24,6 @@ exchange = getattr(ccxt, EXCHANGE_ID)({
 # ================== لیست ۲۰ ارز برتر ==================
 def get_top_coins():
     """لیست ۲۰ ارز برتر از CoinGecko — فقط نماد (BTC, ETH, ...)"""
-    import requests
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
         "vs_currency": "usd",
@@ -38,18 +37,25 @@ def get_top_coins():
     return [c["symbol"].upper() for c in r.json()]
 
 
-# ================== دریافت OHLCV ۴ ساعته با CCXT ==================
+# ================== دریافت OHLCV ۴ ساعته با CCXT (LBank) ==================
 def get_ohlc_4h(symbol_display, limit=500):
     """
-    دریافت کندل ۴ ساعته با CCXT.
-    نمادها در CCXT به شکل 'BTC/USDT' هستند.
+    دریافت کندل ۴ ساعته از LBank با CCXT.
+    در صورت نیاز، پارامتر since محاسبه و ارسال می‌شود.
     """
     symbol = f"{symbol_display}/USDT"
 
     try:
-        # fetch_ohlcv(symbol, timeframe, since, limit)
-        # timeframe='4h' در CCXT استاندارد است [citation:6]
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=limit)
+        # LBank در CCXT ممکن است به since نیاز داشته باشد [citation:18]
+        # 500 کندل 4 ساعته = 2000 ساعت قبل
+        since_ms = exchange.milliseconds() - (limit * 4 * 60 * 60 * 1000)
+        
+        ohlcv = exchange.fetch_ohlcv(
+            symbol, 
+            timeframe='4h', 
+            since=since_ms, 
+            limit=limit
+        )
     except Exception as e:
         print(f"  ❌ خطا در دریافت {symbol}: {e}")
         return None
@@ -57,7 +63,6 @@ def get_ohlc_4h(symbol_display, limit=500):
     if not ohlcv or len(ohlcv) < 50:
         return None
 
-    # CCXT خروجی: [[timestamp, open, high, low, close, volume], ...]
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     for col in ["open", "high", "low", "close", "volume"]:
@@ -66,7 +71,7 @@ def get_ohlc_4h(symbol_display, limit=500):
     return df[["timestamp", "open", "high", "low", "close", "volume"]]
 
 
-# ================== ADX (بدون تغییر) ==================
+# ================== ADX ==================
 def calc_adx(df, di_len=14, adx_len=14):
     high, low, close = df["high"], df["low"], df["close"]
     up = high.diff()
@@ -95,20 +100,20 @@ def calc_adx(df, di_len=14, adx_len=14):
     return df
 
 
-# ================== Williams Alligator (بدون تغییر) ==================
+# ================== Williams Alligator ==================
 def calc_alligator(df):
     median = (df["high"] + df["low"]) / 2
 
     def smma(s, n):
         return s.ewm(alpha=1.0 / n, adjust=False).mean()
 
-    df["alligator_jaw"] = smma(median, 13).shift(8)
-    df["alligator_teeth"] = smma(median, 8).shift(5)
-    df["alligator_lips"] = smma(median, 5).shift(3)
+    df["alligator_jaw"] = smma(median, 13).shift(8)      # آبی
+    df["alligator_teeth"] = smma(median, 8).shift(5)     # سبز
+    df["alligator_lips"] = smma(median, 5).shift(3)      # قرمز
     return df
 
 
-# ================== تشخیص سیگنال (بدون تغییر) ==================
+# ================== تشخیص سیگنال ==================
 def detect_signals(df, hl_trend=35, hl_range=20):
     df["signal"] = False
     for i in range(1, len(df)):
@@ -129,7 +134,7 @@ def detect_signals(df, hl_trend=35, hl_range=20):
     return df
 
 
-# ================== تحلیل ماتریس ریزش × هدف (بدون تغییر) ==================
+# ================== تحلیل ماتریس ریزش × هدف ==================
 def analyze_signals(df, lookahead=LOOKAHEAD):
     signals = df.index[df["signal"]].tolist()
     hit_matrix = {t: {d: 0 for d in DRAWDOWN_LEVELS} for t in TARGETS_UP}
@@ -161,7 +166,7 @@ def analyze_signals(df, lookahead=LOOKAHEAD):
     return {"total_signals": total, "reached": reached, "matrix": hit_matrix}
 
 
-# ================== جدول و گزارش (بدون تغییر) ==================
+# ================== جدول و گزارش ==================
 def build_matrix_table(res):
     total = res["total_signals"]
     if total == 0:
@@ -190,7 +195,7 @@ def build_report(coin_results):
 
     lines = []
     lines.append("=" * 70)
-    lines.append(f"گزارش ADX + Alligator | TF=4h | صرافی: {EXCHANGE_ID} | سیگنال کل: {total_all}")
+    lines.append(f"گزارش ADX + Alligator | TF=4h | صرافی: {EXCHANGE_ID.upper()} | سیگنال کل: {total_all}")
     lines.append("=" * 70)
     lines.append("راهنما: هر خانه = درصدی از کل سیگنال‌ها که هم به هدف رسیدند")
     lines.append("و هم قبل از رسیدن، ریزششان زیر حد ستون بود.")
@@ -221,12 +226,13 @@ def build_report(coin_results):
 
 # ================== main ==================
 def main():
-    print(f"بارگذاری بازارهای {EXCHANGE_ID}...")
+    print(f"بارگذاری بازارهای {EXCHANGE_ID.upper()}...")
     try:
         exchange.load_markets()
         print(f"✅ {len(exchange.markets)} بازار بارگذاری شد.\n")
     except Exception as e:
         print(f"❌ خطا در بارگذاری بازارها: {e}")
+        print("⚠️ احتمالاً IP شما توسط LBank مسدود شده است. صرافی را به 'okx' یا 'gate' تغییر دهید.")
         return
 
     print("دریافت لیست ۲۰ ارز برتر از CoinGecko...")
