@@ -16,6 +16,7 @@ FORWARD_BARS = 100
 MIN_BARS = 150
 DRAWDOWN_LEVELS = [0.02, 0.03, 0.04, 0.05]
 TARGET_LEVELS = [0.10, 0.20, 0.40, 0.80, 1.00]
+CLEAN_TARGET = 0.10  # هدف برای آمار «بدون افت»
 
 
 # ================= توابع کمکی =================
@@ -207,7 +208,9 @@ def detect_pattern(df):
     return matches
 
 
+# ================= ارزیابی بعد از سیگنال =================
 def evaluate_forward(df, entry_idx, drawdown_levels, target_levels, forward_bars=100):
+    """بعد از لمس افت، آیا به هدف رسیده؟ (هدف‌ها از قیمت ورود)"""
     entry_price = df.loc[entry_idx, "close"]
     end_idx = min(entry_idx + forward_bars, len(df) - 1)
     future_high = df.loc[entry_idx + 1:end_idx, "high"].values
@@ -232,6 +235,31 @@ def evaluate_forward(df, entry_idx, drawdown_levels, target_levels, forward_bars
             target_price = entry_price * (1 + t)
             results[dd][t] = bool(np.any(remaining_high >= target_price))
     return results
+
+
+def hit_without_drawdown(df, entry_idx, dd, target, forward_bars=100):
+    """
+    آیا قیمت قبل از لمس افت dd به هدف رسیده؟
+    True  = هدف زده شد بدون لمس افت
+    False = افت لمس شد (یا پنجره کامل بود و هدف زده نشد)
+    None  = هنوز مشخص نیست (پنجره ناقص و نه هدف زده شد نه افت)
+    اگر در یک کندل هم low به افت و هم high به هدف برسد، شکست حساب می‌شود.
+    """
+    entry = df.loc[entry_idx, "close"]
+    end_idx = min(entry_idx + forward_bars, len(df) - 1)
+    if end_idx <= entry_idx:
+        return None
+    dd_price = entry * (1 - dd)
+    tg_price = entry * (1 + target)
+
+    for j in range(entry_idx + 1, end_idx + 1):
+        if df.loc[j, "low"] <= dd_price:
+            return False
+        if df.loc[j, "high"] >= tg_price:
+            return True
+
+    window_complete = (entry_idx + forward_bars) <= (len(df) - 1)
+    return False if window_complete else None
 
 
 # ================= اجرای اصلی =================
@@ -279,11 +307,16 @@ def main():
         for idx in matches:
             res = evaluate_forward(df, idx, DRAWDOWN_LEVELS, TARGET_LEVELS, FORWARD_BARS)
             if res:
+                clean = {
+                    dd: hit_without_drawdown(df, idx, dd, CLEAN_TARGET, FORWARD_BARS)
+                    for dd in DRAWDOWN_LEVELS
+                }
                 all_matches.append({
                     "symbol": symbol,
                     "timestamp": df.loc[idx, "timestamp"],
                     "entry_price": df.loc[idx, "close"],
                     "results": res,
+                    "clean": clean,
                 })
         time.sleep(0.3)
 
@@ -296,6 +329,24 @@ def main():
         return
 
     print(f"تعداد کل الگوهای پیدا شده: {len(all_matches)}")
+
+    # ---------- آمار «بدون افت» ----------
+    print(f"\nرسیدن به +{int(CLEAN_TARGET * 100)}% بدون اینکه قبلش افت لمس شود:")
+    print("(سیگنال‌های با پنجره ناقص و بدون نتیجه قطعی، حذف شده‌اند)")
+    for dd in DRAWDOWN_LEVELS:
+        vals = [m["clean"][dd] for m in all_matches if m["clean"][dd] is not None]
+        skipped = len(all_matches) - len(vals)
+        if not vals:
+            print(f"  بدون افت {int(dd * 100)}%: داده کافی نیست")
+            continue
+        ok = sum(vals)
+        print(
+            f"  بدون افت {int(dd * 100)}%: {ok / len(vals) * 100:.1f}% "
+            f"({ok}/{len(vals)}) | حذف‌شده: {skipped}"
+        )
+
+    # ---------- آمار «بعد از لمس افت» ----------
+    print("\nرسیدن به هدف بعد از لمس افت (هدف‌ها از قیمت ورود):")
     print("هر ستون: درصد موفقیت (تعداد موفق / تعداد دفعاتی که افت لمس شد)\n")
 
     header = f"{'افت':<8}" + "".join([f"{'← ' + str(int(t * 100)) + '%':<16}" for t in TARGET_LEVELS])
@@ -320,16 +371,25 @@ def main():
         touched = sum(1 for m in all_matches if m["results"].get(dd, {}).get("_touched"))
         print(f"  افت {int(dd * 100)}% در {touched} مورد از {len(all_matches)} لمس شد")
 
+    # ---------- جزئیات ----------
     print("\nجزئیات نمونه‌ها (۲۰ مورد اول):")
     for m in all_matches[:20]:
         print(f"  {m['symbol']} | تاریخ: {m['timestamp']} | قیمت ورود: {m['entry_price']}")
         for dd in DRAWDOWN_LEVELS:
             r = m["results"].get(dd, {})
+            c = m["clean"].get(dd)
+            c_txt = {True: "بله", False: "خیر", None: "نامشخص"}[c]
             if r.get("_touched"):
                 hits = [str(int(t * 100)) + "%" for t in TARGET_LEVELS if r.get(t)]
-                print(f"    افت {int(dd * 100)}% ← اهداف رسیده: {hits if hits else 'هیچ'}")
+                print(
+                    f"    افت {int(dd * 100)}% ← اهداف رسیده: {hits if hits else 'هیچ'} "
+                    f"| +{int(CLEAN_TARGET * 100)}% بدون افت: {c_txt}"
+                )
             else:
-                print(f"    افت {int(dd * 100)}% ← لمس نشد")
+                print(
+                    f"    افت {int(dd * 100)}% ← لمس نشد "
+                    f"| +{int(CLEAN_TARGET * 100)}% بدون افت: {c_txt}"
+                )
 
 
 if __name__ == "__main__":
