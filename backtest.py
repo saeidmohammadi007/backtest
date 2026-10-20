@@ -1,19 +1,7 @@
 """
-Backtest: MACD cross-up (candle i) + ADX End-Trend X in candle i+1
+Backtest: MACD cross-up (candle i) + ADX End-Trend X in [i+1, i+TRI_AFTER]
+           + at least one small red triangle (shortE) in [j-10, j-1]
 on top-20 coins, 4h timeframe, data from LBank SPOT via ccxt.
-
-Signal rule:
-  1. MACD cross-up on candle i
-  2. ADX End-Trend (orange X in "ADX Di+ Di- [Gu5]") in candles [i+1, i+TRI_AFTER]
-     (TRI_AFTER = 1 -> only the candle right after the cross)
-
-Entry: close of the FIRST candle j where the X appears (no look-ahead).
-Forward: next LOOKAHEAD candles after j.
-Win = TP hit before SL (same-candle tie -> loss).
-Fees: FEE_PCT is added to the TP distance.
-Baseline: random entries with the same count per coin, same SL/TP.
-Output: win-rate tables + list of all found signals with dates (UTC)
-        (log, results/latest.md, results/signals.csv, Telegram).
 """
 import os
 import time
@@ -35,14 +23,19 @@ TOP_COINS = [
 SL_LEVELS = [2, 3, 4, 5]
 TP_LEVELS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 LOOKAHEAD = 100
-TRI_AFTER = 1
+TRI_AFTER = 3
+
+# شرط جدید: مثلث قرمز کوچک در [j-10, j-1]
+RED_TRI_BEFORE_MIN = 1
+RED_TRI_BEFORE_MAX = 10
+
 RANGE_DAYS = int(os.getenv("RANGE_DAYS", "700"))
 WARMUP = 100
 MIN_CANDLES = 200
 
 FEE_PCT = 0.1
 RANDOM_SEED = 42
-TG_LIST_MAX = 40     # max signals listed in the Telegram message (most recent)
+TG_LIST_MAX = 40
 
 MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ADX_SIG_LEN, DI_LEN, LVL_RANGE, LVL_TREND = 14, 14, 20, 35
@@ -52,18 +45,15 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
 OUT_DIR = "results"
-
 EX = ccxt.lbank({"enableRateLimit": True})
 
 
-# ============ FETCH (LBank spot via ccxt) ============
+# ============ FETCH ============
 def fetch_klines(coin):
-    """4h candles from LBank spot, finished candles only. Returns df or None."""
     symbol = f"{coin}/USDT"
     tf_ms = TF_SECONDS * 1000
     since = EX.milliseconds() - RANGE_DAYS * 86400 * 1000
-    rows = []
-    prev_last = None
+    rows, prev_last = [], None
     for _ in range(10):
         batch = None
         for attempt in range(3):
@@ -80,10 +70,10 @@ def fetch_klines(coin):
         rows.extend(batch)
         last = batch[-1][0]
         if prev_last is not None and last <= prev_last:
-            break                      # no progress
+            break
         prev_last = last
         if last + tf_ms >= EX.milliseconds():
-            break                      # reached the present
+            break
         since = last + tf_ms
 
     if not rows:
@@ -92,7 +82,7 @@ def fetch_klines(coin):
     df["t"] = df["t"] / 1000.0
     df = df[["t", "o", "h", "l", "c"]].astype(float).dropna()
     df = df.drop_duplicates("t").sort_values("t")
-    df = df[df["t"] + TF_SECONDS <= time.time()]     # drop unfinished candle
+    df = df[df["t"] + TF_SECONDS <= time.time()]
     return df.reset_index(drop=True) if not df.empty else None
 
 
@@ -110,7 +100,8 @@ def rma(x: pd.Series, n: int) -> pd.Series:
     return pd.Series(out, index=x.index)
 
 
-def adx_end_trend(df: pd.DataFrame) -> pd.Series:
+def adx_end_trend(df: pd.DataFrame):
+    """Returns (end_trend, shortE) as bool Series."""
     h, l, c = df["h"], df["l"], df["c"]
     up = h.diff()
     down = -l.diff()
@@ -130,7 +121,9 @@ def adx_end_trend(df: pd.DataFrame) -> pd.Series:
     n = len(df)
     P, M, G = plus.to_numpy(), minus.to_numpy(), sig.to_numpy()
     end_trend = np.zeros(n, dtype=bool)
+    shortE_arr = np.zeros(n, dtype=bool)
     cond = 0.0
+
     for i in range(1, n):
         if np.isnan(G[i]) or np.isnan(G[i - 1]) or np.isnan(P[i]) or np.isnan(M[i]):
             continue
@@ -153,6 +146,8 @@ def adx_end_trend(df: pd.DataFrame) -> pd.Series:
         exitLong = (cross and di_up_prev) or (hl and not hl_prev)
         exitShort = (cross and di_dn_prev) or (hl and not hl_prev)
 
+        shortE_arr[i] = entryShort        # ← مثلث قرمز کوچک
+
         prev = cond
         if prev != 1 and entryLongStr:
             cond = 1
@@ -169,7 +164,8 @@ def adx_end_trend(df: pd.DataFrame) -> pd.Series:
 
         end_trend[i] = (prev != 0) and (cond == 0)
 
-    return pd.Series(end_trend, index=df.index)
+    return (pd.Series(end_trend, index=df.index),
+            pd.Series(shortE_arr, index=df.index))
 
 
 def macd_cross_up(df: pd.DataFrame) -> pd.Series:
@@ -182,11 +178,13 @@ def macd_cross_up(df: pd.DataFrame) -> pd.Series:
 
 # ============ SIGNAL DETECTION ============
 def detect_signals(df: pd.DataFrame):
-    """Returns list of (i, j): i = cross candle, j = entry candle (first X)."""
     cross = macd_cross_up(df).to_numpy()
-    end_tr = adx_end_trend(df).to_numpy()
+    end_tr_series, shortE_series = adx_end_trend(df)
+    end_tr = end_tr_series.to_numpy()
+    shortE = shortE_series.to_numpy()
     n = len(df)
-    signals, dropped = [], 0
+    signals, dropped, no_red_tri = [], 0, 0
+
     for i in range(WARMUP, n):
         if not cross[i]:
             continue
@@ -195,11 +193,19 @@ def detect_signals(df: pd.DataFrame):
         if len(hits) == 0:
             continue
         j = i + 1 + int(hits[0])
+
+        # شرط جدید: مثلث قرمز کوچک در [j-10, j-1]
+        lo = max(0, j - RED_TRI_BEFORE_MAX)
+        hi = j - RED_TRI_BEFORE_MIN + 1
+        if hi <= lo or not shortE[lo:hi].any():
+            no_red_tri += 1
+            continue
+
         if j + LOOKAHEAD >= n:
             dropped += 1
             continue
         signals.append((i, j))
-    return signals, dropped
+    return signals, dropped, no_red_tri
 
 
 def fmt_ts(t):
@@ -207,7 +213,6 @@ def fmt_ts(t):
 
 
 def describe_signals(coin, df, signals):
-    """Rows with dates (UTC). entry_time = close time of the X candle."""
     rows = []
     for i, j in signals:
         rows.append({
@@ -222,7 +227,6 @@ def describe_signals(coin, df, signals):
 
 # ============ BACKTEST ============
 def backtest_coin(df: pd.DataFrame, entries):
-    """entries: list of entry candle indices j."""
     outcomes = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
     for j in entries:
         entry = float(df["c"].iloc[j])
@@ -340,9 +344,9 @@ def telegram(text):
 
 # ============ MAIN ============
 def main():
-    print(f"config: source=LBank spot (ccxt) RANGE_DAYS={RANGE_DAYS} "
-          f"LOOKAHEAD={LOOKAHEAD} TRI_AFTER={TRI_AFTER} FEE={FEE_PCT}% "
-          f"coins={len(TOP_COINS)}", flush=True)
+    print(f"config: LBank spot | RANGE_DAYS={RANGE_DAYS} LOOKAHEAD={LOOKAHEAD} "
+          f"TRI_AFTER={TRI_AFTER} RED_TRI=[j-{RED_TRI_BEFORE_MAX},j-{RED_TRI_BEFORE_MIN}] "
+          f"FEE={FEE_PCT}% coins={len(TOP_COINS)}", flush=True)
 
     rng = np.random.default_rng(RANDOM_SEED)
     keys = [(sl, tp) for sl in SL_LEVELS for tp in TP_LEVELS]
@@ -350,6 +354,7 @@ def main():
     rand_outcomes = {k: [] for k in keys}
     total_signals = 0
     total_dropped = 0
+    total_no_red_tri = 0
     per_coin = {}
     found = []
 
@@ -359,11 +364,11 @@ def main():
         if df is None or len(df) < MIN_CANDLES:
             n = 0 if df is None else len(df)
             print(f"[{coin}] skipped (candles={n})", flush=True)
-            per_coin[coin] = {"signals": 0, "dropped": 0,
+            per_coin[coin] = {"signals": 0, "dropped": 0, "no_red_tri": 0,
                               "candles": n, "skipped": True}
             continue
 
-        signals, dropped = detect_signals(df)
+        signals, dropped, no_red_tri = detect_signals(df)
         entries = [j for _, j in signals]
         outcomes, n_valid = backtest_coin(df, entries)
         rb = random_baseline(df, n_valid, rng)
@@ -371,36 +376,40 @@ def main():
         found.extend(rows)
 
         per_coin[coin] = {"signals": n_valid, "dropped": dropped,
+                          "no_red_tri": no_red_tri,
                           "candles": len(df), "skipped": False}
         total_signals += n_valid
         total_dropped += dropped
+        total_no_red_tri += no_red_tri
 
         for k in keys:
             all_outcomes[k].extend(outcomes[k])
             rand_outcomes[k].extend(rb[k])
 
         print(f"[{coin}] candles={len(df)} signals={n_valid} "
-              f"dropped_no_future={dropped}", flush=True)
+              f"dropped_no_future={dropped} no_red_tri={no_red_tri}", flush=True)
         for r in rows:
             print(f"    {r['coin']}  cross={r['cross_candle_open']}  "
                   f"entry={r['entry_time']}  price={r['entry_price']:.6g}",
                   flush=True)
 
     found.sort(key=lambda r: r["entry_time"])
-
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
     lines = [
-        "# Backtest — MACD cross-up + ADX End-Trend X (4h, LBank spot)",
-        f"**Entry:** close of first X in `[i+1, i+{TRI_AFTER}]` after the cross",
-        f"**Forward window:** {LOOKAHEAD} candles | **Fee:** {FEE_PCT}% "
+        "# Backtest — MACD cross-up + ADX End-Trend ✕ + red triangle before ✕",
+        f"**✕ window:** `[i+1, i+{TRI_AFTER}]` | "
+        f"**red-triangle window:** `[j-{RED_TRI_BEFORE_MAX}, j-{RED_TRI_BEFORE_MIN}]`",
+        f"**Forward:** {LOOKAHEAD} candles | **Fee:** {FEE_PCT}% "
         f"| **Tie rule:** same-candle TP&SL -> loss",
         f"Generated: {ts}",
         f"Coins: {len(TOP_COINS)} | Signals: {total_signals} "
-        f"| Dropped (no future data): {total_dropped}",
+        f"| Dropped (no future): {total_dropped} "
+        f"| Rejected (no red tri): {total_no_red_tri}",
         "",
         md_table(all_outcomes, "Win rate % (signal)"),
         "",
-        md_table(rand_outcomes, "Win rate % (random entries, same count)"),
+        md_table(rand_outcomes, "Win rate % (random entries)"),
         "",
         md_diff_table(all_outcomes, rand_outcomes),
         "",
@@ -413,7 +422,9 @@ def main():
             lines.append(f"- **{coin}**: _skipped (candles={info['candles']})_")
         else:
             lines.append(f"- **{coin}**: signals={info['signals']} "
-                         f"· dropped={info['dropped']} · candles={info['candles']}")
+                         f"· dropped={info['dropped']} "
+                         f"· no_red_tri={info['no_red_tri']} "
+                         f"· candles={info['candles']}")
     md = "\n".join(lines)
     print("\n" + md, flush=True)
 
@@ -426,10 +437,11 @@ def main():
     pd.DataFrame(found).to_csv(f"{OUT_DIR}/signals.csv", index=False)
 
     tg_msg = (
-        f"📊 <b>Backtest</b> — MACD↑ + End-Trend ✕ (entry at ✕, 4h, LBank spot)\n"
+        f"📊 <b>Backtest</b> — MACD↑ + ✕ + red-tri-before-✕ (4h, LBank spot)\n"
+        f"✕ in [i+1..i+{TRI_AFTER}] · red △ in [j-{RED_TRI_BEFORE_MAX}..j-{RED_TRI_BEFORE_MIN}]\n"
         f"Forward: {LOOKAHEAD} bars | Fee: {FEE_PCT}%\n"
-        f"Coins: {len(TOP_COINS)} | Signals: {total_signals} "
-        f"| Dropped: {total_dropped}\n\n"
+        f"Coins: {len(TOP_COINS)} | Signals: {total_signals} | "
+        f"Dropped: {total_dropped} | NoRedTri: {total_no_red_tri}\n\n"
         f"<b>Win rate %</b>\n<pre>{mono_table(all_outcomes)}</pre>\n"
         f"<b>Signal − Random (pp)</b>\n"
         f"<pre>{mono_table(all_outcomes, rand_outcomes)}</pre>"
