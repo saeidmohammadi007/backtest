@@ -1,111 +1,60 @@
+import os
+import time
 import requests
 import pandas as pd
 import numpy as np
-import time
+import asyncio
+from telegram import Bot
 
-# ================= تنظیمات =================
-BASE_URL = "https://api.lbkex.com"
-TIMEFRAME = "day1"
-KLINE_SIZE = 1000
-TOP_N = 100
-ADX_LEN = 14
-DI_LEN = 14
-HL_RANGE = 20
-HL_TREND = 35
-FORWARD_BARS = 100
-MIN_BARS = 150
-DRAWDOWN_LEVELS = [0.02, 0.03, 0.04, 0.05]
-TARGET_LEVELS = [0.10, 0.20, 0.40, 0.80, 1.00]
-CLEAN_TARGET = 0.10  # هدف برای آمار «بدون افت»
+# ================== تنظیمات ==================
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
 
+TOP_N = 20
+LOOKAHEAD = 100
 
-# ================= توابع کمکی =================
-def rma(series, length):
-    alpha = 1.0 / length
-    return series.ewm(alpha=alpha, adjust=False, min_periods=length).mean()
+TARGETS_UP = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+DRAWDOWN_LEVELS = [2, 3, 4, 5, 6, 7, 8, 9, 10]
 
-
-def fetch_all_usdt_pairs():
-    """دریافت همه جفت‌ارزهای USDT از LBank"""
-    url = f"{BASE_URL}/v1/currencyPairs.do"
-    resp = requests.get(url, timeout=15)
-    data = resp.json()
-
-    if isinstance(data, list):
-        pairs = [p for p in data if isinstance(p, str) and p.endswith("_usdt")]
-    elif isinstance(data, dict):
-        raw = data.get("data", data.get("result", []))
-        if isinstance(raw, list):
-            pairs = [p for p in raw if isinstance(p, str) and p.endswith("_usdt")]
-        else:
-            raise Exception(f"خروجی جفت‌ارزها قابل تفسیر نیست: {data}")
-    else:
-        raise Exception(f"نوع خروجی ناشناخته: {type(data)}")
-
-    print(f"تعداد جفت‌ارزهای USDT: {len(pairs)}")
-    return pairs
-
-
-def fetch_tickers(pairs):
-    """دریافت تیکر ۲۴ ساعته برای مرتب‌سازی بر اساس حجم معاملات"""
-    url = f"{BASE_URL}/v2/ticker/24hr.do"
-    params = {"symbol": "all"}
-    resp = requests.get(url, params=params, timeout=15)
-    data = resp.json()
-    if data.get("result") != "true":
-        raise Exception(f"دریافت تیکر ناموفق بود: {data}")
-
-    ticker_map = {}
-    for item in data["data"]:
-        sym = item.get("symbol", "").lower()
-        if sym.endswith("_usdt"):
-            ticker_map[sym] = {
-                "turnover": float(item.get("turnover", 0)),
-                "vol": float(item.get("vol", 0)),
-            }
-
-    pairs_set = set(pairs)
-    ranked = sorted(
-        [(sym, info) for sym, info in ticker_map.items() if sym in pairs_set],
-        key=lambda x: x[1]["turnover"],
-        reverse=True,
-    )
-    return [r[0] for r in ranked[:TOP_N]]
-
-
-def fetch_klines(symbol, timeframe="day1", size=KLINE_SIZE):
-    """دریافت کندل‌ها (پارامتر time = زمان شروع)"""
-    url = f"{BASE_URL}/v2/kline.do"
-    step = 86400  # day1
+# ================== دریافت ۲۰ ارز برتر ==================
+def get_top_coins():
+    url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
-        "symbol": symbol,
-        "size": size,
-        "type": timeframe,
-        "time": int(time.time()) - size * step,
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": TOP_N,
+        "page": 1,
+        "sparkline": "false",
     }
-    resp = requests.get(url, params=params, timeout=20)
-    data = resp.json()
-    if data.get("result") != "true":
-        print(f"  [هشدار] دریافت کندل {symbol} ناموفق بود: {data.get('msg', data)}")
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    return [(c["id"], c["symbol"].upper()) for c in data]
+
+
+# ================== دریافت OHLC ۴ ساعته ==================
+def get_ohlc_4h(coin_id, days=90):
+    """
+    CoinGecko OHLC برای 3-30 روز، کندل 4 ساعته برمی‌گرداند.
+    برای پوشش کافی از 90 روز استفاده می‌کنیم؛ اگر API بازه دیگری داد،
+    همان را می‌پذیریم (فقط باید حداقل ~50 کندل داشته باشیم).
+    """
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
+    params = {"vs_currency": "usd", "days": days}
+    r = requests.get(url, params=params, timeout=30)
+    if r.status_code != 200:
         return None
-
-    rows = data["data"]
-    if not rows:
+    data = r.json()
+    if not data:
         return None
-
-    df = pd.DataFrame(rows).iloc[:, :6]
-    df.columns = ["timestamp", "open", "high", "low", "close", "volume"]
-    ts = df["timestamp"].astype(float)
-    unit = "ms" if ts.iloc[0] > 1e11 else "s"
-    df["timestamp"] = pd.to_datetime(ts, unit=unit, utc=True)
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna().sort_values("timestamp").reset_index(drop=True)
-    return df.iloc[:-1].reset_index(drop=True)  # حذف کندل ناقص آخر
+    df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    return df
 
 
-# ================= منطق ADX =================
-def compute_adx_gu5(df, di_len=14, sig_len=14):
+# ================== ADX (مطابق Gu5) ==================
+def calc_adx(df, di_len=14, adx_len=14):
     high = df["high"]
     low = df["low"]
     close = df["close"]
@@ -116,280 +65,254 @@ def compute_adx_gu5(df, di_len=14, sig_len=14):
     plus_dm = np.where((up > down) & (up > 0), up, 0.0)
     minus_dm = np.where((down > up) & (down > 0), down, 0.0)
 
-    plus_dm = pd.Series(plus_dm, index=df.index)
-    minus_dm = pd.Series(minus_dm, index=df.index)
-    plus_dm.iloc[0] = np.nan
-    minus_dm.iloc[0] = np.nan
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    tr = pd.concat(
-        [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1
-    ).max(axis=1)
-    true_range = rma(tr, di_len)
+    def rma(series, length):
+        alpha = 1.0 / length
+        return series.ewm(alpha=alpha, adjust=False).mean()
 
-    plus = 100 * rma(plus_dm, di_len) / true_range
-    minus = 100 * rma(minus_dm, di_len) / true_range
-    plus = plus.ffill()
-    minus = minus.ffill()
+    atr = rma(tr, di_len)
+    plus_di = 100 * rma(pd.Series(plus_dm, index=df.index), di_len) / atr
+    minus_di = 100 * rma(pd.Series(minus_dm, index=df.index), di_len) / atr
 
-    sum_dm = plus + minus
-    sum_dm = sum_dm.replace(0, 1)
-    sig = 100 * rma((plus - minus).abs() / sum_dm, sig_len)
-    sig = sig.ffill()
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = rma(dx, adx_len)
 
-    df["sig"] = sig
-    df["diPlus"] = plus
-    df["diMinus"] = minus
+    df["plus_di"] = plus_di
+    df["minus_di"] = minus_di
+    df["adx"] = adx
+    return df
 
-    hlRange = sig <= HL_RANGE
-    diUp = plus >= minus
-    diUpUp = plus >= HL_TREND
-    diDn = minus > plus
-    diDnDn = minus > HL_TREND
-    crossDi = ((plus > minus) & (plus.shift(1) <= minus.shift(1))) | (
-        (plus < minus) & (plus.shift(1) >= minus.shift(1))
-    )
-    sigUp = sig > sig.shift(1)
 
-    condition = np.zeros(len(df))
-    condition[0] = 0.0
+# ================== Williams Alligator ==================
+def calc_alligator(df):
+    median = (df["high"] + df["low"]) / 2
 
-    for i in range(1, len(df)):
-        prev = condition[i - 1]
-        if not hlRange.iloc[i] and diUp.iloc[i] and sigUp.iloc[i] and diUpUp.iloc[i]:
-            condition[i] = 1
-        elif not hlRange.iloc[i] and diDn.iloc[i] and sigUp.iloc[i] and diDnDn.iloc[i]:
-            condition[i] = -1
-        elif not hlRange.iloc[i] and diUp.iloc[i] and sigUp.iloc[i] and not diUp.iloc[i - 1]:
-            condition[i] = 0.5
-        elif not hlRange.iloc[i] and diDn.iloc[i] and sigUp.iloc[i] and not diDn.iloc[i - 1]:
-            condition[i] = -0.5
-        elif (crossDi.iloc[i] and diUp.iloc[i - 1]) or (hlRange.iloc[i] and not hlRange.iloc[i - 1]):
-            condition[i] = 0
-        elif (crossDi.iloc[i] and diDn.iloc[i - 1]) or (hlRange.iloc[i] and not hlRange.iloc[i - 1]):
-            condition[i] = 0
-        else:
-            condition[i] = prev
+    def smma(series, length):
+        alpha = 1.0 / length
+        return series.ewm(alpha=alpha, adjust=False).mean()
 
-    df["condition"] = condition
-    df["hlRange"] = hlRange.values
+    jaw_raw = smma(median, 13)
+    df["alligator_jaw"] = jaw_raw.shift(8)        # آبی
 
-    df["longX"] = (df["condition"].shift(1).isin([0.5, 1.0])) & (df["condition"] == 0)
-    df["shortX"] = (df["condition"].shift(1).isin([-0.5, -1.0])) & (df["condition"] == 0)
-    df["longEStr"] = (df["condition"].shift(1) != 1) & (df["condition"] == 1)
-    df["shortEStr"] = (df["condition"].shift(1) != -1) & (df["condition"] == -1)
+    teeth_raw = smma(median, 8)
+    df["alligator_teeth"] = teeth_raw.shift(5)    # سبز
+
+    lips_raw = smma(median, 5)
+    df["alligator_lips"] = lips_raw.shift(3)      # قرمز
 
     return df
 
 
-# ================= تشخیص الگو =================
-def detect_pattern(df):
-    """× ← ناحیه زرد ← مثلث سبز بزرگ"""
-    signal_cols = ["longX", "shortX", "longEStr", "shortEStr"]
-    yellow = df["hlRange"]
-
-    matches = []
-    for idx in df.index[df["longEStr"]]:
-        found = False
-        for back in range(10, 61):
-            prev_idx = idx - back
-            if prev_idx < 0:
-                break
-            if df.loc[prev_idx, "longX"] or df.loc[prev_idx, "shortX"]:
-                between_signals = df.loc[prev_idx + 1:idx - 1, signal_cols].any(axis=1)
-                if between_signals.any():
-                    break
-                between_yellow = yellow.loc[prev_idx + 1:idx - 1]
-                if not between_yellow.any():
-                    break
-                found = True
-                break
-        if found:
-            matches.append(idx)
-    return matches
-
-
-# ================= ارزیابی بعد از سیگنال =================
-def evaluate_forward(df, entry_idx, drawdown_levels, target_levels, forward_bars=100):
-    """بعد از لمس افت، آیا به هدف رسیده؟ (هدف‌ها از قیمت ورود)"""
-    entry_price = df.loc[entry_idx, "close"]
-    end_idx = min(entry_idx + forward_bars, len(df) - 1)
-    future_high = df.loc[entry_idx + 1:end_idx, "high"].values
-    future_low = df.loc[entry_idx + 1:end_idx, "low"].values
-
-    if len(future_high) == 0:
-        return None
-
-    results = {}
-    for dd in drawdown_levels:
-        dd_price = entry_price * (1 - dd)
-        touch_indices = np.where(future_low <= dd_price)[0]
-        if len(touch_indices) == 0:
-            results[dd] = {t: False for t in target_levels}
-            results[dd]["_touched"] = False
-            continue
-
-        touch_idx = touch_indices[0]
-        results[dd] = {"_touched": True}
-        remaining_high = future_high[touch_idx:]
-        for t in target_levels:
-            target_price = entry_price * (1 + t)
-            results[dd][t] = bool(np.any(remaining_high >= target_price))
-    return results
-
-
-def hit_without_drawdown(df, entry_idx, dd, target, forward_bars=100):
+# ================== تشخیص سیگنال (مثلث سبز بزرگ + ترتیب الیگیتور) ==================
+def detect_signals(df, hl_trend=35, hl_range=20):
     """
-    آیا قیمت قبل از لمس افت dd به هدف رسیده؟
-    True  = هدف زده شد بدون لمس افت
-    False = افت لمس شد (یا پنجره کامل بود و هدف زده نشد)
-    None  = هنوز مشخص نیست (پنجره ناقص و نه هدف زده شد نه افت)
-    اگر در یک کندل هم low به افت و هم high به هدف برسد، شکست حساب می‌شود.
+    شرط سیگنال:
+    1) ADX > 35 و ADX > ADX[1] و +DI > -DI و +DI >= 35  → مثلث سبز بزرگ
+    2) Alligator: Jaw (آبی) > Teeth (سبز) > Lips (قرمز)
+    3) ADX > 20 (range filter)
     """
-    entry = df.loc[entry_idx, "close"]
-    end_idx = min(entry_idx + forward_bars, len(df) - 1)
-    if end_idx <= entry_idx:
-        return None
-    dd_price = entry * (1 - dd)
-    tg_price = entry * (1 + target)
+    df["signal"] = False
 
-    for j in range(entry_idx + 1, end_idx + 1):
-        if df.loc[j, "low"] <= dd_price:
-            return False
-        if df.loc[j, "high"] >= tg_price:
-            return True
-
-    window_complete = (entry_idx + forward_bars) <= (len(df) - 1)
-    return False if window_complete else None
-
-
-# ================= اجرای اصلی =================
-def main():
-    print("=" * 60)
-    print("اسکریپت آمار الگوی ADX در LBank")
-    print(f"تایم‌فریم: {TIMEFRAME} | {TOP_N} جفت‌ارز USDT برتر")
-    print("شرط: × ← ناحیه زرد ← مثلث سبز بزرگ")
-    print("=" * 60)
-
-    all_pairs = fetch_all_usdt_pairs()
-    time.sleep(0.5)
-
-    top_pairs = fetch_tickers(all_pairs)
-    print(f"{len(top_pairs)} جفت‌ارز برتر از نظر حجم: {top_pairs[:5]} ...")
-    time.sleep(0.5)
-
-    all_matches = []
-
-    for i, symbol in enumerate(top_pairs):
-        print(f"[{i + 1}/{len(top_pairs)}] در حال پردازش {symbol} ...", end=" ")
-
-        df = fetch_klines(symbol, TIMEFRAME, KLINE_SIZE)
-        if df is None or len(df) < MIN_BARS:
-            print("داده کافی نیست، رد شد")
-            time.sleep(0.2)
-            continue
-
-        try:
-            df = compute_adx_gu5(df, DI_LEN, ADX_LEN)
-        except Exception as e:
-            print(f"خطا در محاسبه ADX: {e}")
-            time.sleep(0.2)
-            continue
-
-        matches = detect_pattern(df)
-
-        if not matches:
-            print(f"الگویی پیدا نشد ({len(df)} کندل)")
-            time.sleep(0.2)
-            continue
-
-        print(f"{len(matches)} الگو پیدا شد")
-
-        for idx in matches:
-            res = evaluate_forward(df, idx, DRAWDOWN_LEVELS, TARGET_LEVELS, FORWARD_BARS)
-            if res:
-                clean = {
-                    dd: hit_without_drawdown(df, idx, dd, CLEAN_TARGET, FORWARD_BARS)
-                    for dd in DRAWDOWN_LEVELS
-                }
-                all_matches.append({
-                    "symbol": symbol,
-                    "timestamp": df.loc[idx, "timestamp"],
-                    "entry_price": df.loc[idx, "close"],
-                    "results": res,
-                    "clean": clean,
-                })
-        time.sleep(0.3)
-
-    print("\n" + "=" * 60)
-    print("نتایج آماری")
-    print("=" * 60)
-
-    if not all_matches:
-        print("هیچ الگوی منطبقی پیدا نشد.")
-        return
-
-    print(f"تعداد کل الگوهای پیدا شده: {len(all_matches)}")
-
-    # ---------- آمار «بدون افت» ----------
-    print(f"\nرسیدن به +{int(CLEAN_TARGET * 100)}% بدون اینکه قبلش افت لمس شود:")
-    print("(سیگنال‌های با پنجره ناقص و بدون نتیجه قطعی، حذف شده‌اند)")
-    for dd in DRAWDOWN_LEVELS:
-        vals = [m["clean"][dd] for m in all_matches if m["clean"][dd] is not None]
-        skipped = len(all_matches) - len(vals)
-        if not vals:
-            print(f"  بدون افت {int(dd * 100)}%: داده کافی نیست")
-            continue
-        ok = sum(vals)
-        print(
-            f"  بدون افت {int(dd * 100)}%: {ok / len(vals) * 100:.1f}% "
-            f"({ok}/{len(vals)}) | حذف‌شده: {skipped}"
+    for i in range(1, len(df)):
+        adx_ok = (
+            df.loc[i, "adx"] > hl_trend
+            and df.loc[i, "adx"] > df.loc[i - 1, "adx"]
+            and df.loc[i, "plus_di"] > df.loc[i, "minus_di"]
+            and df.loc[i, "plus_di"] >= hl_trend
         )
 
-    # ---------- آمار «بعد از لمس افت» ----------
-    print("\nرسیدن به هدف بعد از لمس افت (هدف‌ها از قیمت ورود):")
-    print("هر ستون: درصد موفقیت (تعداد موفق / تعداد دفعاتی که افت لمس شد)\n")
+        j = df.loc[i, "alligator_jaw"]
+        t = df.loc[i, "alligator_teeth"]
+        l = df.loc[i, "alligator_lips"]
+        alligator_ok = (
+            pd.notna(j) and pd.notna(t) and pd.notna(l)
+            and j > t > l
+        )
 
-    header = f"{'افت':<8}" + "".join([f"{'← ' + str(int(t * 100)) + '%':<16}" for t in TARGET_LEVELS])
-    print(header)
-    print("-" * 90)
+        range_ok = df.loc[i, "adx"] > hl_range
 
-    for dd in DRAWDOWN_LEVELS:
-        row = f"{int(dd * 100)}%{'':<5}"
-        touched_count = sum(1 for m in all_matches if m["results"].get(dd, {}).get("_touched"))
-        for t in TARGET_LEVELS:
-            hit_count = 0
-            for m in all_matches:
-                r = m["results"].get(dd)
-                if r and r.get("_touched") and r.get(t):
-                    hit_count += 1
-            pct = (hit_count / touched_count * 100) if touched_count > 0 else 0
-            row += f"{pct:.1f}%({hit_count}/{touched_count})".ljust(18)
-        print(row)
+        df.loc[i, "signal"] = bool(adx_ok and alligator_ok and range_ok)
 
-    print(f"\nتعداد کل الگوها: {len(all_matches)}")
-    for dd in DRAWDOWN_LEVELS:
-        touched = sum(1 for m in all_matches if m["results"].get(dd, {}).get("_touched"))
-        print(f"  افت {int(dd * 100)}% در {touched} مورد از {len(all_matches)} لمس شد")
+    return df
 
-    # ---------- جزئیات ----------
-    print("\nجزئیات نمونه‌ها (۲۰ مورد اول):")
-    for m in all_matches[:20]:
-        print(f"  {m['symbol']} | تاریخ: {m['timestamp']} | قیمت ورود: {m['entry_price']}")
-        for dd in DRAWDOWN_LEVELS:
-            r = m["results"].get(dd, {})
-            c = m["clean"].get(dd)
-            c_txt = {True: "بله", False: "خیر", None: "نامشخص"}[c]
-            if r.get("_touched"):
-                hits = [str(int(t * 100)) + "%" for t in TARGET_LEVELS if r.get(t)]
-                print(
-                    f"    افت {int(dd * 100)}% ← اهداف رسیده: {hits if hits else 'هیچ'} "
-                    f"| +{int(CLEAN_TARGET * 100)}% بدون افت: {c_txt}"
-                )
-            else:
-                print(
-                    f"    افت {int(dd * 100)}% ← لمس نشد "
-                    f"| +{int(CLEAN_TARGET * 100)}% بدون افت: {c_txt}"
-                )
+
+# ================== تحلیل ماتریس ریزش × هدف ==================
+def analyze_signals(df, lookahead=LOOKAHEAD):
+    """
+    برای هر سیگنال و هر هدف:
+      - آیا قیمت به هدف رسید؟
+      - اگر رسید، حداکثر ریزش قبل از رسیدن چقدر بود؟
+    خروجی:
+      total_signals : تعداد کل سیگنال‌ها
+      reached[t]    : تعداد سیگنال‌هایی که به هدف t رسیدند (بدون قید ریزش)
+      matrix[t][d]  : تعداد سیگنال‌هایی که به هدف t رسیدند و ریزش قبل از هدف < d بود
+    """
+    signals = df.index[df["signal"]].tolist()
+
+    hit_matrix = {t: {d: 0 for d in DRAWDOWN_LEVELS} for t in TARGETS_UP}
+    reached_matrix = {t: 0 for t in TARGETS_UP}
+    total_signals = 0
+
+    for sig_idx in signals:
+        future = df.loc[sig_idx + 1: sig_idx + lookahead]
+        if len(future) == 0:
+            continue
+        total_signals += 1
+        entry = df.loc[sig_idx, "close"]
+        if entry <= 0:
+            continue
+
+        for t in TARGETS_UP:
+            target_price = entry * (1 + t / 100.0)
+            hit_mask = (future["high"] >= target_price).values
+
+            if not hit_mask.any():
+                continue
+
+            hit_pos = int(hit_mask.argmax())
+            reached_matrix[t] += 1
+
+            segment = future.iloc[: hit_pos + 1]
+            min_low = segment["low"].min()
+            drawdown_pct = (entry - min_low) / entry * 100
+
+            for d in DRAWDOWN_LEVELS:
+                if drawdown_pct < d:
+                    hit_matrix[t][d] += 1
+
+    return {
+        "total_signals": total_signals,
+        "reached": reached_matrix,
+        "matrix": hit_matrix,
+    }
+
+
+# ================== ساخت جدول متنی ==================
+def build_matrix_table(res):
+    total = res["total_signals"]
+    if total == 0:
+        return "  (بدون سیگنال)"
+
+    header = "هدف/ریزش  |" + "|".join(f"<{d}٪".rjust(5) for d in DRAWDOWN_LEVELS)
+    lines = [header, "-" * len(header)]
+
+    for t in TARGETS_UP:
+        row = [f"{t:>3}٪      |"]
+        for d in DRAWDOWN_LEVELS:
+            cnt = res["matrix"][t][d]
+            pct = cnt / total * 100
+            row.append(f"{pct:>4.0f}٪")
+        lines.append("|".join(row))
+
+    # خط «رسیده صرفاً»
+    reached_line = "رسیده فقط: " + " | ".join(
+        f"{t}٪→{res['reached'][t] / total * 100:.0f}٪" for t in TARGETS_UP
+    )
+    lines.append("")
+    lines.append(reached_line)
+    return "\n".join(lines)
+
+
+# ================== پیام فارسی نهایی ==================
+def build_fa_message(coin_results):
+    total_all = sum(r["total_signals"] for r in coin_results.values())
+
+    if total_all == 0:
+        return "📊 در ۲۰ ارز برتر، هیچ سیگنالی با شرایط مشخص‌شده در تایم‌فریم ۴ ساعته یافت نشد."
+
+    lines = []
+    lines.append("📊 *گزارش ADX + Alligator — ماتریس ریسک/بازده*")
+    lines.append(f"تایم‌فریم ۴ ساعته | {len(coin_results)} ارز | مجموع سیگنال: {total_all}")
+    lines.append("")
+    lines.append("📖 *راهنما:*")
+    lines.append("هر خانه = درصدی از کل سیگنال‌ها که هم به آن هدف رسیدند")
+    lines.append("و هم قبل از رسیدن به هدف، ریزششان کمتر از حد ستون بود.")
+    lines.append("مثال: خانه (هدف ۱۰٪، ستون <4٪) = ۶۰٪ یعنی ۶۰٪ سیگنال‌ها")
+    lines.append("با ریزش کمتر از ۴٪ به هدف ۱۰٪ رسیدند.")
+    lines.append("")
+
+    global_matrix = {t: {d: 0 for d in DRAWDOWN_LEVELS} for t in TARGETS_UP}
+    global_reached = {t: 0 for t in TARGETS_UP}
+
+    for sym, res in coin_results.items():
+        if res["total_signals"] == 0:
+            continue
+        lines.append(f"🔹 *{sym}* — {res['total_signals']} سیگنال")
+        lines.append(build_matrix_table(res))
+        lines.append("")
+
+        for t in TARGETS_UP:
+            global_reached[t] += res["reached"][t]
+            for d in DRAWDOWN_LEVELS:
+                global_matrix[t][d] += res["matrix"][t][d]
+
+    lines.append("📌 *خلاصه کل ۲۰ ارز*")
+    global_res = {
+        "total_signals": total_all,
+        "reached": global_reached,
+        "matrix": global_matrix,
+    }
+    lines.append(build_matrix_table(global_res))
+
+    return "\n".join(lines)
+
+
+# ================== ارسال به تلگرام ==================
+async def send_telegram(message):
+    bot = Bot(token=TELEGRAM_TOKEN)
+    max_len = 3800
+    if len(message) <= max_len:
+        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
+    else:
+        for i in range(0, len(message), max_len):
+            chunk = message[i: i + max_len]
+            await bot.send_message(chat_id=CHAT_ID, text=chunk, parse_mode="Markdown")
+
+
+# ================== main ==================
+def main():
+    print("دریافت لیست ۲۰ ارز برتر...")
+    coins = get_top_coins()
+    print(f"تعداد ارز: {len(coins)}")
+
+    empty_result = lambda: {
+        "total_signals": 0,
+        "reached": {t: 0 for t in TARGETS_UP},
+        "matrix": {t: {d: 0 for d in DRAWDOWN_LEVELS} for t in TARGETS_UP},
+    }
+
+    coin_results = {}
+
+    for coin_id, symbol in coins:
+        print(f"بررسی {symbol} ({coin_id})...")
+        try:
+            df = get_ohlc_4h(coin_id)
+            if df is None or len(df) < 50:
+                print(f"  داده کافی برای {symbol} وجود ندارد.")
+                coin_results[symbol] = empty_result()
+                time.sleep(2)  # جلوگیری از rate limit
+                continue
+
+            df = calc_adx(df)
+            df = calc_alligator(df)
+            df = detect_signals(df)
+            res = analyze_signals(df)
+            coin_results[symbol] = res
+            print(f"  سیگنال‌ها: {res['total_signals']}")
+        except Exception as e:
+            print(f"  خطا برای {symbol}: {e}")
+            coin_results[symbol] = empty_result()
+
+        time.sleep(2)  # CoinGecko rate limit
+
+    message = build_fa_message(coin_results)
+    print("ارسال به تلگرام...")
+    asyncio.run(send_telegram(message))
+    print("انجام شد.")
 
 
 if __name__ == "__main__":
