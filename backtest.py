@@ -1,703 +1,325 @@
-"""
-Backtest: MACD cross-up (candle i) + ADX End-Trend X in [i+1, i+TRI_AFTER]
-           + at least one small red triangle (shortE) at candle m in [j-10, j-1]
-           + at least ONE candle in [m, i] similar (shape & direction) to SHIB @ 16 Sep 2026 12:00 UTC
-on top-100 coins, 4h timeframe, data from LBank SPOT via ccxt.
-"""
-import os
-import time
-from datetime import datetime, timezone
-
-import ccxt
-import numpy as np
-import pandas as pd
 import requests
+import pandas as pd
+import numpy as np
+import time
+from datetime import datetime
 
-# ============ CONFIG ============
-TOP_COINS = [
-    "BTC", "ETH", "BNB", "SOL", "XRP",
-    "DOGE", "ADA", "AVAX", "TRX", "LINK",
-    "DOT", "MATIC", "TON", "SHIB", "LTC",
-    "BCH", "UNI", "XLM", "NEAR", "APT",
-    "ICP", "FIL", "ETC", "HBAR", "ATOM",
-    "IMX", "INJ", "OP", "ARB", "SUI",
-    "STX", "GRT", "RNDR", "VET", "MKR",
-    "LDO", "THETA", "ALGO", "FTM", "AAVE",
-    "EGLD", "FLOW", "SAND", "MANA", "AXS",
-    "EOS", "XTZ", "KAVA", "SNX", "CRV",
-    "COMP", "ZEC", "DASH", "ENJ", "CHZ",
-    "BAT", "ONE", "ZIL", "IOTA", "NEO",
-    "QTUM", "OMG", "WAVES", "KSM", "RUNE",
-    "CAKE", "1INCH", "SUSHI", "YFI", "BAL",
-    "UMA", "KNC", "REN", "STORJ", "ANKR",
-    "SKL", "OCEAN", "FET", "AGIX", "ROSE",
-    "CELO", "AR", "MASK", "DYDX", "GMX",
-    "ENS", "PEPE", "WLD", "SEI", "TIA",
-    "JUP", "PYTH", "ORDI", "JTO", "BONK",
-    "WIF", "BLUR", "MEME", "GALA", "APE",
-]
+# ================= 配置 =================
+BASE_URL = "https://api.lbkex.com"
+TIMEFRAME = "day1"          # 可选: day1, hour4, hour1
+KLINE_SIZE = 1000           # 每次请求的K线数量 (最大2000)
+TOP_N = 100                 # 取成交量前100的USDT交易对
+ADX_LEN = 14
+DI_LEN = 14
+HL_RANGE = 20
+HL_TREND = 35
+FORWARD_BARS = 100          # 信号后观察多少根K线
+DRAWDOWN_LEVELS = [0.02, 0.03, 0.04, 0.05]   # 回撤阈值
+TARGET_LEVELS = [0.10, 0.20, 0.40, 0.80, 1.00] # 目标涨幅
 
-SL_LEVELS = [2, 3, 4, 5]
-TP_LEVELS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
-LOOKAHEAD = 100
-TRI_AFTER = 1
+# ================= 工具函数 =================
+def rma(series, length):
+    """Wilder's Moving Average (RMA)"""
+    alpha = 1.0 / length
+    return series.ewm(alpha=alpha, adjust=False, min_periods=length).mean()
 
-RED_TRI_BEFORE_MIN = 1
-RED_TRI_BEFORE_MAX = 10
+def fetch_all_usdt_pairs():
+    """获取LBank所有USDT交易对"""
+    url = f"{BASE_URL}/v1/currencyPairs.do"
+    resp = requests.get(url, timeout=15)
+    data = resp.json()
+    if data.get("result") != "true":
+        raise Exception(f"获取交易对失败: {data}")
+    pairs = [p for p in data["data"] if p.endswith("_usdt")]
+    print(f"共获取到 {len(pairs)} 个 USDT 交易对")
+    return pairs
 
-SIM_REF_COIN = os.getenv("SIM_REF_COIN", "SHIB")
-SIM_REF_TIME = os.getenv("SIM_REF_TIME", "2026-09-16T12:00:00")
-SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.85"))
-SIM_DIRECTION_WEIGHT = float(os.getenv("SIM_DIRECTION_WEIGHT", "0.5"))
-SIM_REQUIRE_SAME_DIRECTION = os.getenv("SIM_REQUIRE_SAME_DIRECTION", "1") == "1"
+def fetch_tickers(pairs):
+    """批量获取24h行情，用于排序成交量"""
+    url = f"{BASE_URL}/v2/ticker/24hr.do"
+    params = {"symbol": "all"}
+    resp = requests.get(url, params=params, timeout=15)
+    data = resp.json()
+    if data.get("result") != "true":
+        raise Exception(f"获取ticker失败: {data}")
+    
+    ticker_map = {}
+    for item in data["data"]:
+        sym = item.get("symbol", "").lower()
+        if sym.endswith("_usdt"):
+            ticker_map[sym] = {
+                "turnover": float(item.get("turnover", 0)),
+                "vol": float(item.get("vol", 0)),
+            }
+    ranked = sorted(
+        [(sym, info) for sym, info in ticker_map.items() if sym in pairs],
+        key=lambda x: x[1]["turnover"],
+        reverse=True
+    )
+    return [r[0] for r in ranked[:TOP_N]]
 
-RANGE_DAYS = int(os.getenv("RANGE_DAYS", "700"))
-WARMUP = 100
-MIN_CANDLES = 200
-
-FEE_PCT = 0.1
-RANDOM_SEED = 42
-TG_LIST_MAX = 40
-
-# برای گزارش‌های لیستی
-REPORT_SL = int(os.getenv("REPORT_SL", "4"))     # ریزش ≥ این درصد (SL)
-REPORT_TP = int(os.getenv("REPORT_TP", "10"))    # هدف مرجع برای timeout
-
-MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
-ADX_SIG_LEN, DI_LEN, LVL_RANGE, LVL_TREND = 14, 14, 20, 35
-TF_SECONDS = 4 * 3600
-
-SLEEP_BETWEEN_COINS = float(os.getenv("SLEEP_BETWEEN_COINS", "0.5"))
-
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-
-OUT_DIR = "results"
-EX = ccxt.lbank({"enableRateLimit": True})
-
-
-# ============ FETCH ============
-def fetch_klines(coin):
-    symbol = f"{coin}/USDT"
-    tf_ms = TF_SECONDS * 1000
-    since = EX.milliseconds() - RANGE_DAYS * 86400 * 1000
-    rows, prev_last = [], None
-    for _ in range(10):
-        batch = None
-        for attempt in range(3):
-            try:
-                batch = EX.fetch_ohlcv(symbol, "4h", since=since, limit=2000)
-                break
-            except ccxt.BadSymbol:
-                return None
-            except Exception as e:
-                print(f"[{coin}] fetch error ({attempt + 1}/3): {e}", flush=True)
-                time.sleep(1 + attempt)
-        if not batch:
-            break
-        rows.extend(batch)
-        last = batch[-1][0]
-        if prev_last is not None and last <= prev_last:
-            break
-        prev_last = last
-        if last + tf_ms >= EX.milliseconds():
-            break
-        since = last + tf_ms
-
+def fetch_klines(symbol, timeframe="day1", size=KLINE_SIZE):
+    """获取K线数据"""
+    url = f"{BASE_URL}/v2/kline.do"
+    params = {
+        "symbol": symbol,
+        "size": size,
+        "type": timeframe,
+        "time": int(time.time())
+    }
+    resp = requests.get(url, params=params, timeout=20)
+    data = resp.json()
+    if data.get("result") != "true":
+        print(f"  [警告] {symbol} K线获取失败: {data.get('msg', data)}")
+        return None
+    
+    rows = data["data"]
     if not rows:
         return None
-    df = pd.DataFrame(rows, columns=["t", "o", "h", "l", "c", "v"])
-    df["t"] = df["t"] / 1000.0
-    df = df[["t", "o", "h", "l", "c"]].astype(float).dropna()
-    df = df.drop_duplicates("t").sort_values("t")
-    df = df[df["t"] + TF_SECONDS <= time.time()]
-    return df.reset_index(drop=True) if not df.empty else None
+    
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna().reset_index(drop=True)
+    return df
 
+# ================= ADX 逻辑 (移植 Pine) =================
+def compute_adx_gu5(df, di_len=14, sig_len=14):
+    """完整移植 ADX Di+ Di- [Gu5] 的核心逻辑"""
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    
+    # --- f_dirMov ---
+    up = high.diff()
+    down = -low.diff()
+    
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    
+    plus_dm = pd.Series(plus_dm, index=df.index)
+    minus_dm = pd.Series(minus_dm, index=df.index)
+    plus_dm.iloc[0] = np.nan
+    minus_dm.iloc[0] = np.nan
+    
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    true_range = rma(tr, di_len)
+    
+    plus = 100 * rma(plus_dm, di_len) / true_range
+    minus = 100 * rma(minus_dm, di_len) / true_range
+    
+    plus = plus.ffill()
+    minus = minus.ffill()
+    
+    # --- f_sig ---
+    sum_dm = plus + minus
+    sum_dm = sum_dm.replace(0, 1)
+    sig = 100 * rma((plus - minus).abs() / sum_dm, sig_len)
+    sig = sig.ffill()
+    
+    df["sig"] = sig
+    df["diPlus"] = plus
+    df["diMinus"] = minus
+    
+    # --- 信号逻辑 ---
+    hlRange = sig <= HL_RANGE
+    diUp = plus >= minus
+    diUpUp = plus >= HL_TREND
+    diDn = minus > plus
+    diDnDn = minus > HL_TREND
+    crossDi = ((plus > minus) & (plus.shift(1) <= minus.shift(1))) | ((plus < minus) & (plus.shift(1) >= minus.shift(1)))
+    sigUp = sig > sig.shift(1)
+    
+    # condition 状态机
+    condition = np.zeros(len(df))
+    condition[0] = 0.0
+    
+    for i in range(1, len(df)):
+        prev = condition[i-1]
+        
+        if not hlRange.iloc[i] and diUp.iloc[i] and sigUp.iloc[i] and diUpUp.iloc[i]:
+            condition[i] = 1
+        elif not hlRange.iloc[i] and diDn.iloc[i] and sigUp.iloc[i] and diDnDn.iloc[i]:
+            condition[i] = -1
+        elif not hlRange.iloc[i] and diUp.iloc[i] and sigUp.iloc[i] and not diUp.iloc[i-1]:
+            condition[i] = 0.5
+        elif not hlRange.iloc[i] and diDn.iloc[i] and sigUp.iloc[i] and not diDn.iloc[i-1]:
+            condition[i] = -0.5
+        elif (crossDi.iloc[i] and diUp.iloc[i-1]) or (hlRange.iloc[i] and not hlRange.iloc[i-1]):
+            condition[i] = 0
+        elif (crossDi.iloc[i] and diDn.iloc[i-1]) or (hlRange.iloc[i] and not hlRange.iloc[i-1]):
+            condition[i] = 0
+        else:
+            condition[i] = prev
+    
+    df["condition"] = condition
+    df["hlRange"] = hlRange.values
+    
+    df["longX"] = (df["condition"].shift(1).isin([0.5, 1.0])) & (df["condition"] == 0)
+    df["shortX"] = (df["condition"].shift(1).isin([-0.5, -1.0])) & (df["condition"] == 0)
+    df["longEStr"] = (df["condition"].shift(1) != 1) & (df["condition"] == 1)
+    df["shortEStr"] = (df["condition"].shift(1) != -1) & (df["condition"] == -1)
+    
+    return df
 
-# ============ INDICATORS ============
-def rma(x: pd.Series, n: int) -> pd.Series:
-    v = x.to_numpy(dtype=float)
-    out = np.full(len(v), np.nan)
-    valid = np.where(~np.isnan(v))[0]
-    if len(valid) < n:
-        return pd.Series(out, index=x.index)
-    s = valid[0] + n - 1
-    out[s] = np.nanmean(v[valid[0]:s + 1])
-    for i in range(s + 1, len(v)):
-        out[i] = (out[i - 1] * (n - 1) + v[i]) / n if not np.isnan(v[i]) else np.nan
-    return pd.Series(out, index=x.index)
+# ================= 模式检测与统计 =================
+def detect_pattern(df):
+    """
+    检测：
+    - 大绿三角 (longEStr) 之前 10~60 根内出现 longX 或 shortX
+    - 两者之间没有其他信号 (longEStr/shortEStr/longX/shortX)
+    - 两者之间至少有一根黄色K线 (hlRange == True，即 ADX <= 20)
+    返回匹配的信号索引列表（以 longEStr 的位置为准）
+    """
+    signal_cols = ["longX", "shortX", "longEStr", "shortEStr"]
+    yellow = df["hlRange"]
 
-
-def adx_end_trend(df: pd.DataFrame):
-    h, l, c = df["h"], df["l"], df["c"]
-    up = h.diff()
-    down = -l.diff()
-    plus_dm = np.where(up.isna(), np.nan,
-                       np.where((up > down) & (up > 0), up, 0.0))
-    minus_dm = np.where(down.isna(), np.nan,
-                        np.where((down > up) & (down > 0), down, 0.0))
-    pc = c.shift(1)
-    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()],
-                   axis=1).max(axis=1, skipna=False)
-    tr_r = rma(tr, DI_LEN)
-    plus = (100 * rma(pd.Series(plus_dm, index=df.index), DI_LEN) / tr_r).ffill()
-    minus = (100 * rma(pd.Series(minus_dm, index=df.index), DI_LEN) / tr_r).ffill()
-    sm = plus + minus
-    sig = 100 * rma((plus - minus).abs() / sm.where(sm != 0, 1), ADX_SIG_LEN)
-
-    n = len(df)
-    P, M, G = plus.to_numpy(), minus.to_numpy(), sig.to_numpy()
-    end_trend = np.zeros(n, dtype=bool)
-    shortE_arr = np.zeros(n, dtype=bool)
-    cond = 0.0
-
-    for i in range(1, n):
-        if np.isnan(G[i]) or np.isnan(G[i - 1]) or np.isnan(P[i]) or np.isnan(M[i]):
-            continue
-        hl = G[i] <= LVL_RANGE
-        hl_prev = G[i - 1] <= LVL_RANGE
-        di_up = P[i] >= M[i]
-        di_dn = M[i] > P[i]
-        di_up_prev = (P[i - 1] >= M[i - 1]) if not np.isnan(M[i - 1]) else False
-        di_dn_prev = (M[i - 1] > P[i - 1]) if not np.isnan(M[i - 1]) else False
-        sig_up = G[i] > G[i - 1]
-        cross = (P[i] > M[i] and P[i - 1] <= M[i - 1]) or \
-                (P[i] < M[i] and P[i - 1] >= M[i - 1])
-
-        entryLong = (not hl and di_up and sig_up and not di_up_prev) or \
-                    (not hl and di_up and sig_up and G[i] > LVL_RANGE and hl_prev)
-        entryShort = (not hl and di_dn and sig_up and not di_dn_prev) or \
-                     (not hl and di_dn and sig_up and G[i] > LVL_RANGE and hl_prev)
-        entryLongStr = not hl and di_up and sig_up and P[i] >= LVL_TREND
-        entryShortSt = not hl and di_dn and sig_up and M[i] > LVL_TREND
-        exitLong = (cross and di_up_prev) or (hl and not hl_prev)
-        exitShort = (cross and di_dn_prev) or (hl and not hl_prev)
-
-        shortE_arr[i] = entryShort
-
-        prev = cond
-        if prev != 1 and entryLongStr:
-            cond = 1
-        elif prev != -1 and entryShortSt:
-            cond = -1
-        elif prev != 0.5 and entryLong:
-            cond = 0.5
-        elif prev != -0.5 and entryShort:
-            cond = -0.5
-        elif prev != 0 and exitLong:
-            cond = 0
-        elif prev != 0 and exitShort:
-            cond = 0
-
-        end_trend[i] = (prev != 0) and (cond == 0)
-
-    return (pd.Series(end_trend, index=df.index),
-            pd.Series(shortE_arr, index=df.index))
-
-
-def macd_cross_up(df: pd.DataFrame) -> pd.Series:
-    c = df["c"]
-    macd = c.ewm(span=MACD_FAST, adjust=False).mean() \
-        - c.ewm(span=MACD_SLOW, adjust=False).mean()
-    sgn = macd.ewm(span=MACD_SIG, adjust=False).mean()
-    return (macd.shift(1) <= sgn.shift(1)) & (macd > sgn)
-
-
-# ============ CANDLE SIMILARITY ============
-def candle_features(o, h, l, c):
-    rng = h - l
-    if rng <= 0:
-        return np.array([0.0, 0.0, 0.0, 0.0])
-    body_signed = (c - o) / rng
-    body_abs = abs(body_signed)
-    upper = (h - max(o, c)) / rng
-    lower = (min(o, c) - l) / rng
-    direction = 0.0 if body_abs < 1e-6 else (1.0 if c > o else -1.0)
-    return np.array([direction, body_abs, upper, lower])
-
-
-def candle_similarity_from_feats(f1, f2, direction_weight=0.5):
-    if f1[0] == 0.0 or f2[0] == 0.0:
-        dir_match = 0.5
-    else:
-        dir_match = 1.0 if f1[0] == f2[0] else 0.0
-    shape_dist = float(np.linalg.norm(f1[1:] - f2[1:])) / np.sqrt(3.0)
-    shape_sim = 1.0 - shape_dist
-    return (1.0 - direction_weight) * shape_sim + direction_weight * dir_match
-
-
-def fetch_reference_candle():
-    df = fetch_klines(SIM_REF_COIN)
-    if df is None or df.empty:
-        print("[ref] failed to fetch reference coin", flush=True)
-        return None
-    target_ts = datetime.fromisoformat(SIM_REF_TIME) \
-        .replace(tzinfo=timezone.utc).timestamp()
-    idx = int(np.argmin(np.abs(df["t"].to_numpy() - target_ts)))
-    row = df.iloc[idx]
-    candle = {
-        "t": float(row["t"]),
-        "o": float(row["o"]), "h": float(row["h"]),
-        "l": float(row["l"]), "c": float(row["c"]),
-    }
-    print(f"[ref] {SIM_REF_COIN} candle @ {fmt_ts(candle['t'])} "
-          f"O={candle['o']:.6g} H={candle['h']:.6g} "
-          f"L={candle['l']:.6g} C={candle['c']:.6g}", flush=True)
-    return candle
-
-
-# ============ SIGNAL DETECTION ============
-def detect_signals(df: pd.DataFrame, ref_candle=None):
-    cross = macd_cross_up(df).to_numpy()
-    end_tr_series, shortE_series = adx_end_trend(df)
-    end_tr = end_tr_series.to_numpy()
-    shortE = shortE_series.to_numpy()
-    n = len(df)
-    signals, dropped, no_red_tri, no_similar = [], 0, 0, 0
-
-    o_arr = df["o"].to_numpy(dtype=float)
-    h_arr = df["h"].to_numpy(dtype=float)
-    l_arr = df["l"].to_numpy(dtype=float)
-    c_arr = df["c"].to_numpy(dtype=float)
-    feats = np.empty((n, 4), dtype=float)
-    for k in range(n):
-        feats[k] = candle_features(o_arr[k], h_arr[k], l_arr[k], c_arr[k])
-
-    ref_feat = None
-    ref_dir = None
-    if ref_candle is not None:
-        ref_feat = candle_features(ref_candle["o"], ref_candle["h"],
-                                   ref_candle["l"], ref_candle["c"])
-        ref_dir = ref_feat[0]
-
-    for i in range(WARMUP, n):
-        if not cross[i]:
-            continue
-
-        window = end_tr[i + 1:min(n, i + TRI_AFTER + 1)]
-        hits = np.where(window)[0]
-        if len(hits) == 0:
-            continue
-        j = i + 1 + int(hits[0])
-
-        lo = max(0, j - RED_TRI_BEFORE_MAX)
-        hi = j - RED_TRI_BEFORE_MIN + 1
-        if hi <= lo:
-            no_red_tri += 1
-            continue
-        tri_idx = np.where(shortE[lo:hi])[0]
-        if len(tri_idx) == 0:
-            no_red_tri += 1
-            continue
-        m = lo + int(tri_idx[-1])
-
-        if m >= i:
-            no_red_tri += 1
-            continue
-
-        if ref_feat is not None:
-            any_similar = False
-            for k in range(m, i + 1):
-                cf = feats[k]
-                if SIM_REQUIRE_SAME_DIRECTION and ref_dir not in (0.0,) and cf[0] != 0.0:
-                    if cf[0] != ref_dir:
-                        continue
-                sim = candle_similarity_from_feats(ref_feat, cf, SIM_DIRECTION_WEIGHT)
-                if sim >= SIM_THRESHOLD:
-                    any_similar = True
+    matches = []
+    for idx in df.index[df["longEStr"]]:
+        found = False
+        for back in range(10, 61):
+            prev_idx = idx - back
+            if prev_idx < 0:
+                break
+            if df.loc[prev_idx, "longX"] or df.loc[prev_idx, "shortX"]:
+                # 检查中间有无其他信号
+                between_signals = df.loc[prev_idx+1:idx-1, signal_cols].any(axis=1)
+                if between_signals.any():
                     break
-            if not any_similar:
-                no_similar += 1
-                continue
+                # 检查中间是否至少有一根黄色K线
+                between_yellow = yellow.loc[prev_idx+1:idx-1]
+                if not between_yellow.any():
+                    break
+                found = True
+                break
+        if found:
+            matches.append(idx)
 
-        if j + LOOKAHEAD >= n:
-            dropped += 1
+    return matches
+
+def evaluate_forward(df, entry_idx, drawdown_levels, target_levels, forward_bars=100):
+    """评估信号后的表现：先回撤到阈值，然后反弹到目标涨幅"""
+    entry_price = df.loc[entry_idx, "close"]
+    end_idx = min(entry_idx + forward_bars, len(df) - 1)
+    
+    future_high = df.loc[entry_idx+1:end_idx, "high"].values
+    future_low = df.loc[entry_idx+1:end_idx, "low"].values
+    
+    if len(future_high) == 0:
+        return None
+    
+    results = {}
+    for dd in drawdown_levels:
+        dd_price = entry_price * (1 - dd)
+        touch_indices = np.where(future_low <= dd_price)[0]
+        if len(touch_indices) == 0:
+            results[dd] = {t: False for t in target_levels}
+            results[dd]["_touched"] = False
             continue
-        signals.append((i, j))
+        
+        touch_idx = touch_indices[0]
+        results[dd] = {"_touched": True}
+        
+        remaining_high = future_high[touch_idx:]
+        for t in target_levels:
+            target_price = entry_price * (1 + t)
+            results[dd][t] = bool(np.any(remaining_high >= target_price))
+    
+    return results
 
-    return signals, dropped, no_red_tri, no_similar
-
-
-def fmt_ts(t):
-    return datetime.fromtimestamp(float(t), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-
-
-def describe_signals(coin, df, signals):
-    rows = []
-    for i, j in signals:
-        rows.append({
-            "coin": coin,
-            "cross_candle_open": fmt_ts(df["t"].iloc[i]),
-            "x_candle_open": fmt_ts(df["t"].iloc[j]),
-            "entry_time": fmt_ts(df["t"].iloc[j] + TF_SECONDS),
-            "entry_price": float(df["c"].iloc[j]),
-        })
-    return rows
-
-
-# ============ BACKTEST ============
-def backtest_coin(df: pd.DataFrame, entries, coin=""):
-    outcomes = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
-    no_hit   = {(sl, tp): 0 for sl in SL_LEVELS for tp in TP_LEVELS}
-    trades   = []
-
-    for j in entries:
-        entry = float(df["c"].iloc[j])
-        hi = df["h"].iloc[j + 1:j + 1 + LOOKAHEAD].to_numpy(dtype=float)
-        lo = df["l"].iloc[j + 1:j + 1 + LOOKAHEAD].to_numpy(dtype=float)
-        run_hi = np.maximum.accumulate(hi)
-        run_lo = np.minimum.accumulate(lo)
-
-        max_dd_pct  = (entry - lo.min()) / entry * 100 if len(lo) else 0.0
-        max_run_pct = (hi.max() - entry) / entry * 100 if len(hi) else 0.0
-
-        sl_first = {}
-        for sl in SL_LEVELS:
-            mask = run_lo <= entry * (1 - sl / 100)
-            sl_first[sl] = int(np.argmax(mask)) if mask.any() else None
-
-        for tp in TP_LEVELS:
-            mask = run_hi >= entry * (1 + (tp + FEE_PCT) / 100)
-            tp_first = int(np.argmax(mask)) if mask.any() else None
-            for sl in SL_LEVELS:
-                sl_idx = sl_first[sl]
-                tp_hit = tp_first is not None
-                sl_hit = sl_idx is not None
-
-                if not tp_hit and not sl_hit:
-                    no_hit[(sl, tp)] += 1
-                    status = "no_hit"
-                    win = False
-                else:
-                    win = tp_hit and (not sl_hit or tp_first < sl_idx)
-                    status = "win" if win else "loss"
-                    outcomes[(sl, tp)].append(win)
-
-                trades.append({
-                    "coin": coin,
-                    "entry_time": fmt_ts(df["t"].iloc[j] + TF_SECONDS),
-                    "entry_price": round(entry, 8),
-                    "sl": sl, "tp": tp,
-                    "status": status,
-                    "max_dd_pct": round(max_dd_pct, 2),
-                    "max_run_pct": round(max_run_pct, 2),
-                })
-    return outcomes, no_hit, trades, len(entries)
-
-
-def random_baseline(df: pd.DataFrame, n_signals: int, rng):
-    empty = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
-    lo_i, hi_i = WARMUP, len(df) - LOOKAHEAD - 1
-    if n_signals == 0 or hi_i <= lo_i:
-        return empty
-    idx = rng.choice(np.arange(lo_i, hi_i), size=n_signals, replace=True)
-    out, _, _, _ = backtest_coin(df, [int(x) for x in idx])
-    return out
-
-
-# ============ COIN FILTER ============
-def filter_available_coins(coins):
-    try:
-        markets = EX.load_markets()
-        available = set()
-        for sym, m in markets.items():
-            if m.get("spot") and m.get("quote") == "USDT" and m.get("active"):
-                available.add(m["base"])
-        filtered = [c for c in coins if c in available]
-        missing = [c for c in coins if c not in available]
-        print(f"[filter] {len(filtered)}/{len(coins)} coins available on LBank spot",
-              flush=True)
-        if missing:
-            print(f"[filter] missing ({len(missing)}): {missing}", flush=True)
-        return filtered
-    except Exception as e:
-        print(f"[filter] failed to load markets: {e} — using full list", flush=True)
-        return coins
-
-
-# ============ FORMAT ============
-def rate(arr):
-    return sum(arr) / len(arr) * 100 if arr else float("nan")
-
-
-def md_table(outcomes, title):
-    lines = [f"### {title}",
-             "| SL\\TP |" + "|".join(f" {tp}% |" for tp in TP_LEVELS),
-             "|-------|" + "|".join("-------|" for _ in TP_LEVELS)]
-    for sl in SL_LEVELS:
-        row = f"| **{sl}%** |"
-        for tp in TP_LEVELS:
-            row += f" {rate(outcomes[(sl, tp)]):5.1f} |"
-        lines.append(row)
-    return "\n".join(lines)
-
-
-def md_diff_table(sig, rnd):
-    lines = ["### Signal minus Random (percentage points)",
-             "| SL\\TP |" + "|".join(f" {tp}% |" for tp in TP_LEVELS),
-             "|-------|" + "|".join("-------|" for _ in TP_LEVELS)]
-    for sl in SL_LEVELS:
-        row = f"| **{sl}%** |"
-        for tp in TP_LEVELS:
-            row += f" {rate(sig[(sl, tp)]) - rate(rnd[(sl, tp)]):+5.1f} |"
-        lines.append(row)
-    return "\n".join(lines)
-
-
-def md_signal_list(rows):
-    lines = ["## Signals found (UTC)",
-             "| # | Coin | Cross candle (open) | X candle (open) | Entry time | Entry price |",
-             "|---|------|---------------------|-----------------|------------|-------------|"]
-    for n, r in enumerate(rows, 1):
-        lines.append(f"| {n} | {r['coin']} | {r['cross_candle_open']} | "
-                     f"{r['x_candle_open']} | {r['entry_time']} | "
-                     f"{r['entry_price']:.6g} |")
-    return "\n".join(lines)
-
-
-def md_failed_list(rows, title, show_run=False):
-    if show_run:
-        lines = [f"## {title} — {len(rows)} مورد",
-                 "| # | Coin | Entry time (UTC) | Entry price | Max DD % | Max Run % |",
-                 "|---|------|------------------|-------------|----------|-----------|"]
-    else:
-        lines = [f"## {title} — {len(rows)} مورد",
-                 "| # | Coin | Entry time (UTC) | Entry price | Max DD % |",
-                 "|---|------|------------------|-------------|----------|"]
-    for k, t in enumerate(sorted(rows, key=lambda x: x["entry_time"]), 1):
-        if show_run:
-            lines.append(f"| {k} | {t['coin']} | {t['entry_time']} | "
-                         f"{t['entry_price']:.6g} | {t['max_dd_pct']}% | "
-                         f"{t['max_run_pct']}% |")
-        else:
-            lines.append(f"| {k} | {t['coin']} | {t['entry_time']} | "
-                         f"{t['entry_price']:.6g} | {t['max_dd_pct']}% |")
-    return "\n".join(lines)
-
-
-def mono_table(outcomes, rnd=None):
-    col_w = 7
-    head = "SL\\TP".ljust(6) + "".join(f"{tp}%".rjust(col_w) for tp in TP_LEVELS)
-    lines = [head]
-    for sl in SL_LEVELS:
-        row = f"{sl}%".ljust(6)
-        for tp in TP_LEVELS:
-            v = rate(outcomes[(sl, tp)])
-            if rnd is not None:
-                v -= rate(rnd[(sl, tp)])
-                row += f"{v:+.1f}".rjust(col_w)
-            else:
-                row += f"{v:.1f}".rjust(col_w)
-        lines.append(row)
-    return "\n".join(lines)
-
-
-def mono_signal_list(rows, limit):
-    shown = rows[-limit:]
-    lines = [f"{'Coin':<6}{'Entry time (UTC)':<18}{'Price':>12}"]
-    for r in shown:
-        lines.append(f"{r['coin']:<6}{r['entry_time']:<18}{r['entry_price']:>12.6g}")
-    return "\n".join(lines), len(shown)
-
-
-def mono_failed_list(rows, limit):
-    shown = sorted(rows, key=lambda x: x["entry_time"])[:limit]
-    lines = [f"{'Coin':<6}{'Entry time (UTC)':<18}{'DD%':>6}{'Run%':>6}"]
-    for r in shown:
-        lines.append(f"{r['coin']:<6}{r['entry_time']:<18}"
-                     f"{r['max_dd_pct']:>6.1f}{r['max_run_pct']:>6.1f}")
-    if len(rows) > limit:
-        lines.append(f"... و {len(rows) - limit} مورد دیگر")
-    return "\n".join(lines), len(shown)
-
-
-def telegram(text):
-    if not TG_TOKEN or not TG_CHAT:
-        print("[telegram] not configured — skipping")
-        return
-    for i in range(0, len(text), 3800):
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                data={"chat_id": TG_CHAT, "text": text[i:i + 3800],
-                      "parse_mode": "HTML"},
-                timeout=20,
-            )
-        except Exception as e:
-            print(f"[telegram] error: {e}")
-
-
-# ============ MAIN ============
+# ================= 主流程 =================
 def main():
-    coins = filter_available_coins(TOP_COINS)
-
-    ref_candle = fetch_reference_candle()
-    if ref_candle is None:
-        print("[main] warning: reference candle unavailable — "
-              "similarity filter disabled", flush=True)
-
-    print(f"config: LBank spot | RANGE_DAYS={RANGE_DAYS} LOOKAHEAD={LOOKAHEAD} "
-          f"TRI_AFTER={TRI_AFTER} RED_TRI=[j-{RED_TRI_BEFORE_MAX},j-{RED_TRI_BEFORE_MIN}] "
-          f"FEE={FEE_PCT}% coins={len(coins)}", flush=True)
-    print(f"similarity: ref={SIM_REF_COIN}@{SIM_REF_TIME} "
-          f"threshold={SIM_THRESHOLD} dir_weight={SIM_DIRECTION_WEIGHT} "
-          f"require_same_dir={SIM_REQUIRE_SAME_DIRECTION} "
-          f"rule=at least ONE candle in [m,i]", flush=True)
-
-    rng = np.random.default_rng(RANDOM_SEED)
-    keys = [(sl, tp) for sl in SL_LEVELS for tp in TP_LEVELS]
-    all_outcomes = {k: [] for k in keys}
-    rand_outcomes = {k: [] for k in keys}
-    total_signals = 0
-    total_dropped = 0
-    total_no_red_tri = 0
-    total_no_similar = 0
-    per_coin = {}
-    found = []
-    all_trades = []
-
-    for idx, coin in enumerate(coins, 1):
-        print(f"[{idx}/{len(coins)}] [{coin}] fetching...", flush=True)
-        df = fetch_klines(coin)
-        if df is None or len(df) < MIN_CANDLES:
-            n = 0 if df is None else len(df)
-            print(f"[{coin}] skipped (candles={n})", flush=True)
-            per_coin[coin] = {"signals": 0, "dropped": 0, "no_red_tri": 0,
-                              "no_similar": 0, "candles": n, "skipped": True}
-            time.sleep(SLEEP_BETWEEN_COINS)
+    print("=" * 60)
+    print("LBank ADX 形态统计脚本")
+    print(f"时间框架: {TIMEFRAME}, 前 {TOP_N} 个 USDT 交易对")
+    print("条件: × → 黄色区间 → 大绿三角")
+    print("=" * 60)
+    
+    all_pairs = fetch_all_usdt_pairs()
+    time.sleep(0.5)
+    
+    top_pairs = fetch_tickers(all_pairs)
+    print(f"成交量前 {len(top_pairs)} 的交易对: {top_pairs[:5]} ...")
+    time.sleep(0.5)
+    
+    all_matches = []
+    
+    for i, symbol in enumerate(top_pairs):
+        print(f"[{i+1}/{len(top_pairs)}] 处理 {symbol} ...", end=" ")
+        
+        df = fetch_klines(symbol, TIMEFRAME, KLINE_SIZE)
+        if df is None or len(df) < 200:
+            print("数据不足，跳过")
+            time.sleep(0.2)
             continue
-
-        signals, dropped, no_red_tri, no_similar = detect_signals(df, ref_candle)
-        entries = [j for _, j in signals]
-        outcomes, nh, trades, n_valid = backtest_coin(df, entries, coin)
-        rb = random_baseline(df, n_valid, rng)
-        rows = describe_signals(coin, df, signals)
-        found.extend(rows)
-        all_trades.extend(trades)
-
-        per_coin[coin] = {"signals": n_valid, "dropped": dropped,
-                          "no_red_tri": no_red_tri, "no_similar": no_similar,
-                          "candles": len(df), "skipped": False}
-        total_signals += n_valid
-        total_dropped += dropped
-        total_no_red_tri += no_red_tri
-        total_no_similar += no_similar
-
-        for k in keys:
-            all_outcomes[k].extend(outcomes[k])
-            rand_outcomes[k].extend(rb[k])
-
-        print(f"[{coin}] candles={len(df)} signals={n_valid} "
-              f"dropped_no_future={dropped} no_red_tri={no_red_tri} "
-              f"no_similar={no_similar}", flush=True)
-        for r in rows:
-            print(f"    {r['coin']}  cross={r['cross_candle_open']}  "
-                  f"entry={r['entry_time']}  price={r['entry_price']:.6g}",
-                  flush=True)
-
-        time.sleep(SLEEP_BETWEEN_COINS)
-
-    # ─── لیست‌های failed ───
-    # ۱) ریزش ≥ REPORT_SL% (SL خورده) — برای هر سیگنال یکبار
-    dd_hits = [t for t in all_trades
-               if t["sl"] == REPORT_SL and t["tp"] == REPORT_TP and t["status"] == "loss"]
-    dd_hits = list({(t["coin"], t["entry_time"]): t for t in dd_hits}.values())
-
-    # ۲) به هدف نرسیدن (نه TP نه SL) — با SL/TP مرجع
-    no_tp_hits = [t for t in all_trades
-                  if t["sl"] == 2 and t["tp"] == REPORT_TP and t["status"] == "no_hit"]
-    no_tp_hits = list({(t["coin"], t["entry_time"]): t for t in no_tp_hits}.values())
-
-    found.sort(key=lambda r: r["entry_time"])
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    lines = [
-        "# Backtest — MACD cross-up + ADX End-Trend ✕ + red triangle + candle similarity",
-        f"**✕ window:** `[i+1, i+{TRI_AFTER}]` | "
-        f"**red-triangle window:** `[j-{RED_TRI_BEFORE_MAX}, j-{RED_TRI_BEFORE_MIN}]`",
-        f"**Similarity rule:** at least ONE candle in `[m, i]` similar to ref",
-        f"**Reference:** `{SIM_REF_COIN}@{SIM_REF_TIME}` "
-        f"threshold={SIM_THRESHOLD} dir_weight={SIM_DIRECTION_WEIGHT}",
-        f"**Forward:** {LOOKAHEAD} candles | **Fee:** {FEE_PCT}% "
-        f"| **Tie rule:** same-candle TP&SL -> loss",
-        f"Generated: {ts}",
-        f"Coins: {len(coins)} | Signals: {total_signals} "
-        f"| Dropped: {total_dropped} | NoRedTri: {total_no_red_tri} "
-        f"| NoSimilar: {total_no_similar}",
-        "",
-        md_table(all_outcomes, "Win rate % (signal)"),
-        "",
-        md_table(rand_outcomes, "Win rate % (random entries)"),
-        "",
-        md_diff_table(all_outcomes, rand_outcomes),
-        "",
-        md_failed_list(dd_hits,
-                       f"🔴 ریزش ≥ {REPORT_SL}% (SL خورد، SL={REPORT_SL}/TP={REPORT_TP})"),
-        "",
-        md_failed_list(no_tp_hits,
-                       f"⚪ به هدف نرسیدن (timeout، SL=2/TP={REPORT_TP})",
-                       show_run=True),
-        "",
-        md_signal_list(found),
-        "",
-        "## Per-coin signals",
-    ]
-    for coin, info in per_coin.items():
-        if info["skipped"]:
-            lines.append(f"- **{coin}**: _skipped (candles={info['candles']})_")
-        else:
-            lines.append(f"- **{coin}**: signals={info['signals']} "
-                         f"· dropped={info['dropped']} "
-                         f"· no_red_tri={info['no_red_tri']} "
-                         f"· no_similar={info.get('no_similar', 0)} "
-                         f"· candles={info['candles']}")
-    md = "\n".join(lines)
-    print("\n" + md, flush=True)
-
-    os.makedirs(OUT_DIR, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    with open(f"{OUT_DIR}/backtest_{stamp}.md", "w", encoding="utf-8") as f:
-        f.write(md)
-    with open(f"{OUT_DIR}/latest.md", "w", encoding="utf-8") as f:
-        f.write(md)
-    if found:
-        pd.DataFrame(found).to_csv(f"{OUT_DIR}/signals.csv", index=False)
-    pd.DataFrame(all_trades).to_csv(f"{OUT_DIR}/all_trades.csv", index=False)
-    if dd_hits:
-        pd.DataFrame(dd_hits).to_csv(f"{OUT_DIR}/dd_hits.csv", index=False)
-    if no_tp_hits:
-        pd.DataFrame(no_tp_hits).to_csv(f"{OUT_DIR}/no_tp_hits.csv", index=False)
-
-    # ─── تلگرام ───
-    tg_msg = (
-        f"📊 <b>Backtest</b> — MACD↑ + ✕ + red-tri + candle-sim (4h, LBank spot)\n"
-        f"✕ in [i+1..i+{TRI_AFTER}] · red △ in [j-{RED_TRI_BEFORE_MAX}..j-{RED_TRI_BEFORE_MIN}]"
-        f" · sim={SIM_REF_COIN}@{SIM_REF_TIME} thr={SIM_THRESHOLD}\n"
-        f"Forward: {LOOKAHEAD} bars | Fee: {FEE_PCT}%\n"
-        f"Coins: {len(coins)} | Signals: {total_signals}\n\n"
-        f"<b>Win rate %</b>\n<pre>{mono_table(all_outcomes)}</pre>\n"
-        f"<b>Signal − Random (pp)</b>\n"
-        f"<pre>{mono_table(all_outcomes, rand_outcomes)}</pre>\n\n"
-        f"🔴 <b>ریزش ≥ {REPORT_SL}%</b>: {len(dd_hits)} مورد\n"
-        f"⚪ <b>به هدف نرسیدن</b>: {len(no_tp_hits)} مورد"
-    )
-    telegram(tg_msg)
-
-    if found:
-        txt, shown = mono_signal_list(found, TG_LIST_MAX)
-        telegram(f"🗓 <b>Signals</b> (last {shown} of {len(found)}, UTC)\n"
-                 f"<pre>{txt}</pre>")
-
-    if dd_hits:
-        txt, shown = mono_failed_list(dd_hits, TG_LIST_MAX)
-        telegram(f"🔴 <b>ریزش ≥ {REPORT_SL}%</b> ({shown} of {len(dd_hits)})\n"
-                 f"<pre>{txt}</pre>")
-
-    if no_tp_hits:
-        txt, shown = mono_failed_list(no_tp_hits, TG_LIST_MAX)
-        telegram(f"⚪ <b>به هدف نرسیدن</b> ({shown} of {len(no_tp_hits)})\n"
-                 f"<pre>{txt}</pre>")
-
+        
+        try:
+            df = compute_adx_gu5(df, DI_LEN, ADX_LEN)
+        except Exception as e:
+            print(f"ADX计算失败: {e}")
+            time.sleep(0.2)
+            continue
+        
+        matches = detect_pattern(df)
+        
+        if not matches:
+            print(f"无匹配形态 (共{len(df)}根K线)")
+            time.sleep(0.2)
+            continue
+        
+        print(f"找到 {len(matches)} 个匹配形态")
+        
+        for idx in matches:
+            res = evaluate_forward(df, idx, DRAWDOWN_LEVELS, TARGET_LEVELS, FORWARD_BARS)
+            if res:
+                all_matches.append({
+                    "symbol": symbol,
+                    "timestamp": df.loc[idx, "timestamp"],
+                    "entry_price": df.loc[idx, "close"],
+                    "results": res,
+                })
+        
+        time.sleep(0.3)
+    
+    # 汇总统计
+    print("\n" + "=" * 60)
+    print("统计结果")
+    print("=" * 60)
+    
+    if not all_matches:
+        print("没有找到任何匹配的形态。")
+        return
+    
+    print(f"总匹配形态数: {len(all_matches)}")
+    
+    header = f"{'回撤':<8}" + "".join([f"{'→'+str(int(t*100))+'%':<14}" for t in TARGET_LEVELS])
+    print(header)
+    print("-" * 80)
+    
+    for dd in DRAWDOWN_LEVELS:
+        row = f"{int(dd*100)}%{'':<5}"
+        touched_count = sum(1 for m in all_matches if m["results"].get(dd, {}).get("_touched"))
+        for t in TARGET_LEVELS:
+            hit_count = 0
+            for m in all_matches:
+                r = m["results"].get(dd)
+                if r and r.get("_touched") and r.get(t):
+                    hit_count += 1
+            pct = (hit_count / touched_count * 100) if touched_count > 0 else 0
+            row += f"{pct:.1f}%({hit_count}/{touched_count})".ljust(16)
+        print(row)
+    
+    print("\n匹配样本明细:")
+    for m in all_matches[:20]:
+        print(f"  {m['symbol']} @ {m['timestamp']}  entry={m['entry_price']}")
+        for dd in DRAWDOWN_LEVELS:
+            r = m["results"].get(dd, {})
+            if r.get("_touched"):
+                hits = [str(int(t*100))+"%" for t in TARGET_LEVELS if r.get(t)]
+                print(f"    回撤{int(dd*100)}% → 达成: {hits if hits else '无'}")
+            else:
+                print(f"    回撤{int(dd*100)}% → 未触及")
 
 if __name__ == "__main__":
     main()
