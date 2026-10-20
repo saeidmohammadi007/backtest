@@ -10,52 +10,55 @@ LOOKAHEAD = 100
 TARGETS_UP = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 DRAWDOWN_LEVELS = [2, 3, 4, 5, 6, 7, 8, 9, 10]
 
-# ================== تنظیم صرافی (LBank) ==================
-EXCHANGE_ID = 'lbank'
+# استیبل‌کوین‌ها — نباید تحلیل شوند
+STABLECOINS = {
+    "USDT", "USDC", "USDS", "DAI", "BUSD", "TUSD", "FDUSD",
+    "USDD", "USDE", "PYUSD", "FRAX", "LUSD", "GUSD", "USTC",
+    "USD1", "RLUSD", "EURC", "EURT", "XAUT", "PAXG",
+}
 
+EXCHANGE_ID = 'lbank'
 exchange = getattr(ccxt, EXCHANGE_ID)({
-    'enableRateLimit': True,  # فعال‌سازی محدودیت نرخ خودکار [citation:5]
-    'options': {
-        'defaultType': 'spot',
-    }
+    'enableRateLimit': True,
+    'options': {'defaultType': 'spot'},
 })
 
 
 # ================== لیست ۲۰ ارز برتر ==================
 def get_top_coins():
-    """لیست ۲۰ ارز برتر از CoinGecko — فقط نماد (BTC, ETH, ...)"""
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "per_page": TOP_N,
-        "page": 1,
-        "sparkline": "false",
+        "vs_currency": "usd", "order": "market_cap_desc",
+        "per_page": TOP_N * 2,  # بیشتر می‌گیریم تا بعد از فیلتر استیبل‌کوین‌ها ۲۰ تا بماند
+        "page": 1, "sparkline": "false",
     }
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
-    return [c["symbol"].upper() for c in r.json()]
+    coins = []
+    for c in r.json():
+        sym = c["symbol"].upper()
+        if sym in STABLECOINS:
+            continue
+        coins.append(sym)
+        if len(coins) >= TOP_N:
+            break
+    return coins
 
 
-# ================== دریافت OHLCV ۴ ساعته با CCXT (LBank) ==================
+# ================== دریافت OHLCV ۴ ساعته از LBank ==================
 def get_ohlc_4h(symbol_display, limit=500):
     """
     دریافت کندل ۴ ساعته از LBank با CCXT.
-    در صورت نیاز، پارامتر since محاسبه و ارسال می‌شود.
+    بدون since — فقط limit (LBank خودش آخرین کندل‌ها را می‌دهد).
     """
     symbol = f"{symbol_display}/USDT"
 
+    # چک کنیم نماد در بازارهای LBank وجود دارد
+    if symbol not in exchange.markets:
+        return None
+
     try:
-        # LBank در CCXT ممکن است به since نیاز داشته باشد [citation:18]
-        # 500 کندل 4 ساعته = 2000 ساعت قبل
-        since_ms = exchange.milliseconds() - (limit * 4 * 60 * 60 * 1000)
-        
-        ohlcv = exchange.fetch_ohlcv(
-            symbol, 
-            timeframe='4h', 
-            since=since_ms, 
-            limit=limit
-        )
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=limit)
     except Exception as e:
         print(f"  ❌ خطا در دریافت {symbol}: {e}")
         return None
@@ -76,10 +79,8 @@ def calc_adx(df, di_len=14, adx_len=14):
     high, low, close = df["high"], df["low"], df["close"]
     up = high.diff()
     down = -low.diff()
-
     plus_dm = np.where((up > down) & (up > 0), up, 0.0)
     minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-
     tr = pd.concat(
         [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()],
         axis=1,
@@ -93,27 +94,26 @@ def calc_adx(df, di_len=14, adx_len=14):
     minus_di = 100 * rma(pd.Series(minus_dm, index=df.index), di_len) / atr
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     adx = rma(dx, adx_len)
-
     df["plus_di"] = plus_di
     df["minus_di"] = minus_di
     df["adx"] = adx
     return df
 
 
-# ================== Williams Alligator ==================
+# ================== Alligator ==================
 def calc_alligator(df):
     median = (df["high"] + df["low"]) / 2
 
     def smma(s, n):
         return s.ewm(alpha=1.0 / n, adjust=False).mean()
 
-    df["alligator_jaw"] = smma(median, 13).shift(8)      # آبی
-    df["alligator_teeth"] = smma(median, 8).shift(5)     # سبز
-    df["alligator_lips"] = smma(median, 5).shift(3)      # قرمز
+    df["alligator_jaw"] = smma(median, 13).shift(8)
+    df["alligator_teeth"] = smma(median, 8).shift(5)
+    df["alligator_lips"] = smma(median, 5).shift(3)
     return df
 
 
-# ================== تشخیص سیگنال ==================
+# ================== سیگنال ==================
 def detect_signals(df, hl_trend=35, hl_range=20):
     df["signal"] = False
     for i in range(1, len(df)):
@@ -134,7 +134,7 @@ def detect_signals(df, hl_trend=35, hl_range=20):
     return df
 
 
-# ================== تحلیل ماتریس ریزش × هدف ==================
+# ================== تحلیل ماتریس ==================
 def analyze_signals(df, lookahead=LOOKAHEAD):
     signals = df.index[df["signal"]].tolist()
     hit_matrix = {t: {d: 0 for d in DRAWDOWN_LEVELS} for t in TARGETS_UP}
@@ -149,7 +149,6 @@ def analyze_signals(df, lookahead=LOOKAHEAD):
         entry = df.loc[sig_idx, "close"]
         if entry <= 0:
             continue
-
         for t in TARGETS_UP:
             target = entry * (1 + t / 100.0)
             mask = (future["high"] >= target).values
@@ -166,12 +165,11 @@ def analyze_signals(df, lookahead=LOOKAHEAD):
     return {"total_signals": total, "reached": reached, "matrix": hit_matrix}
 
 
-# ================== جدول و گزارش ==================
+# ================== جدول ==================
 def build_matrix_table(res):
     total = res["total_signals"]
     if total == 0:
         return "  (بدون سیگنال)"
-
     header = "هدف/ریزش |" + "|".join(f"<{d}٪".rjust(5) for d in DRAWDOWN_LEVELS)
     lines = [header, "-" * len(header)]
     for t in TARGETS_UP:
@@ -188,18 +186,15 @@ def build_matrix_table(res):
     return "\n".join(lines)
 
 
+# ================== گزارش ==================
 def build_report(coin_results):
     total_all = sum(r["total_signals"] for r in coin_results.values())
     if total_all == 0:
         return "📊 هیچ سیگنالی یافت نشد."
 
-    lines = []
-    lines.append("=" * 70)
-    lines.append(f"گزارش ADX + Alligator | TF=4h | صرافی: {EXCHANGE_ID.upper()} | سیگنال کل: {total_all}")
-    lines.append("=" * 70)
-    lines.append("راهنما: هر خانه = درصدی از کل سیگنال‌ها که هم به هدف رسیدند")
-    lines.append("و هم قبل از رسیدن، ریزششان زیر حد ستون بود.")
-    lines.append("")
+    lines = ["=" * 70,
+             f"گزارش ADX + Alligator | TF=4h | {EXCHANGE_ID.upper()} | سیگنال کل: {total_all}",
+             "=" * 70, ""]
 
     gm = {t: {d: 0 for d in DRAWDOWN_LEVELS} for t in TARGETS_UP}
     gr = {t: 0 for t in TARGETS_UP}
@@ -218,9 +213,7 @@ def build_report(coin_results):
     lines.append("=" * 70)
     lines.append("خلاصه کل")
     lines.append("=" * 70)
-    lines.append(build_matrix_table({
-        "total_signals": total_all, "reached": gr, "matrix": gm,
-    }))
+    lines.append(build_matrix_table({"total_signals": total_all, "reached": gr, "matrix": gm}))
     return "\n".join(lines)
 
 
@@ -231,13 +224,16 @@ def main():
         exchange.load_markets()
         print(f"✅ {len(exchange.markets)} بازار بارگذاری شد.\n")
     except Exception as e:
-        print(f"❌ خطا در بارگذاری بازارها: {e}")
-        print("⚠️ احتمالاً IP شما توسط LBank مسدود شده است. صرافی را به 'okx' یا 'gate' تغییر دهید.")
+        print(f"❌ خطا: {e}")
         return
 
-    print("دریافت لیست ۲۰ ارز برتر از CoinGecko...")
     coins = get_top_coins()
-    print(f"تعداد ارز: {len(coins)}\n")
+    print(f"ارزهای برتر (بدون استیبل): {', '.join(coins)}\n")
+
+    # گزارش نمادهایی که در LBank موجود نیستند
+    missing = [s for s in coins if f"{s}/USDT" not in exchange.markets]
+    if missing:
+        print(f"⚠️ این نمادها در LBank نیستند: {', '.join(missing)}\n")
 
     empty = lambda: {
         "total_signals": 0,
@@ -251,24 +247,21 @@ def main():
         try:
             df = get_ohlc_4h(sym, limit=500)
             if df is None or len(df) < 50:
-                print(f"  ⚠️ داده کافی برای {sym} نبود (یا در {EXCHANGE_ID} نیست).\n")
+                print(f"  ⚠️ داده کافی نبود.\n")
                 coin_results[sym] = empty()
                 continue
-
             df = calc_adx(df)
             df = calc_alligator(df)
             df = detect_signals(df)
             res = analyze_signals(df)
             coin_results[sym] = res
-            print(f"  ✅ سیگنال‌ها: {res['total_signals']}\n")
+            print(f"  ✅ {res['total_signals']} سیگنال (از {len(df)} کندل)\n")
         except Exception as e:
-            print(f"  ❌ خطا برای {sym}: {e}\n")
+            print(f"  ❌ {e}\n")
             coin_results[sym] = empty()
 
     report = build_report(coin_results)
-    print("\n\n")
-    print(report)
-
+    print("\n\n" + report)
     with open("report.txt", "w", encoding="utf-8") as f:
         f.write(report)
 
