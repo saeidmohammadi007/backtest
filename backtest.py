@@ -1,6 +1,6 @@
 """
 Backtest: MACD cross-up (candle i) + ADX End-Trend X in candle i+1
-on top-20 coins, 4h timeframe.
+on top-20 coins, 4h timeframe, data from LBank SPOT via ccxt.
 
 Signal rule:
   1. MACD cross-up on candle i
@@ -19,6 +19,7 @@ import os
 import time
 from datetime import datetime, timezone
 
+import ccxt
 import numpy as np
 import pandas as pd
 import requests
@@ -50,60 +51,49 @@ TF_SECONDS = 4 * 3600
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
-YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart"
-S = requests.Session()
-S.headers["User-Agent"] = "Mozilla/5.0"
-
 OUT_DIR = "results"
 
+EX = ccxt.lbank({"enableRateLimit": True})
 
-# ============ FETCH ============
-def get_json(url, params=None, tries=4):
-    for i in range(tries):
-        try:
-            r = S.get(url, params=params, timeout=30)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code == 404:
+
+# ============ FETCH (LBank spot via ccxt) ============
+def fetch_klines(coin):
+    """4h candles from LBank spot, finished candles only. Returns df or None."""
+    symbol = f"{coin}/USDT"
+    tf_ms = TF_SECONDS * 1000
+    since = EX.milliseconds() - RANGE_DAYS * 86400 * 1000
+    rows = []
+    prev_last = None
+    for _ in range(10):
+        batch = None
+        for attempt in range(3):
+            try:
+                batch = EX.fetch_ohlcv(symbol, "4h", since=since, limit=2000)
+                break
+            except ccxt.BadSymbol:
                 return None
-        except Exception:
-            pass
-        time.sleep(1 + i)
-    return None
+            except Exception as e:
+                print(f"[{coin}] fetch error ({attempt + 1}/3): {e}", flush=True)
+                time.sleep(1 + attempt)
+        if not batch:
+            break
+        rows.extend(batch)
+        last = batch[-1][0]
+        if prev_last is not None and last <= prev_last:
+            break                      # no progress
+        prev_last = last
+        if last + tf_ms >= EX.milliseconds():
+            break                      # reached the present
+        since = last + tf_ms
 
-
-def to_4h(df: pd.DataFrame, now=None) -> pd.DataFrame:
-    now = now or time.time()
-    d = df.copy()
-    d["dt"] = pd.to_datetime(d["t"], unit="s", utc=True)
-    d = d.set_index("dt")
-    g = d.resample("4h", origin="epoch").agg(
-        {"o": "first", "h": "max", "l": "min", "c": "last", "t": "first"}
-    )
-    g["n"] = d["c"].resample("4h", origin="epoch").count()
-    g = g[g["n"] == 4].dropna()
-    g["t"] = ((g.index - pd.Timestamp("1970-01-01", tz="UTC"))
-              // pd.Timedelta(seconds=1)).astype(float)
-    g = g[g["t"] + TF_SECONDS <= now]
-    return g[["t", "o", "h", "l", "c"]].reset_index(drop=True)
-
-
-def fetch_klines(ticker):
-    j = get_json(f"{YAHOO}/{ticker}",
-                 {"interval": "1h", "range": f"{RANGE_DAYS}d"})
-    try:
-        r = j["chart"]["result"][0]
-        q = r["indicators"]["quote"][0]
-        df = pd.DataFrame({
-            "t": r["timestamp"], "o": q["open"], "h": q["high"],
-            "l": q["low"], "c": q["close"],
-        }).dropna()
-        df = df.astype(float).drop_duplicates("t").sort_values("t")
-    except Exception:
+    if not rows:
         return None
-    if df.empty:
-        return None
-    return to_4h(df)
+    df = pd.DataFrame(rows, columns=["t", "o", "h", "l", "c", "v"])
+    df["t"] = df["t"] / 1000.0
+    df = df[["t", "o", "h", "l", "c"]].astype(float).dropna()
+    df = df.drop_duplicates("t").sort_values("t")
+    df = df[df["t"] + TF_SECONDS <= time.time()]     # drop unfinished candle
+    return df.reset_index(drop=True) if not df.empty else None
 
 
 # ============ INDICATORS ============
@@ -350,9 +340,9 @@ def telegram(text):
 
 # ============ MAIN ============
 def main():
-    print(f"config: RANGE_DAYS={RANGE_DAYS} LOOKAHEAD={LOOKAHEAD} "
-          f"TRI_AFTER={TRI_AFTER} FEE={FEE_PCT}% coins={len(TOP_COINS)}",
-          flush=True)
+    print(f"config: source=LBank spot (ccxt) RANGE_DAYS={RANGE_DAYS} "
+          f"LOOKAHEAD={LOOKAHEAD} TRI_AFTER={TRI_AFTER} FEE={FEE_PCT}% "
+          f"coins={len(TOP_COINS)}", flush=True)
 
     rng = np.random.default_rng(RANDOM_SEED)
     keys = [(sl, tp) for sl in SL_LEVELS for tp in TP_LEVELS]
@@ -365,13 +355,12 @@ def main():
 
     for coin in TOP_COINS:
         print(f"[{coin}] fetching...", flush=True)
-        df = fetch_klines(f"{coin}-USD")
+        df = fetch_klines(coin)
         if df is None or len(df) < MIN_CANDLES:
             n = 0 if df is None else len(df)
             print(f"[{coin}] skipped (candles={n})", flush=True)
             per_coin[coin] = {"signals": 0, "dropped": 0,
                               "candles": n, "skipped": True}
-            time.sleep(0.5)
             continue
 
         signals, dropped = detect_signals(df)
@@ -396,13 +385,12 @@ def main():
             print(f"    {r['coin']}  cross={r['cross_candle_open']}  "
                   f"entry={r['entry_time']}  price={r['entry_price']:.6g}",
                   flush=True)
-        time.sleep(0.5)
 
     found.sort(key=lambda r: r["entry_time"])
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        "# Backtest — MACD cross-up + ADX End-Trend X (4h)",
+        "# Backtest — MACD cross-up + ADX End-Trend X (4h, LBank spot)",
         f"**Entry:** close of first X in `[i+1, i+{TRI_AFTER}]` after the cross",
         f"**Forward window:** {LOOKAHEAD} candles | **Fee:** {FEE_PCT}% "
         f"| **Tie rule:** same-candle TP&SL -> loss",
@@ -438,7 +426,7 @@ def main():
     pd.DataFrame(found).to_csv(f"{OUT_DIR}/signals.csv", index=False)
 
     tg_msg = (
-        f"📊 <b>Backtest</b> — MACD↑ + End-Trend ✕ (entry at ✕, 4h)\n"
+        f"📊 <b>Backtest</b> — MACD↑ + End-Trend ✕ (entry at ✕, 4h, LBank spot)\n"
         f"Forward: {LOOKAHEAD} bars | Fee: {FEE_PCT}%\n"
         f"Coins: {len(TOP_COINS)} | Signals: {total_signals} "
         f"| Dropped: {total_dropped}\n\n"
