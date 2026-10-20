@@ -1,8 +1,8 @@
 """
 Backtest: MACD cross-up + ADX End-Trend in [i+1, i+3]
-Top-N coins, 4h timeframe.
+on top-100 coins, 4h timeframe.
 
-Signal rule (UNCHANGED):
+Signal rule (UNCHANGED — same as original):
   1. MACD cross-up on candle i
   2. ADX End-Trend (longX or shortX — orange ✕ in "ADX Di+ Di- [Gu5]")
      in candles [i+1, i+3]
@@ -13,18 +13,10 @@ Signal rule (UNCHANGED):
      (signals too close to end of data are dropped)
 
 For each signal, tests next 100 candles for each (SL, TP) pair.
-Win = TP hit before SL (tie rule configurable).
+Win = TP hit before SL (same-candle tie -> loss, conservative).
 
 ⚠️ WARNING: End-Trend is AFTER the cross, so entry at candle i close
    uses future information (look-ahead bias). Results are optimistic.
-
-Extras vs original:
-  - Trading costs (fee + slippage) applied
-  - Market-regime breakdown (bull/bear/range)
-  - Configurable tie rule (loss/win/half)
-  - Data caching (parquet/pickle)
-  - Coin ranking with min-signal filter
-  - JSON snapshot alongside MD report
 """
 
 import os
@@ -55,20 +47,17 @@ TOP_N_COINS = int(os.getenv("TOP_N_COINS", "100"))
 SL_LEVELS = [2, 3, 4, 5]
 TP_LEVELS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 LOOKAHEAD = 100
-TRI_AFTER = 3                    # End-Trend window: [i+1, i+TRI_AFTER]
+TRI_AFTER = 3
 RANGE_DAYS = int(os.getenv("RANGE_DAYS", "365"))
 WARMUP = 100
 MIN_CANDLES = 200
 
-# --- Tie rule ---
-# 'loss': same-candle TP&SL -> loss (conservative, DEFAULT)
-# 'win':  same-candle TP&SL -> win
-# 'half': same-candle TP&SL -> 0.5 credit
-TIE_RULE = os.getenv("TIE_RULE", "loss").lower()
+# --- Tie rule (default 'loss' matches original exactly) ---
+TIE_RULE = os.getenv("TIE_RULE", "loss").lower()   # loss / win / half
 
-# --- Trading costs ---
-FEE_PCT = float(os.getenv("FEE_PCT", "0.1"))              # per side, %
-SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.05"))   # per side, %
+# --- Trading costs (default 0 = matches original exactly) ---
+FEE_PCT = float(os.getenv("FEE_PCT", "0"))
+SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0"))
 
 MIN_SIG_FOR_RANK = int(os.getenv("MIN_SIG_FOR_RANK", "10"))
 REF_SL = int(os.getenv("REF_SL", "3"))
@@ -89,11 +78,10 @@ OUT_DIR = "results"
 CACHE_DIR = "cache"
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
-
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 
 
-# ============ MARKET REGIME LABELS ============
+# ============ REGIME LABELS ============
 REGIMES = [
     ("2021-01-01", "2021-11-10", "bull_2021"),
     ("2021-11-11", "2022-06-18", "bear_2021H2"),
@@ -166,8 +154,7 @@ def to_4h(df: pd.DataFrame, now=None) -> pd.DataFrame:
         {"o": "first", "h": "max", "l": "min", "c": "last", "t": "first"}
     )
     g["n"] = d["c"].resample("4h", origin="epoch").count()
-    # accept >=3 of 4 hourly bars (Yahoo often drops one)
-    g = g[g["n"] >= 3].dropna()
+    g = g[g["n"] == 4].dropna()   # ← same as original
     g["t"] = ((g.index - pd.Timestamp("1970-01-01", tz="UTC"))
               // pd.Timedelta(seconds=1)).astype(float)
     g = g[g["t"] + TF_SECONDS <= now]
@@ -216,7 +203,7 @@ def fetch_klines_cached(ticker):
     return df
 
 
-# ============ INDICATORS ============
+# ============ INDICATORS (UNCHANGED) ============
 def rma(x: pd.Series, n: int) -> pd.Series:
     v = x.to_numpy(dtype=float)
     out = np.full(len(v), np.nan)
@@ -231,7 +218,7 @@ def rma(x: pd.Series, n: int) -> pd.Series:
 
 
 def adx_end_trend(df: pd.DataFrame) -> pd.Series:
-    """Equivalent of longX or shortX in Pine 'ADX Di+ Di- [Gu5]'."""
+    """Same as original — equivalent of longX or shortX in Pine 'ADX Di+ Di- [Gu5]'."""
     h, l, c = df["h"], df["l"], df["c"]
     up = h.diff()
     down = -l.diff()
@@ -297,7 +284,7 @@ def macd_cross_up(df: pd.DataFrame) -> pd.Series:
     return (macd.shift(1) <= sgn.shift(1)) & (macd > sgn)
 
 
-# ============ SIGNAL DETECTION (UNCHANGED) ============
+# ============ SIGNAL DETECTION (UNCHANGED — exactly the same loop) ============
 def detect_signals(df: pd.DataFrame):
     """
     A signal at candle i requires:
@@ -330,13 +317,19 @@ def detect_signals(df: pd.DataFrame):
 
 # ============ BACKTEST ============
 def backtest_coin(df: pd.DataFrame, signals):
+    """
+    Same as original:
+      entry = close of bar i
+      hi/lo = forward window [i+1, i+LOOKAHEAD]
+      win = TP hit strictly before SL (tie -> loss)
+    Costs default to 0 (FEE_PCT=SLIPPAGE_PCT=0) so behavior matches original exactly.
+    """
     outcomes = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
     regimes = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
-    cost = (FEE_PCT + SLIPPAGE_PCT) / 100.0  # per side
+    cost = (FEE_PCT + SLIPPAGE_PCT) / 100.0  # 0 by default
 
     for i in signals:
-        entry_raw = float(df["c"].iloc[i])
-        entry = entry_raw * (1 + cost)  # effective entry (fee + slip paid)
+        entry = float(df["c"].iloc[i]) * (1 + cost)
         hi = df["h"].iloc[i + 1:i + 1 + LOOKAHEAD].to_numpy(dtype=float)
         lo = df["l"].iloc[i + 1:i + 1 + LOOKAHEAD].to_numpy(dtype=float)
         ts = float(df["t"].iloc[i])
@@ -458,9 +451,11 @@ def md_table(all_outcomes, total, total_dropped):
     lines.append(f"**Dropped (no {LOOKAHEAD} candles of future data):** {total_dropped}")
     lines.append(f"**End-Trend window:** `[i+1, i+{TRI_AFTER}]` "
                  f"(1..{TRI_AFTER} candles AFTER cross, not cross, not before)")
+    lines.append("**End-Trend meaning:** exit from any ADX trend "
+                 "(weak/strong, long/short) → 0 (orange ✕)")
     lines.append(f"**Forward window:** {LOOKAHEAD} candles")
     lines.append(f"**Tie rule:** {TIE_RULE}")
-    lines.append(f"**Fee per side:** {FEE_PCT}%  ·  **Slippage per side:** {SLIPPAGE_PCT}%")
+    lines.append(f"**Costs:** fee={FEE_PCT}%/side, slippage={SLIPPAGE_PCT}%/side")
     lines.append(f"**⚠️ Warning:** look-ahead bias (entry at i, "
                  f"End-Trend in i+1..i+{TRI_AFTER})")
     return "\n".join(lines)
@@ -578,7 +573,7 @@ def main():
         f"(1..{TRI_AFTER} candles AFTER cross, not cross, not before)",
         "**End-Trend:** exit from any ADX trend (weak/strong, long/short) → 0 "
         "(orange ✕ in 'ADX Di+ Di- [Gu5]')",
-        f"**Forward window:** {LOOKAHEAD} candles",
+        f"**Forward window:** {LOOKAHEAD} candles required after signal",
         f"**Tie rule:** {TIE_RULE}",
         f"**Costs:** fee={FEE_PCT}%/side, slippage={SLIPPAGE_PCT}%/side",
         f"**⚠️ Warning:** look-ahead bias — entry at `i`, "
