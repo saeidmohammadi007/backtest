@@ -1,6 +1,7 @@
 """
 Backtest: MACD cross-up (candle i) + ADX End-Trend X in [i+1, i+TRI_AFTER]
-           + at least one small red triangle (shortE) in [j-10, j-1]
+           + at least one small red triangle (shortE) at candle m in [j-10, j-1]
+           + at least ONE candle in [m, i] similar (shape & direction) to SHIB @ 16 Sep 2026 12:00 UTC
 on top-100 coins, 4h timeframe, data from LBank SPOT via ccxt.
 """
 import os
@@ -46,9 +47,16 @@ TP_LEVELS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 LOOKAHEAD = 100
 TRI_AFTER = 1
 
-# شرط جدید: مثلث قرمز کوچک در [j-10, j-1]
+# مثلث قرمز کوچک در [j-10, j-1]
 RED_TRI_BEFORE_MIN = 1
 RED_TRI_BEFORE_MAX = 10
+
+# شباهت شکل و جهت به کندل مرجع SHIB
+SIM_REF_COIN = os.getenv("SIM_REF_COIN", "SHIB")
+SIM_REF_TIME = os.getenv("SIM_REF_TIME", "2026-09-16T12:00:00")  # UTC
+SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.85"))         # 0..1
+SIM_DIRECTION_WEIGHT = float(os.getenv("SIM_DIRECTION_WEIGHT", "0.5"))  # 0..1
+SIM_REQUIRE_SAME_DIRECTION = os.getenv("SIM_REQUIRE_SAME_DIRECTION", "1") == "1"
 
 RANGE_DAYS = int(os.getenv("RANGE_DAYS", "700"))
 WARMUP = 100
@@ -62,7 +70,6 @@ MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ADX_SIG_LEN, DI_LEN, LVL_RANGE, LVL_TREND = 14, 14, 20, 35
 TF_SECONDS = 4 * 3600
 
-# تاخیر بین ارزها برای جلوگیری از rate-limit
 SLEEP_BETWEEN_COINS = float(os.getenv("SLEEP_BETWEEN_COINS", "0.5"))
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -200,36 +207,144 @@ def macd_cross_up(df: pd.DataFrame) -> pd.Series:
     return (macd.shift(1) <= sgn.shift(1)) & (macd > sgn)
 
 
+# ============ CANDLE SIMILARITY (SHAPE + DIRECTION ONLY) ============
+def candle_features(o, h, l, c):
+    """
+    ویژگی‌های کندل فقط بر اساس شکل و جهت (مستقل از قیمت مطلق و اندازه دامنه).
+    برمی‌گرداند: [direction, body_abs, upper, lower]
+      direction: +1 صعودی، -1 نزولی، 0 دوجی
+      body_abs : |c-o|/range    → 0..+1
+      upper    : سایه بالا /range → 0..+1
+      lower    : سایه پایین /range → 0..+1
+    """
+    rng = h - l
+    if rng <= 0:
+        return np.array([0.0, 0.0, 0.0, 0.0])
+
+    body_signed = (c - o) / rng
+    body_abs = abs(body_signed)
+    upper = (h - max(o, c)) / rng
+    lower = (min(o, c) - l) / rng
+
+    if body_abs < 1e-6:
+        direction = 0.0
+    else:
+        direction = 1.0 if c > o else -1.0
+
+    return np.array([direction, body_abs, upper, lower])
+
+
+def candle_similarity_from_feats(f1, f2, direction_weight=0.5):
+    """شباهت 0..1 بین دو بردار ویژگی کندل."""
+    if f1[0] == 0.0 or f2[0] == 0.0:
+        dir_match = 0.5
+    else:
+        dir_match = 1.0 if f1[0] == f2[0] else 0.0
+
+    shape_dist = float(np.linalg.norm(f1[1:] - f2[1:])) / np.sqrt(3.0)
+    shape_sim = 1.0 - shape_dist
+
+    return (1.0 - direction_weight) * shape_sim + direction_weight * dir_match
+
+
+def fetch_reference_candle():
+    """کندل مرجع SHIB را از LBank می‌گیرد."""
+    df = fetch_klines(SIM_REF_COIN)
+    if df is None or df.empty:
+        print("[ref] failed to fetch reference coin", flush=True)
+        return None
+    target_ts = datetime.fromisoformat(SIM_REF_TIME) \
+        .replace(tzinfo=timezone.utc).timestamp()
+    idx = int(np.argmin(np.abs(df["t"].to_numpy() - target_ts)))
+    row = df.iloc[idx]
+    candle = {
+        "t": float(row["t"]),
+        "o": float(row["o"]), "h": float(row["h"]),
+        "l": float(row["l"]), "c": float(row["c"]),
+    }
+    print(f"[ref] {SIM_REF_COIN} candle @ {fmt_ts(candle['t'])} "
+          f"O={candle['o']:.6g} H={candle['h']:.6g} "
+          f"L={candle['l']:.6g} C={candle['c']:.6g}", flush=True)
+    return candle
+
+
 # ============ SIGNAL DETECTION ============
-def detect_signals(df: pd.DataFrame):
+def detect_signals(df: pd.DataFrame, ref_candle=None):
     cross = macd_cross_up(df).to_numpy()
     end_tr_series, shortE_series = adx_end_trend(df)
     end_tr = end_tr_series.to_numpy()
     shortE = shortE_series.to_numpy()
     n = len(df)
-    signals, dropped, no_red_tri = [], 0, 0
+    signals, dropped, no_red_tri, no_similar = [], 0, 0, 0
+
+    # پیش‌محاسبه ویژگی همه کندل‌ها (سریع‌تر)
+    o_arr = df["o"].to_numpy(dtype=float)
+    h_arr = df["h"].to_numpy(dtype=float)
+    l_arr = df["l"].to_numpy(dtype=float)
+    c_arr = df["c"].to_numpy(dtype=float)
+    feats = np.empty((n, 4), dtype=float)
+    for k in range(n):
+        feats[k] = candle_features(o_arr[k], h_arr[k], l_arr[k], c_arr[k])
+
+    ref_feat = None
+    ref_dir = None
+    if ref_candle is not None:
+        ref_feat = candle_features(ref_candle["o"], ref_candle["h"],
+                                   ref_candle["l"], ref_candle["c"])
+        ref_dir = ref_feat[0]
 
     for i in range(WARMUP, n):
         if not cross[i]:
             continue
+
+        # ── پیدا کردن کندل ✕ (j)
         window = end_tr[i + 1:min(n, i + TRI_AFTER + 1)]
         hits = np.where(window)[0]
         if len(hits) == 0:
             continue
         j = i + 1 + int(hits[0])
 
-        # شرط جدید: مثلث قرمز کوچک در [j-10, j-1]
+        # ── پیدا کردن کندل مثلث قرمز کوچک (m) در [j-10, j-1]
         lo = max(0, j - RED_TRI_BEFORE_MAX)
         hi = j - RED_TRI_BEFORE_MIN + 1
-        if hi <= lo or not shortE[lo:hi].any():
+        if hi <= lo:
             no_red_tri += 1
             continue
+        tri_idx = np.where(shortE[lo:hi])[0]
+        if len(tri_idx) == 0:
+            no_red_tri += 1
+            continue
+        # آخرین مثلث (نزدیک‌ترین به j)
+        m = lo + int(tri_idx[-1])
+
+        # مثلث باید قبل از کراس باشد
+        if m >= i:
+            no_red_tri += 1
+            continue
+
+        # ── شرط جدید: کافیست حداقل یکی از کندل‌های [m, i] شبیه مرجع باشد
+        if ref_feat is not None:
+            any_similar = False
+            for k in range(m, i + 1):
+                cf = feats[k]
+                # جهت باید یکسان باشد (اختیاری)
+                if SIM_REQUIRE_SAME_DIRECTION and ref_dir not in (0.0,) and cf[0] != 0.0:
+                    if cf[0] != ref_dir:
+                        continue
+                sim = candle_similarity_from_feats(ref_feat, cf, SIM_DIRECTION_WEIGHT)
+                if sim >= SIM_THRESHOLD:
+                    any_similar = True
+                    break
+            if not any_similar:
+                no_similar += 1
+                continue
 
         if j + LOOKAHEAD >= n:
             dropped += 1
             continue
         signals.append((i, j))
-    return signals, dropped, no_red_tri
+
+    return signals, dropped, no_red_tri, no_similar
 
 
 def fmt_ts(t):
@@ -287,7 +402,6 @@ def random_baseline(df: pd.DataFrame, n_signals: int, rng):
 
 # ============ COIN FILTER ============
 def filter_available_coins(coins):
-    """فقط ارزهایی که در LBank Spot موجود هستند را برمی‌گرداند."""
     try:
         markets = EX.load_markets()
         available = set()
@@ -391,9 +505,19 @@ def telegram(text):
 def main():
     coins = filter_available_coins(TOP_COINS)
 
+    # ── کندل مرجع SHIB
+    ref_candle = fetch_reference_candle()
+    if ref_candle is None:
+        print("[main] warning: reference candle unavailable — "
+              "similarity filter disabled", flush=True)
+
     print(f"config: LBank spot | RANGE_DAYS={RANGE_DAYS} LOOKAHEAD={LOOKAHEAD} "
           f"TRI_AFTER={TRI_AFTER} RED_TRI=[j-{RED_TRI_BEFORE_MAX},j-{RED_TRI_BEFORE_MIN}] "
           f"FEE={FEE_PCT}% coins={len(coins)}", flush=True)
+    print(f"similarity: ref={SIM_REF_COIN}@{SIM_REF_TIME} "
+          f"threshold={SIM_THRESHOLD} dir_weight={SIM_DIRECTION_WEIGHT} "
+          f"require_same_dir={SIM_REQUIRE_SAME_DIRECTION} "
+          f"rule=at least ONE candle in [m,i]", flush=True)
 
     rng = np.random.default_rng(RANDOM_SEED)
     keys = [(sl, tp) for sl in SL_LEVELS for tp in TP_LEVELS]
@@ -402,6 +526,7 @@ def main():
     total_signals = 0
     total_dropped = 0
     total_no_red_tri = 0
+    total_no_similar = 0
     per_coin = {}
     found = []
 
@@ -412,11 +537,11 @@ def main():
             n = 0 if df is None else len(df)
             print(f"[{coin}] skipped (candles={n})", flush=True)
             per_coin[coin] = {"signals": 0, "dropped": 0, "no_red_tri": 0,
-                              "candles": n, "skipped": True}
+                              "no_similar": 0, "candles": n, "skipped": True}
             time.sleep(SLEEP_BETWEEN_COINS)
             continue
 
-        signals, dropped, no_red_tri = detect_signals(df)
+        signals, dropped, no_red_tri, no_similar = detect_signals(df, ref_candle)
         entries = [j for _, j in signals]
         outcomes, n_valid = backtest_coin(df, entries)
         rb = random_baseline(df, n_valid, rng)
@@ -424,18 +549,20 @@ def main():
         found.extend(rows)
 
         per_coin[coin] = {"signals": n_valid, "dropped": dropped,
-                          "no_red_tri": no_red_tri,
+                          "no_red_tri": no_red_tri, "no_similar": no_similar,
                           "candles": len(df), "skipped": False}
         total_signals += n_valid
         total_dropped += dropped
         total_no_red_tri += no_red_tri
+        total_no_similar += no_similar
 
         for k in keys:
             all_outcomes[k].extend(outcomes[k])
             rand_outcomes[k].extend(rb[k])
 
         print(f"[{coin}] candles={len(df)} signals={n_valid} "
-              f"dropped_no_future={dropped} no_red_tri={no_red_tri}", flush=True)
+              f"dropped_no_future={dropped} no_red_tri={no_red_tri} "
+              f"no_similar={no_similar}", flush=True)
         for r in rows:
             print(f"    {r['coin']}  cross={r['cross_candle_open']}  "
                   f"entry={r['entry_time']}  price={r['entry_price']:.6g}",
@@ -447,16 +574,21 @@ def main():
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     lines = [
-        "# Backtest — MACD cross-up + ADX End-Trend ✕ + red triangle before ✕",
+        "# Backtest — MACD cross-up + ADX End-Trend ✕ + red triangle before ✕ + candle similarity (any-one in [m,i])",
         f"**✕ window:** `[i+1, i+{TRI_AFTER}]` | "
         f"**red-triangle window:** `[j-{RED_TRI_BEFORE_MAX}, j-{RED_TRI_BEFORE_MIN}]`",
+        f"**Similarity rule:** at least ONE candle in `[m, i]` similar to ref (shape & direction)",
+        f"**Reference:** `{SIM_REF_COIN}@{SIM_REF_TIME}` "
+        f"threshold={SIM_THRESHOLD} dir_weight={SIM_DIRECTION_WEIGHT} "
+        f"require_same_dir={SIM_REQUIRE_SAME_DIRECTION}",
         f"**Forward:** {LOOKAHEAD} candles | **Fee:** {FEE_PCT}% "
         f"| **Tie rule:** same-candle TP&SL -> loss",
         f"Generated: {ts}",
         f"Coins: {len(coins)} (requested {len(TOP_COINS)}) | "
         f"Signals: {total_signals} "
         f"| Dropped (no future): {total_dropped} "
-        f"| Rejected (no red tri): {total_no_red_tri}",
+        f"| Rejected (no red tri): {total_no_red_tri} "
+        f"| Rejected (no similar candle in [m,i]): {total_no_similar}",
         "",
         md_table(all_outcomes, "Win rate % (signal)"),
         "",
@@ -475,6 +607,7 @@ def main():
             lines.append(f"- **{coin}**: signals={info['signals']} "
                          f"· dropped={info['dropped']} "
                          f"· no_red_tri={info['no_red_tri']} "
+                         f"· no_similar={info.get('no_similar', 0)} "
                          f"· candles={info['candles']}")
     md = "\n".join(lines)
     print("\n" + md, flush=True)
@@ -488,11 +621,13 @@ def main():
     pd.DataFrame(found).to_csv(f"{OUT_DIR}/signals.csv", index=False)
 
     tg_msg = (
-        f"📊 <b>Backtest</b> — MACD↑ + ✕ + red-tri-before-✕ (4h, LBank spot)\n"
-        f"✕ in [i+1..i+{TRI_AFTER}] · red △ in [j-{RED_TRI_BEFORE_MAX}..j-{RED_TRI_BEFORE_MIN}]\n"
+        f"📊 <b>Backtest</b> — MACD↑ + ✕ + red-tri + candle-sim (4h, LBank spot)\n"
+        f"✕ in [i+1..i+{TRI_AFTER}] · red △ in [j-{RED_TRI_BEFORE_MAX}..j-{RED_TRI_BEFORE_MIN}]"
+        f" · sim={SIM_REF_COIN}@{SIM_REF_TIME} thr={SIM_THRESHOLD} (any-one in [m,i])\n"
         f"Forward: {LOOKAHEAD} bars | Fee: {FEE_PCT}%\n"
         f"Coins: {len(coins)} | Signals: {total_signals} | "
-        f"Dropped: {total_dropped} | NoRedTri: {total_no_red_tri}\n\n"
+        f"Dropped: {total_dropped} | NoRedTri: {total_no_red_tri} | "
+        f"NoSimilar: {total_no_similar}\n\n"
         f"<b>Win rate %</b>\n<pre>{mono_table(all_outcomes)}</pre>\n"
         f"<b>Signal − Random (pp)</b>\n"
         f"<pre>{mono_table(all_outcomes, rand_outcomes)}</pre>"
