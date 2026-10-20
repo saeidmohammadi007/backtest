@@ -15,27 +15,22 @@ import requests
 
 # ============ CONFIG ============
 TOP_COINS = [
-    # --- Top 20 ---
     "BTC", "ETH", "BNB", "SOL", "XRP",
     "DOGE", "ADA", "AVAX", "TRX", "LINK",
     "DOT", "MATIC", "TON", "SHIB", "LTC",
     "BCH", "UNI", "XLM", "NEAR", "APT",
-    # --- 21..40 ---
     "ICP", "FIL", "ETC", "HBAR", "ATOM",
     "IMX", "INJ", "OP", "ARB", "SUI",
     "STX", "GRT", "RNDR", "VET", "MKR",
     "LDO", "THETA", "ALGO", "FTM", "AAVE",
-    # --- 41..60 ---
     "EGLD", "FLOW", "SAND", "MANA", "AXS",
     "EOS", "XTZ", "KAVA", "SNX", "CRV",
     "COMP", "ZEC", "DASH", "ENJ", "CHZ",
     "BAT", "ONE", "ZIL", "IOTA", "NEO",
-    # --- 61..80 ---
     "QTUM", "OMG", "WAVES", "KSM", "RUNE",
     "CAKE", "1INCH", "SUSHI", "YFI", "BAL",
     "UMA", "KNC", "REN", "STORJ", "ANKR",
     "SKL", "OCEAN", "FET", "AGIX", "ROSE",
-    # --- 81..100 ---
     "CELO", "AR", "MASK", "DYDX", "GMX",
     "ENS", "PEPE", "WLD", "SEI", "TIA",
     "JUP", "PYTH", "ORDI", "JTO", "BONK",
@@ -47,15 +42,13 @@ TP_LEVELS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 LOOKAHEAD = 100
 TRI_AFTER = 1
 
-# مثلث قرمز کوچک در [j-10, j-1]
 RED_TRI_BEFORE_MIN = 1
 RED_TRI_BEFORE_MAX = 10
 
-# شباهت شکل و جهت به کندل مرجع SHIB
 SIM_REF_COIN = os.getenv("SIM_REF_COIN", "SHIB")
-SIM_REF_TIME = os.getenv("SIM_REF_TIME", "2026-09-16T12:00:00")  # UTC
-SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.85"))         # 0..1
-SIM_DIRECTION_WEIGHT = float(os.getenv("SIM_DIRECTION_WEIGHT", "0.5"))  # 0..1
+SIM_REF_TIME = os.getenv("SIM_REF_TIME", "2026-09-16T12:00:00")
+SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.85"))
+SIM_DIRECTION_WEIGHT = float(os.getenv("SIM_DIRECTION_WEIGHT", "0.5"))
 SIM_REQUIRE_SAME_DIRECTION = os.getenv("SIM_REQUIRE_SAME_DIRECTION", "1") == "1"
 
 RANGE_DAYS = int(os.getenv("RANGE_DAYS", "700"))
@@ -65,6 +58,10 @@ MIN_CANDLES = 200
 FEE_PCT = 0.1
 RANDOM_SEED = 42
 TG_LIST_MAX = 40
+
+# برای گزارش‌های لیستی
+REPORT_SL = int(os.getenv("REPORT_SL", "4"))     # ریزش ≥ این درصد (SL)
+REPORT_TP = int(os.getenv("REPORT_TP", "10"))    # هدف مرجع برای timeout
 
 MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ADX_SIG_LEN, DI_LEN, LVL_RANGE, LVL_TREND = 14, 14, 20, 35
@@ -132,7 +129,6 @@ def rma(x: pd.Series, n: int) -> pd.Series:
 
 
 def adx_end_trend(df: pd.DataFrame):
-    """Returns (end_trend, shortE) as bool Series."""
     h, l, c = df["h"], df["l"], df["c"]
     up = h.diff()
     down = -l.diff()
@@ -177,7 +173,7 @@ def adx_end_trend(df: pd.DataFrame):
         exitLong = (cross and di_up_prev) or (hl and not hl_prev)
         exitShort = (cross and di_dn_prev) or (hl and not hl_prev)
 
-        shortE_arr[i] = entryShort        # ← مثلث قرمز کوچک
+        shortE_arr[i] = entryShort
 
         prev = cond
         if prev != 1 and entryLongStr:
@@ -207,48 +203,30 @@ def macd_cross_up(df: pd.DataFrame) -> pd.Series:
     return (macd.shift(1) <= sgn.shift(1)) & (macd > sgn)
 
 
-# ============ CANDLE SIMILARITY (SHAPE + DIRECTION ONLY) ============
+# ============ CANDLE SIMILARITY ============
 def candle_features(o, h, l, c):
-    """
-    ویژگی‌های کندل فقط بر اساس شکل و جهت (مستقل از قیمت مطلق و اندازه دامنه).
-    برمی‌گرداند: [direction, body_abs, upper, lower]
-      direction: +1 صعودی، -1 نزولی، 0 دوجی
-      body_abs : |c-o|/range    → 0..+1
-      upper    : سایه بالا /range → 0..+1
-      lower    : سایه پایین /range → 0..+1
-    """
     rng = h - l
     if rng <= 0:
         return np.array([0.0, 0.0, 0.0, 0.0])
-
     body_signed = (c - o) / rng
     body_abs = abs(body_signed)
     upper = (h - max(o, c)) / rng
     lower = (min(o, c) - l) / rng
-
-    if body_abs < 1e-6:
-        direction = 0.0
-    else:
-        direction = 1.0 if c > o else -1.0
-
+    direction = 0.0 if body_abs < 1e-6 else (1.0 if c > o else -1.0)
     return np.array([direction, body_abs, upper, lower])
 
 
 def candle_similarity_from_feats(f1, f2, direction_weight=0.5):
-    """شباهت 0..1 بین دو بردار ویژگی کندل."""
     if f1[0] == 0.0 or f2[0] == 0.0:
         dir_match = 0.5
     else:
         dir_match = 1.0 if f1[0] == f2[0] else 0.0
-
     shape_dist = float(np.linalg.norm(f1[1:] - f2[1:])) / np.sqrt(3.0)
     shape_sim = 1.0 - shape_dist
-
     return (1.0 - direction_weight) * shape_sim + direction_weight * dir_match
 
 
 def fetch_reference_candle():
-    """کندل مرجع SHIB را از LBank می‌گیرد."""
     df = fetch_klines(SIM_REF_COIN)
     if df is None or df.empty:
         print("[ref] failed to fetch reference coin", flush=True)
@@ -277,7 +255,6 @@ def detect_signals(df: pd.DataFrame, ref_candle=None):
     n = len(df)
     signals, dropped, no_red_tri, no_similar = [], 0, 0, 0
 
-    # پیش‌محاسبه ویژگی همه کندل‌ها (سریع‌تر)
     o_arr = df["o"].to_numpy(dtype=float)
     h_arr = df["h"].to_numpy(dtype=float)
     l_arr = df["l"].to_numpy(dtype=float)
@@ -297,14 +274,12 @@ def detect_signals(df: pd.DataFrame, ref_candle=None):
         if not cross[i]:
             continue
 
-        # ── پیدا کردن کندل ✕ (j)
         window = end_tr[i + 1:min(n, i + TRI_AFTER + 1)]
         hits = np.where(window)[0]
         if len(hits) == 0:
             continue
         j = i + 1 + int(hits[0])
 
-        # ── پیدا کردن کندل مثلث قرمز کوچک (m) در [j-10, j-1]
         lo = max(0, j - RED_TRI_BEFORE_MAX)
         hi = j - RED_TRI_BEFORE_MIN + 1
         if hi <= lo:
@@ -314,20 +289,16 @@ def detect_signals(df: pd.DataFrame, ref_candle=None):
         if len(tri_idx) == 0:
             no_red_tri += 1
             continue
-        # آخرین مثلث (نزدیک‌ترین به j)
         m = lo + int(tri_idx[-1])
 
-        # مثلث باید قبل از کراس باشد
         if m >= i:
             no_red_tri += 1
             continue
 
-        # ── شرط جدید: کافیست حداقل یکی از کندل‌های [m, i] شبیه مرجع باشد
         if ref_feat is not None:
             any_similar = False
             for k in range(m, i + 1):
                 cf = feats[k]
-                # جهت باید یکسان باشد (اختیاری)
                 if SIM_REQUIRE_SAME_DIRECTION and ref_dir not in (0.0,) and cf[0] != 0.0:
                     if cf[0] != ref_dir:
                         continue
@@ -365,14 +336,20 @@ def describe_signals(coin, df, signals):
 
 
 # ============ BACKTEST ============
-def backtest_coin(df: pd.DataFrame, entries):
+def backtest_coin(df: pd.DataFrame, entries, coin=""):
     outcomes = {(sl, tp): [] for sl in SL_LEVELS for tp in TP_LEVELS}
+    no_hit   = {(sl, tp): 0 for sl in SL_LEVELS for tp in TP_LEVELS}
+    trades   = []
+
     for j in entries:
         entry = float(df["c"].iloc[j])
         hi = df["h"].iloc[j + 1:j + 1 + LOOKAHEAD].to_numpy(dtype=float)
         lo = df["l"].iloc[j + 1:j + 1 + LOOKAHEAD].to_numpy(dtype=float)
         run_hi = np.maximum.accumulate(hi)
         run_lo = np.minimum.accumulate(lo)
+
+        max_dd_pct  = (entry - lo.min()) / entry * 100 if len(lo) else 0.0
+        max_run_pct = (hi.max() - entry) / entry * 100 if len(hi) else 0.0
 
         sl_first = {}
         for sl in SL_LEVELS:
@@ -384,10 +361,28 @@ def backtest_coin(df: pd.DataFrame, entries):
             tp_first = int(np.argmax(mask)) if mask.any() else None
             for sl in SL_LEVELS:
                 sl_idx = sl_first[sl]
-                win = (tp_first is not None and
-                       (sl_idx is None or tp_first < sl_idx))
-                outcomes[(sl, tp)].append(win)
-    return outcomes, len(entries)
+                tp_hit = tp_first is not None
+                sl_hit = sl_idx is not None
+
+                if not tp_hit and not sl_hit:
+                    no_hit[(sl, tp)] += 1
+                    status = "no_hit"
+                    win = False
+                else:
+                    win = tp_hit and (not sl_hit or tp_first < sl_idx)
+                    status = "win" if win else "loss"
+                    outcomes[(sl, tp)].append(win)
+
+                trades.append({
+                    "coin": coin,
+                    "entry_time": fmt_ts(df["t"].iloc[j] + TF_SECONDS),
+                    "entry_price": round(entry, 8),
+                    "sl": sl, "tp": tp,
+                    "status": status,
+                    "max_dd_pct": round(max_dd_pct, 2),
+                    "max_run_pct": round(max_run_pct, 2),
+                })
+    return outcomes, no_hit, trades, len(entries)
 
 
 def random_baseline(df: pd.DataFrame, n_signals: int, rng):
@@ -396,7 +391,7 @@ def random_baseline(df: pd.DataFrame, n_signals: int, rng):
     if n_signals == 0 or hi_i <= lo_i:
         return empty
     idx = rng.choice(np.arange(lo_i, hi_i), size=n_signals, replace=True)
-    out, _ = backtest_coin(df, [int(x) for x in idx])
+    out, _, _, _ = backtest_coin(df, [int(x) for x in idx])
     return out
 
 
@@ -460,6 +455,26 @@ def md_signal_list(rows):
     return "\n".join(lines)
 
 
+def md_failed_list(rows, title, show_run=False):
+    if show_run:
+        lines = [f"## {title} — {len(rows)} مورد",
+                 "| # | Coin | Entry time (UTC) | Entry price | Max DD % | Max Run % |",
+                 "|---|------|------------------|-------------|----------|-----------|"]
+    else:
+        lines = [f"## {title} — {len(rows)} مورد",
+                 "| # | Coin | Entry time (UTC) | Entry price | Max DD % |",
+                 "|---|------|------------------|-------------|----------|"]
+    for k, t in enumerate(sorted(rows, key=lambda x: x["entry_time"]), 1):
+        if show_run:
+            lines.append(f"| {k} | {t['coin']} | {t['entry_time']} | "
+                         f"{t['entry_price']:.6g} | {t['max_dd_pct']}% | "
+                         f"{t['max_run_pct']}% |")
+        else:
+            lines.append(f"| {k} | {t['coin']} | {t['entry_time']} | "
+                         f"{t['entry_price']:.6g} | {t['max_dd_pct']}% |")
+    return "\n".join(lines)
+
+
 def mono_table(outcomes, rnd=None):
     col_w = 7
     head = "SL\\TP".ljust(6) + "".join(f"{tp}%".rjust(col_w) for tp in TP_LEVELS)
@@ -485,6 +500,17 @@ def mono_signal_list(rows, limit):
     return "\n".join(lines), len(shown)
 
 
+def mono_failed_list(rows, limit):
+    shown = sorted(rows, key=lambda x: x["entry_time"])[:limit]
+    lines = [f"{'Coin':<6}{'Entry time (UTC)':<18}{'DD%':>6}{'Run%':>6}"]
+    for r in shown:
+        lines.append(f"{r['coin']:<6}{r['entry_time']:<18}"
+                     f"{r['max_dd_pct']:>6.1f}{r['max_run_pct']:>6.1f}")
+    if len(rows) > limit:
+        lines.append(f"... و {len(rows) - limit} مورد دیگر")
+    return "\n".join(lines), len(shown)
+
+
 def telegram(text):
     if not TG_TOKEN or not TG_CHAT:
         print("[telegram] not configured — skipping")
@@ -505,7 +531,6 @@ def telegram(text):
 def main():
     coins = filter_available_coins(TOP_COINS)
 
-    # ── کندل مرجع SHIB
     ref_candle = fetch_reference_candle()
     if ref_candle is None:
         print("[main] warning: reference candle unavailable — "
@@ -529,6 +554,7 @@ def main():
     total_no_similar = 0
     per_coin = {}
     found = []
+    all_trades = []
 
     for idx, coin in enumerate(coins, 1):
         print(f"[{idx}/{len(coins)}] [{coin}] fetching...", flush=True)
@@ -543,10 +569,11 @@ def main():
 
         signals, dropped, no_red_tri, no_similar = detect_signals(df, ref_candle)
         entries = [j for _, j in signals]
-        outcomes, n_valid = backtest_coin(df, entries)
+        outcomes, nh, trades, n_valid = backtest_coin(df, entries, coin)
         rb = random_baseline(df, n_valid, rng)
         rows = describe_signals(coin, df, signals)
         found.extend(rows)
+        all_trades.extend(trades)
 
         per_coin[coin] = {"signals": n_valid, "dropped": dropped,
                           "no_red_tri": no_red_tri, "no_similar": no_similar,
@@ -570,31 +597,46 @@ def main():
 
         time.sleep(SLEEP_BETWEEN_COINS)
 
+    # ─── لیست‌های failed ───
+    # ۱) ریزش ≥ REPORT_SL% (SL خورده) — برای هر سیگنال یکبار
+    dd_hits = [t for t in all_trades
+               if t["sl"] == REPORT_SL and t["tp"] == REPORT_TP and t["status"] == "loss"]
+    dd_hits = list({(t["coin"], t["entry_time"]): t for t in dd_hits}.values())
+
+    # ۲) به هدف نرسیدن (نه TP نه SL) — با SL/TP مرجع
+    no_tp_hits = [t for t in all_trades
+                  if t["sl"] == 2 and t["tp"] == REPORT_TP and t["status"] == "no_hit"]
+    no_tp_hits = list({(t["coin"], t["entry_time"]): t for t in no_tp_hits}.values())
+
     found.sort(key=lambda r: r["entry_time"])
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     lines = [
-        "# Backtest — MACD cross-up + ADX End-Trend ✕ + red triangle before ✕ + candle similarity (any-one in [m,i])",
+        "# Backtest — MACD cross-up + ADX End-Trend ✕ + red triangle + candle similarity",
         f"**✕ window:** `[i+1, i+{TRI_AFTER}]` | "
         f"**red-triangle window:** `[j-{RED_TRI_BEFORE_MAX}, j-{RED_TRI_BEFORE_MIN}]`",
-        f"**Similarity rule:** at least ONE candle in `[m, i]` similar to ref (shape & direction)",
+        f"**Similarity rule:** at least ONE candle in `[m, i]` similar to ref",
         f"**Reference:** `{SIM_REF_COIN}@{SIM_REF_TIME}` "
-        f"threshold={SIM_THRESHOLD} dir_weight={SIM_DIRECTION_WEIGHT} "
-        f"require_same_dir={SIM_REQUIRE_SAME_DIRECTION}",
+        f"threshold={SIM_THRESHOLD} dir_weight={SIM_DIRECTION_WEIGHT}",
         f"**Forward:** {LOOKAHEAD} candles | **Fee:** {FEE_PCT}% "
         f"| **Tie rule:** same-candle TP&SL -> loss",
         f"Generated: {ts}",
-        f"Coins: {len(coins)} (requested {len(TOP_COINS)}) | "
-        f"Signals: {total_signals} "
-        f"| Dropped (no future): {total_dropped} "
-        f"| Rejected (no red tri): {total_no_red_tri} "
-        f"| Rejected (no similar candle in [m,i]): {total_no_similar}",
+        f"Coins: {len(coins)} | Signals: {total_signals} "
+        f"| Dropped: {total_dropped} | NoRedTri: {total_no_red_tri} "
+        f"| NoSimilar: {total_no_similar}",
         "",
         md_table(all_outcomes, "Win rate % (signal)"),
         "",
         md_table(rand_outcomes, "Win rate % (random entries)"),
         "",
         md_diff_table(all_outcomes, rand_outcomes),
+        "",
+        md_failed_list(dd_hits,
+                       f"🔴 ریزش ≥ {REPORT_SL}% (SL خورد، SL={REPORT_SL}/TP={REPORT_TP})"),
+        "",
+        md_failed_list(no_tp_hits,
+                       f"⚪ به هدف نرسیدن (timeout، SL=2/TP={REPORT_TP})",
+                       show_run=True),
         "",
         md_signal_list(found),
         "",
@@ -618,25 +660,42 @@ def main():
         f.write(md)
     with open(f"{OUT_DIR}/latest.md", "w", encoding="utf-8") as f:
         f.write(md)
-    pd.DataFrame(found).to_csv(f"{OUT_DIR}/signals.csv", index=False)
+    if found:
+        pd.DataFrame(found).to_csv(f"{OUT_DIR}/signals.csv", index=False)
+    pd.DataFrame(all_trades).to_csv(f"{OUT_DIR}/all_trades.csv", index=False)
+    if dd_hits:
+        pd.DataFrame(dd_hits).to_csv(f"{OUT_DIR}/dd_hits.csv", index=False)
+    if no_tp_hits:
+        pd.DataFrame(no_tp_hits).to_csv(f"{OUT_DIR}/no_tp_hits.csv", index=False)
 
+    # ─── تلگرام ───
     tg_msg = (
         f"📊 <b>Backtest</b> — MACD↑ + ✕ + red-tri + candle-sim (4h, LBank spot)\n"
         f"✕ in [i+1..i+{TRI_AFTER}] · red △ in [j-{RED_TRI_BEFORE_MAX}..j-{RED_TRI_BEFORE_MIN}]"
-        f" · sim={SIM_REF_COIN}@{SIM_REF_TIME} thr={SIM_THRESHOLD} (any-one in [m,i])\n"
+        f" · sim={SIM_REF_COIN}@{SIM_REF_TIME} thr={SIM_THRESHOLD}\n"
         f"Forward: {LOOKAHEAD} bars | Fee: {FEE_PCT}%\n"
-        f"Coins: {len(coins)} | Signals: {total_signals} | "
-        f"Dropped: {total_dropped} | NoRedTri: {total_no_red_tri} | "
-        f"NoSimilar: {total_no_similar}\n\n"
+        f"Coins: {len(coins)} | Signals: {total_signals}\n\n"
         f"<b>Win rate %</b>\n<pre>{mono_table(all_outcomes)}</pre>\n"
         f"<b>Signal − Random (pp)</b>\n"
-        f"<pre>{mono_table(all_outcomes, rand_outcomes)}</pre>"
+        f"<pre>{mono_table(all_outcomes, rand_outcomes)}</pre>\n\n"
+        f"🔴 <b>ریزش ≥ {REPORT_SL}%</b>: {len(dd_hits)} مورد\n"
+        f"⚪ <b>به هدف نرسیدن</b>: {len(no_tp_hits)} مورد"
     )
     telegram(tg_msg)
 
     if found:
         txt, shown = mono_signal_list(found, TG_LIST_MAX)
         telegram(f"🗓 <b>Signals</b> (last {shown} of {len(found)}, UTC)\n"
+                 f"<pre>{txt}</pre>")
+
+    if dd_hits:
+        txt, shown = mono_failed_list(dd_hits, TG_LIST_MAX)
+        telegram(f"🔴 <b>ریزش ≥ {REPORT_SL}%</b> ({shown} of {len(dd_hits)})\n"
+                 f"<pre>{txt}</pre>")
+
+    if no_tp_hits:
+        txt, shown = mono_failed_list(no_tp_hits, TG_LIST_MAX)
+        telegram(f"⚪ <b>به هدف نرسیدن</b> ({shown} of {len(no_tp_hits)})\n"
                  f"<pre>{txt}</pre>")
 
 
