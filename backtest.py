@@ -1,7 +1,7 @@
 """
 Backtest: MACD cross-up (candle i) + ADX End-Trend X in [i+1, i+TRI_AFTER]
            + at least one small red triangle (shortE) in [j-10, j-1]
-on top-20 coins, 4h timeframe, data from LBank SPOT via ccxt.
+on top-100 coins, 4h timeframe, data from LBank SPOT via ccxt.
 """
 import os
 import time
@@ -14,10 +14,31 @@ import requests
 
 # ============ CONFIG ============
 TOP_COINS = [
+    # --- Top 20 ---
     "BTC", "ETH", "BNB", "SOL", "XRP",
     "DOGE", "ADA", "AVAX", "TRX", "LINK",
     "DOT", "MATIC", "TON", "SHIB", "LTC",
     "BCH", "UNI", "XLM", "NEAR", "APT",
+    # --- 21..40 ---
+    "ICP", "FIL", "ETC", "HBAR", "ATOM",
+    "IMX", "INJ", "OP", "ARB", "SUI",
+    "STX", "GRT", "RNDR", "VET", "MKR",
+    "LDO", "THETA", "ALGO", "FTM", "AAVE",
+    # --- 41..60 ---
+    "EGLD", "FLOW", "SAND", "MANA", "AXS",
+    "EOS", "XTZ", "KAVA", "SNX", "CRV",
+    "COMP", "ZEC", "DASH", "ENJ", "CHZ",
+    "BAT", "ONE", "ZIL", "IOTA", "NEO",
+    # --- 61..80 ---
+    "QTUM", "OMG", "WAVES", "KSM", "RUNE",
+    "CAKE", "1INCH", "SUSHI", "YFI", "BAL",
+    "UMA", "KNC", "REN", "STORJ", "ANKR",
+    "SKL", "OCEAN", "FET", "AGIX", "ROSE",
+    # --- 81..100 ---
+    "CELO", "AR", "MASK", "DYDX", "GMX",
+    "ENS", "PEPE", "WLD", "SEI", "TIA",
+    "JUP", "PYTH", "ORDI", "JTO", "BONK",
+    "WIF", "BLUR", "MEME", "GALA", "APE",
 ]
 
 SL_LEVELS = [2, 3, 4, 5]
@@ -40,6 +61,9 @@ TG_LIST_MAX = 40
 MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ADX_SIG_LEN, DI_LEN, LVL_RANGE, LVL_TREND = 14, 14, 20, 35
 TF_SECONDS = 4 * 3600
+
+# تاخیر بین ارزها برای جلوگیری از rate-limit
+SLEEP_BETWEEN_COINS = float(os.getenv("SLEEP_BETWEEN_COINS", "0.5"))
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -261,6 +285,27 @@ def random_baseline(df: pd.DataFrame, n_signals: int, rng):
     return out
 
 
+# ============ COIN FILTER ============
+def filter_available_coins(coins):
+    """فقط ارزهایی که در LBank Spot موجود هستند را برمی‌گرداند."""
+    try:
+        markets = EX.load_markets()
+        available = set()
+        for sym, m in markets.items():
+            if m.get("spot") and m.get("quote") == "USDT" and m.get("active"):
+                available.add(m["base"])
+        filtered = [c for c in coins if c in available]
+        missing = [c for c in coins if c not in available]
+        print(f"[filter] {len(filtered)}/{len(coins)} coins available on LBank spot",
+              flush=True)
+        if missing:
+            print(f"[filter] missing ({len(missing)}): {missing}", flush=True)
+        return filtered
+    except Exception as e:
+        print(f"[filter] failed to load markets: {e} — using full list", flush=True)
+        return coins
+
+
 # ============ FORMAT ============
 def rate(arr):
     return sum(arr) / len(arr) * 100 if arr else float("nan")
@@ -344,9 +389,11 @@ def telegram(text):
 
 # ============ MAIN ============
 def main():
+    coins = filter_available_coins(TOP_COINS)
+
     print(f"config: LBank spot | RANGE_DAYS={RANGE_DAYS} LOOKAHEAD={LOOKAHEAD} "
           f"TRI_AFTER={TRI_AFTER} RED_TRI=[j-{RED_TRI_BEFORE_MAX},j-{RED_TRI_BEFORE_MIN}] "
-          f"FEE={FEE_PCT}% coins={len(TOP_COINS)}", flush=True)
+          f"FEE={FEE_PCT}% coins={len(coins)}", flush=True)
 
     rng = np.random.default_rng(RANDOM_SEED)
     keys = [(sl, tp) for sl in SL_LEVELS for tp in TP_LEVELS]
@@ -358,14 +405,15 @@ def main():
     per_coin = {}
     found = []
 
-    for coin in TOP_COINS:
-        print(f"[{coin}] fetching...", flush=True)
+    for idx, coin in enumerate(coins, 1):
+        print(f"[{idx}/{len(coins)}] [{coin}] fetching...", flush=True)
         df = fetch_klines(coin)
         if df is None or len(df) < MIN_CANDLES:
             n = 0 if df is None else len(df)
             print(f"[{coin}] skipped (candles={n})", flush=True)
             per_coin[coin] = {"signals": 0, "dropped": 0, "no_red_tri": 0,
                               "candles": n, "skipped": True}
+            time.sleep(SLEEP_BETWEEN_COINS)
             continue
 
         signals, dropped, no_red_tri = detect_signals(df)
@@ -393,6 +441,8 @@ def main():
                   f"entry={r['entry_time']}  price={r['entry_price']:.6g}",
                   flush=True)
 
+        time.sleep(SLEEP_BETWEEN_COINS)
+
     found.sort(key=lambda r: r["entry_time"])
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -403,7 +453,8 @@ def main():
         f"**Forward:** {LOOKAHEAD} candles | **Fee:** {FEE_PCT}% "
         f"| **Tie rule:** same-candle TP&SL -> loss",
         f"Generated: {ts}",
-        f"Coins: {len(TOP_COINS)} | Signals: {total_signals} "
+        f"Coins: {len(coins)} (requested {len(TOP_COINS)}) | "
+        f"Signals: {total_signals} "
         f"| Dropped (no future): {total_dropped} "
         f"| Rejected (no red tri): {total_no_red_tri}",
         "",
@@ -440,7 +491,7 @@ def main():
         f"📊 <b>Backtest</b> — MACD↑ + ✕ + red-tri-before-✕ (4h, LBank spot)\n"
         f"✕ in [i+1..i+{TRI_AFTER}] · red △ in [j-{RED_TRI_BEFORE_MAX}..j-{RED_TRI_BEFORE_MIN}]\n"
         f"Forward: {LOOKAHEAD} bars | Fee: {FEE_PCT}%\n"
-        f"Coins: {len(TOP_COINS)} | Signals: {total_signals} | "
+        f"Coins: {len(coins)} | Signals: {total_signals} | "
         f"Dropped: {total_dropped} | NoRedTri: {total_no_red_tri}\n\n"
         f"<b>Win rate %</b>\n<pre>{mono_table(all_outcomes)}</pre>\n"
         f"<b>Signal − Random (pp)</b>\n"
