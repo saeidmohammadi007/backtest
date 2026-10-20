@@ -2,12 +2,17 @@ name: Crypto ADX Alligator Scanner
 
 on:
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '5 */4 * * *'
   workflow_dispatch:
+
+concurrency:
+  group: scanner
+  cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -15,6 +20,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
